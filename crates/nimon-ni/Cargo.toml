@@ -2,7 +2,11 @@
 name = "nimon-ni"
 version.workspace = true
 edition.workspace = true
-authors.workspace = true
-license.workspace = true
 
 [dependencies]
+nimon-core = { path = "../nimon-core" }
+libloading.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
