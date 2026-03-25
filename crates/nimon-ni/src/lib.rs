@@ -3,13 +3,12 @@
 //! This crate provides safe Rust wrappers around NI's C APIs for hardware monitoring.
 //!
 //! # Supported APIs
-//! - NI-SysCfg (System Configuration)
+//! - NI-SysCfg (System Configuration) - Device discovery and status
 //!
 //! # Example
-//! ```ignore
+//! ```no_run
 //! use nimon_ni::syscfg::NiSysCfg;
 //!
-//! // Check if NI software is available
 //! if NiSysCfg::is_available() {
 //!     let api = NiSysCfg::load().unwrap();
 //!     let session = api.create_session().unwrap();
@@ -21,6 +20,7 @@
 //! ```
 
 pub mod common;
+pub mod syscfg;
 
 // Re-export core types
 pub use nimon_core::{NimonError, NimonResult};
