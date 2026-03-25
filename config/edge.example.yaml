@@ -1,0 +1,72 @@
+# NIMon Edge Node Configuration Example
+# Copy this file to config/edge.yaml and customize for your environment
+
+# Node identification and connection settings
+node:
+  # Unique identifier for this edge node (required)
+  id: "test-cell-01"
+
+  # Human-readable name (required)
+  name: "Test Cell 1"
+
+  # Hub server address in host:port format (required)
+  hub_address: "192.168.1.100:8080"
+
+  # Seconds between reconnection attempts when hub is unreachable
+  reconnect_interval_secs: 5
+
+# API-specific settings for device monitoring
+api:
+  # NI System Configuration API (device discovery)
+  syscfg:
+    enabled: true
+    poll_interval_secs: 10
+
+  # NI-DAQmx (data acquisition devices)
+  daqmx:
+    enabled: true
+    poll_interval_secs: 5
+
+  # NI-VISA (instrument communication)
+  visa:
+    enabled: true
+    poll_interval_secs: 15
+
+  # NI-XNET (CAN/LIN/FlexRay)
+  xnet:
+    enabled: true
+    poll_interval_secs: 2
+
+# Prediction engine configuration
+prediction:
+  # Enable local prediction engine
+  enabled: true
+
+  # Prediction models to use
+  models:
+    - threshold
+    - ewma_anomaly
+    - trend_prediction
+
+  # Temperature thresholds (Celsius)
+  temperature_warning: 65
+  temperature_critical: 75
+
+# Data buffering for offline operation
+buffer:
+  # Enable local buffering when hub is unreachable
+  enabled: true
+
+  # Maximum buffer size before dropping old data
+  max_size_mb: 100
+
+  # Path to persist buffered data
+  persist_path: "./data/buffer.db"
+
+# Logging configuration
+logging:
+  # Log level: trace, debug, info, warn, error
+  level: info
+
+  # Path to log file
+  file: "./logs/nimon-edge.log"
