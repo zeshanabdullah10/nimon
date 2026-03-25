@@ -12,3 +12,6 @@ chrono.workspace = true
 thiserror.workspace = true
 sqlx.workspace = true
 async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
