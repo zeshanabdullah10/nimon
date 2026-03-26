@@ -16,6 +16,7 @@ pub struct AlertRule {
     pub condition: RuleCondition,
     pub cooldown_minutes: i32,
     pub notification_channels: Vec<String>,
+    pub suppress_repeat: bool,
 }
 
 /// Rule conditions for triggering alerts
@@ -208,6 +209,7 @@ mod tests {
             },
             cooldown_minutes: 5,
             notification_channels: vec![],
+            suppress_repeat: false,
         };
 
         let ctx = create_test_context();
@@ -230,6 +232,7 @@ mod tests {
             },
             cooldown_minutes: 5,
             notification_channels: vec![],
+            suppress_repeat: false,
         };
 
         let ctx = create_test_context();
@@ -250,6 +253,7 @@ mod tests {
             },
             cooldown_minutes: 5,
             notification_channels: vec![],
+            suppress_repeat: false,
         };
 
         let mut ctx = create_test_context();
@@ -275,6 +279,7 @@ mod tests {
             },
             cooldown_minutes: 5,
             notification_channels: vec![],
+            suppress_repeat: false,
         };
 
         let ctx = create_test_context();
