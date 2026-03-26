@@ -19,6 +19,7 @@
 //! ```
 
 pub mod actor;
+pub mod comm;
 pub mod config;
 
 pub use config::EdgeConfig;

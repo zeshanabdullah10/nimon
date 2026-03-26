@@ -20,6 +20,10 @@ tracing-subscriber.workspace = true
 thiserror.workspace = true
 
 futures = "0.3"
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+url = "2.5"
+ulid = "1.1"
 
 [dev-dependencies]
 tempfile = "3"
