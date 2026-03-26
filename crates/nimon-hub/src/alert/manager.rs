@@ -14,6 +14,10 @@ use nimon_core::{HealthStatus, MetricValue};
 
 use crate::session::SessionStore;
 
+/// Prediction alert thresholds
+const PREDICTION_ALERT_THRESHOLD: f64 = 0.8;
+const PREDICTION_CRITICAL_THRESHOLD: f64 = 0.9;
+
 /// Alert manager configuration
 #[derive(Debug, Clone)]
 pub struct AlertManagerConfig {
@@ -274,7 +278,7 @@ impl Handler<ResolveAlert> for AlertManager {
                 return Ok(());
             }
         }
-        Err(nimon_core::NimonError::DeviceNotFound(msg.alert_id))
+        Err(nimon_core::NimonError::AlertNotFound(msg.alert_id))
     }
 }
 
@@ -307,13 +311,13 @@ impl Handler<PredictionResult> for AlertManager {
 
     fn handle(&mut self, msg: PredictionResult, _ctx: &mut Self::Context) -> Self::Result {
         // Convert prediction to alert if high probability
-        if msg.probability >= 0.8 {
+        if msg.probability >= PREDICTION_ALERT_THRESHOLD {
             let alert = Alert {
                 id: ulid::Ulid::new().to_string(),
                 rule_id: format!("pred-{:?}", msg.prediction_type).to_lowercase(),
                 edge_id: msg.edge_id.clone(),
                 device_id: msg.device_id.clone(),
-                severity: if msg.probability >= 0.9 { AlertSeverity::Critical } else { AlertSeverity::Warning },
+                severity: if msg.probability >= PREDICTION_CRITICAL_THRESHOLD { AlertSeverity::Critical } else { AlertSeverity::Warning },
                 status: AlertStatus::Firing,
                 title: format!("{:?} Prediction for {}", msg.prediction_type, msg.device_id),
                 message: format!("Predicted {:?} with {:.0}% confidence", msg.prediction_type, msg.probability * 100.0),

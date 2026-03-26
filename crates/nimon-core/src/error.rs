@@ -19,6 +19,9 @@ pub enum NimonError {
     #[error("Edge node not found: {0}")]
     EdgeNotFound(String),
 
+    #[error("Alert not found: {0}")]
+    AlertNotFound(String),
+
     #[error("Connection error: {0}")]
     Connection(String),
 
