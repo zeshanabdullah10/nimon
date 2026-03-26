@@ -18,6 +18,7 @@
 //! println!("Edge node: {} ({})", config.node.name, config.node.id);
 //! ```
 
+pub mod actor;
 pub mod config;
 
 pub use config::EdgeConfig;
