@@ -32,7 +32,8 @@ Edge Nodes (nimon-edge)              Central Hub (nimon-hub)
 | `nimon-edge` | Edge node: device discovery, health polling, prediction, WebSocket client |
 | `nimon-hub` | Central server: WebSocket server, REST API, alert management, action execution |
 | `nimon-ni` | FFI bindings to NI APIs (NI-SysCfg, NI-VISA, NI-DAQmx) |
-| `nimon-cli` | Admin CLI tool (stub) |
+| `nimon-cli` | Admin CLI tool |
+| `nimon-sim` | Edge simulator for end-to-end testing without real NI hardware |
 
 ## Prerequisites
 
@@ -47,7 +48,8 @@ cargo build --workspace --release
 
 Binaries are produced in `target/release/`:
 - `nimon-hub.exe` — Central server
-- `nimon-cli.exe` — CLI tool (stub)
+- `nimon-cli.exe` — CLI tool
+- `nimon-sim.exe` — Edge simulator for testing
 
 ## Run
 
@@ -76,6 +78,8 @@ alert:
   max_firing_count: 100
 ```
 
+A test config is provided at `config/test-hub.yaml` which uses port 9090.
+
 ### Edge Node
 
 The edge binary is a library crate (`nimon-edge`) — it has no `main.rs` yet. It is started programmatically or via the CLI (not yet implemented). When running, it:
@@ -86,6 +90,30 @@ The edge binary is a library crate (`nimon-edge`) — it has no `main.rs` yet. I
 4. Connects to the hub via WebSocket and streams status updates
 
 Configuration: copy `config/edge.example.yaml` to `config/edge.yaml` and edit.
+
+### Edge Simulator
+
+For end-to-end testing without real NI hardware, use the edge simulator (`nimon-sim`):
+
+```bash
+# Start the hub first (requires config/test-hub.yaml)
+cargo run -p nimon-hub --release -- config/test-hub.yaml
+
+# In another terminal, run the simulator
+cargo run -p nimon-sim --release
+```
+
+The simulator connects to the hub at `ws://localhost:9090/ws` and:
+- Simulates 3 edge devices with random temperature (35-85°C) and voltage metrics
+- Sends device status updates every 5 seconds
+- Occasionally generates prediction alerts (20% chance per cycle)
+- Auto-reconnects if the connection drops
+
+Use the CLI to verify the simulator is connected:
+
+```bash
+cargo run -p nimon-cli --release -- edges list
+```
 
 ## REST API
 
