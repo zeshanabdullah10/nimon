@@ -14,7 +14,6 @@ use nimon_core::{HealthStatus, MetricValue};
 
 use crate::action::executor::{ActionContext, ExecuteAction};
 use crate::action::actions::Action;
-use crate::session::SessionStore;
 
 /// Prediction alert thresholds
 const PREDICTION_ALERT_THRESHOLD: f64 = 0.8;
@@ -54,7 +53,6 @@ pub struct AlertManager {
     config: AlertManagerConfig,
     rules: Vec<AlertRule>,
     active_alerts: DashMap<String, ActiveAlert>,
-    sessions: SessionStore,
     notification_tx: tokio::sync::mpsc::UnboundedSender<Alert>,
     action_executor: Option<actix::Addr<crate::action::executor::ActionExecutor>>,
     /// SQLite connection pool for persisting alerts and predictions.
@@ -63,13 +61,12 @@ pub struct AlertManager {
 }
 
 impl AlertManager {
-    pub fn new(config: AlertManagerConfig, sessions: SessionStore) -> Self {
+    pub fn new(config: AlertManagerConfig) -> Self {
         let (notification_tx, _) = tokio::sync::mpsc::unbounded_channel();
         Self {
             config,
             rules: Self::default_rules(),
             active_alerts: DashMap::new(),
-            sessions,
             notification_tx,
             action_executor: None,
             db_pool: None,

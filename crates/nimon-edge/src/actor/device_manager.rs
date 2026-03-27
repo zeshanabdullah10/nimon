@@ -9,6 +9,7 @@ use nimon_core::{
 };
 
 use super::device_actor::DeviceActor;
+use super::hub_connector::HubConnectorActor;
 use super::prediction_actor::PredictionActor;
 
 /// Attempt to classify a device product name into a DeviceType
@@ -40,6 +41,8 @@ pub struct DeviceManagerActor {
     device_actors: HashMap<String, Addr<DeviceActor>>,
     /// Prediction actor address
     prediction_actor: Option<Addr<PredictionActor>>,
+    /// Hub connector actor address for forwarding messages
+    hub_connector: Option<Addr<HubConnectorActor>>,
     /// Edge ID
     edge_id: String,
     /// Default poll interval
@@ -51,6 +54,7 @@ impl DeviceManagerActor {
         Self {
             device_actors: HashMap::new(),
             prediction_actor: None,
+            hub_connector: None,
             edge_id,
             default_poll_interval: 10,
         }
@@ -62,9 +66,18 @@ impl DeviceManagerActor {
         self
     }
 
+    /// Set the hub connector for forwarding predictions and status updates
+    pub fn with_hub_connector(mut self, addr: Addr<HubConnectorActor>) -> Self {
+        self.hub_connector = Some(addr);
+        self
+    }
+
     /// Start the prediction actor
     fn start_prediction_actor(&mut self, _ctx: &mut Context<Self>) {
-        let actor = PredictionActor::new(10).with_thresholds(65.0, 75.0);
+        let mut actor = PredictionActor::new(10).with_thresholds(65.0, 75.0);
+        if let Some(ref hub) = self.hub_connector {
+            actor = actor.with_hub_connector(hub.clone());
+        }
         self.prediction_actor = Some(actor.start());
         tracing::info!("Prediction actor started");
     }

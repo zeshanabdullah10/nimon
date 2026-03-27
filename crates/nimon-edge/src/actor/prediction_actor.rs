@@ -13,6 +13,8 @@ use crate::prediction::{
 use nimon_core::actor::{DeviceStatusUpdate, PredictionResult, PredictionType};
 use nimon_core::MetricValue;
 
+use crate::actor::hub_connector::HubConnectorActor;
+
 /// Configuration for the prediction actor's models
 #[derive(Debug, Clone)]
 pub struct PredictionConfig {
@@ -60,6 +62,8 @@ pub struct PredictionActor {
     models: HashMap<String, Vec<Box<dyn PredictionModel>>>,
     /// Temperature history per device (legacy fallback)
     temperature_history: HashMap<String, VecDeque<f64>>,
+    /// Hub connector for forwarding predictions and status updates
+    hub_connector: Option<actix::Addr<HubConnectorActor>>,
 }
 
 impl PredictionActor {
@@ -98,6 +102,7 @@ impl PredictionActor {
             config,
             models,
             temperature_history: HashMap::new(),
+            hub_connector: None,
         }
     }
 
@@ -125,6 +130,12 @@ impl PredictionActor {
             )),
         ];
         self.models.insert("temperature".to_string(), temp_models);
+        self
+    }
+
+    /// Set the hub connector for forwarding predictions and status updates
+    pub fn with_hub_connector(mut self, addr: actix::Addr<HubConnectorActor>) -> Self {
+        self.hub_connector = Some(addr);
         self
     }
 
@@ -262,6 +273,11 @@ impl Handler<DeviceStatusUpdate> for PredictionActor {
                         prediction.probability
                     );
                     any_prediction = true;
+
+                    // Forward prediction to hub connector
+                    if let Some(ref hub) = self.hub_connector {
+                        let _ = hub.do_send(prediction.clone());
+                    }
                 }
             }
         }
@@ -269,15 +285,25 @@ impl Handler<DeviceStatusUpdate> for PredictionActor {
         // Legacy fallback: if no model produced a prediction, try simple temperature analysis
         if !any_prediction {
             if let Some(MetricValue::Float(temp)) = msg.metrics.get("temperature") {
-                if let Some(_prediction) =
+                if let Some(prediction) =
                     self.analyze_temperature(&msg.device_id, &msg.edge_id, *temp)
                 {
                     tracing::debug!(
                         "Legacy prediction generated: device={:?}",
-                        _prediction
+                        prediction
                     );
+
+                    // Forward legacy prediction to hub connector
+                    if let Some(ref hub) = self.hub_connector {
+                        let _ = hub.do_send(prediction);
+                    }
                 }
             }
+        }
+
+        // Forward device status update to hub connector
+        if let Some(ref hub) = self.hub_connector {
+            let _ = hub.do_send(msg);
         }
     }
 }

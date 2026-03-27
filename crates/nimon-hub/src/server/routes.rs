@@ -36,16 +36,26 @@ pub async fn list_edges(State(state): State<HubState>) -> Json<serde_json::Value
 
 /// Get details for a specific edge
 pub async fn get_edge(
-    State(_state): State<HubState>,
+    State(state): State<HubState>,
     axum::extract::Path(edge_id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     info!("Getting details for edge: {}", edge_id);
 
-    // TODO: Implement edge detail lookup
-    Ok(Json(json!({
-        "edge_id": edge_id,
-        "status": "connected",
-    })))
+    match state.sessions().get(&edge_id) {
+        Some(session) => {
+            let device_count = session.device_count().await;
+            Ok(Json(json!({
+                "edge_id": edge_id,
+                "name": session.name(),
+                "hostname": session.hostname(),
+                "ip_address": session.ip_address(),
+                "connected_at": session.connected_at().to_rfc3339(),
+                "device_count": device_count,
+                "status": "connected",
+            })))
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 /// Get device status for an edge

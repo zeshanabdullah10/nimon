@@ -3,7 +3,6 @@
 //! Provides WebSocket server for edge connections and REST API for status/health.
 
 pub mod routes;
-pub mod ws;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,7 +12,7 @@ use axum::{
     extract::ws::{WebSocket, WebSocketUpgrade},
     http::StatusCode,
     response::{IntoResponse, Json},
-    routing::{get, Router},
+    routing::{get, post, Router},
 };
 use futures_util::{StreamExt, SinkExt};
 use sqlx::SqlitePool;
@@ -139,26 +138,57 @@ async fn get_predictions_handler() -> impl IntoResponse {
     })
 }
 
+/// Handler to acknowledge (resolve) an alert
+async fn acknowledge_alert_handler(
+    axum::extract::State(state): axum::extract::State<HubState>,
+    axum::extract::Path(alert_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.alert_manager().await {
+        Some(addr) => {
+            match addr.send(crate::alert::manager::ResolveAlert { alert_id }).await {
+                Ok(Ok(())) => Json(serde_json::json!({ "status": "resolved" })).into_response(),
+                Ok(Err(e)) => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": format!("{}", e) })),
+                ).into_response(),
+                Err(e) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": format!("{}", e) })),
+                ).into_response(),
+            }
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "AlertManager not available" })),
+        ).into_response(),
+    }
+}
+
 /// Start the hub server
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run(config: crate::config::HubConfig) -> anyhow::Result<()> {
     let state = HubState::new();
 
     // Ensure the data directory exists
-    std::fs::create_dir_all("data")?;
+    if let Some(parent) = std::path::Path::new(&config.database_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
     // Connect to SQLite database and initialize schema
-    let pool = SqlitePool::connect("sqlite:./data/nimon.db").await?;
+    let db_url = format!("sqlite:{}", config.database_path);
+    let pool = SqlitePool::connect(&db_url).await?;
     nimon_core::db::init_database(&pool).await?;
-    info!("Database initialized at sqlite:./data/nimon.db");
+    info!("Database initialized at {}", db_url);
 
     // Create and start the ActionExecutor actor
     let action_executor = ActionExecutor::new().start();
 
     // Create and start the AlertManager actor with action executor and database pool
-    let alert_manager = AlertManager::new(
-        AlertManagerConfig::default(),
-        state.sessions().clone(),
-    )
+    let alert_config = AlertManagerConfig {
+        default_cooldown_minutes: config.alert.default_cooldown_minutes,
+        max_firing_count: config.alert.max_firing_count,
+        ..Default::default()
+    };
+    let alert_manager = AlertManager::new(alert_config)
     .with_action_executor(action_executor)
     .with_db_pool(pool);
     let alert_manager_addr = alert_manager.start();
@@ -170,21 +200,39 @@ pub async fn run() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
-        .route("/api/status", get(status_handler))
-        .route("/api/alerts", get(get_alerts_handler))
-        .route("/api/predictions", get(get_predictions_handler))
+        .route("/api/v1/status", get(status_handler))
+        .route("/api/v1/alerts", get(get_alerts_handler))
+        .route("/api/v1/alerts/{alert_id}/acknowledge", post(acknowledge_alert_handler))
+        .route("/api/v1/predictions", get(get_predictions_handler))
+        .route("/api/v1/edges", get(routes::list_edges))
+        .route("/api/v1/edges/{edge_id}", get(routes::get_edge))
+        .route("/api/v1/edges/{edge_id}/devices", get(routes::get_edge_devices))
         .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
     // Bind TCP listener
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let addr = SocketAddr::new(
+        config.host.parse().unwrap_or_else(|_| std::net::Ipv4Addr::UNSPECIFIED.into()),
+        config.port,
+    );
     let listener = TcpListener::bind(addr).await?;
 
     info!("Hub server listening on {}", addr);
 
-    // Start the server
-    axum::serve(listener, app).await?;
+    // Graceful shutdown on Ctrl+C
+    let shutdown = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+        info!("Shutdown signal received, gracefully stopping...");
+    };
+
+    // Start the server with graceful shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+    info!("Hub server shut down gracefully");
 
     Ok(())
 }

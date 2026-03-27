@@ -4,6 +4,7 @@
 
 pub mod action;
 pub mod alert;
+pub mod config;
 pub mod server;
 pub mod session;
 
