@@ -4,6 +4,7 @@
 //!
 //! # Supported APIs
 //! - NI-SysCfg (System Configuration) - Device discovery and status
+//! - NI-VISA - Instrument discovery and communication
 //!
 //! # Example
 //! ```no_run
@@ -21,6 +22,7 @@
 
 pub mod common;
 pub mod syscfg;
+pub mod visa;
 
 // Re-export core types
 pub use nimon_core::{NimonError, NimonResult};
