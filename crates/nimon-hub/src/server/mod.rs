@@ -168,13 +168,19 @@ async fn acknowledge_alert_handler(
 pub async fn run(config: crate::config::HubConfig) -> anyhow::Result<()> {
     let state = HubState::new();
 
-    // Ensure the data directory exists
-    if let Some(parent) = std::path::Path::new(&config.database_path).parent() {
+    // Resolve database path to absolute and ensure the data directory exists
+    let db_path = std::path::Path::new(&config.database_path);
+    let db_path = if db_path.is_relative() {
+        std::env::current_dir().unwrap_or_default().join(db_path)
+    } else {
+        db_path.to_path_buf()
+    };
+    if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     // Connect to SQLite database and initialize schema
-    let db_url = format!("sqlite:{}", config.database_path);
+    let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
     let pool = SqlitePool::connect(&db_url).await?;
     nimon_core::db::init_database(&pool).await?;
     info!("Database initialized at {}", db_url);
@@ -202,14 +208,14 @@ pub async fn run(config: crate::config::HubConfig) -> anyhow::Result<()> {
         .route("/health", get(health_handler))
         .route("/api/v1/status", get(status_handler))
         .route("/api/v1/alerts", get(get_alerts_handler))
-        .route("/api/v1/alerts/{alert_id}/acknowledge", post(acknowledge_alert_handler))
+        .route("/api/v1/alerts/:alert_id/acknowledge", post(acknowledge_alert_handler))
         .route("/api/v1/predictions", get(get_predictions_handler))
         .route("/api/v1/edges", get(routes::list_edges))
-        .route("/api/v1/edges/{edge_id}", get(routes::get_edge))
-        .route("/api/v1/edges/{edge_id}/devices", get(routes::get_edge_devices))
-        .with_state(state)
+        .route("/api/v1/edges/:edge_id", get(routes::get_edge))
+        .route("/api/v1/edges/:edge_id/devices", get(routes::get_edge_devices))
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
 
     // Bind TCP listener
     let addr = SocketAddr::new(

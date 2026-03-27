@@ -277,7 +277,7 @@ impl WsClient {
                 Ok((ws_stream, _)) => {
                     info!("Reconnected to hub");
                     *state.write().await = ConnectionState::Connected;
-                    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+                    let (_shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
                     let (new_send_tx, outgoing_rx) = mpsc::unbounded_channel();
 
                     // Update the shared send_tx so the actor can send messages again

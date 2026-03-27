@@ -4,7 +4,7 @@ use actix::prelude::*;
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
 use sqlx::SqlitePool;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use nimon_core::alert::*;
 use nimon_core::alert::rules::{AlertRule, ComparisonOp, EvaluationContext, RuleCondition};

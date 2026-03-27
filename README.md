@@ -70,7 +70,7 @@ Create `config/hub.yaml`:
 ```yaml
 host: "0.0.0.0"
 port: 8080
-database_path: "./data/nimon.db"
+database_path: "data/nimon.db"
 alert:
   default_cooldown_minutes: 5
   max_firing_count: 100

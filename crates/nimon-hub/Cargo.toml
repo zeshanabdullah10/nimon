@@ -10,7 +10,7 @@ nimon-core = { path = "../nimon-core" }
 actix = "0.13"
 tokio.workspace = true
 axum = { version = "0.7", features = ["ws"] }
-tower = { version = "0.4", features = ["full"] }
+tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 serde.workspace = true
 serde_json.workspace = true

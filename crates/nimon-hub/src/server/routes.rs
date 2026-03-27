@@ -60,16 +60,19 @@ pub async fn get_edge(
 
 /// Get device status for an edge
 pub async fn get_edge_devices(
-    State(_state): State<HubState>,
+    State(state): State<HubState>,
     axum::extract::Path(edge_id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     info!("Getting devices for edge: {}", edge_id);
 
-    // TODO: Implement device lookup for edge
-    Ok(Json(json!({
-        "edge_id": edge_id,
-        "devices": [],
-    })))
+    // Only return devices if the edge session exists
+    match state.sessions().get(&edge_id) {
+        Some(_) => Ok(Json(json!({
+            "edge_id": edge_id,
+            "devices": [],
+        }))),
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 #[cfg(test)]

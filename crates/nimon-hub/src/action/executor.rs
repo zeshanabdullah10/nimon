@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::process::Command as TokioCommand;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::actions::{
     Action, ActionResult, ActionStatus, ActionType, ScriptAction,

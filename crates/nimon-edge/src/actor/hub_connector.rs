@@ -15,7 +15,7 @@ use nimon_core::actor::messages::{
 };
 use nimon_core::NimonError;
 
-use crate::comm::{Connect, ConnectionState, SendWsMessage, WsClient, WsClientConfig, WsMessage};
+use crate::comm::{Connect, ConnectionState, SendWsMessage, WsClient, WsMessage};
 
 /// Maximum number of messages to buffer when offline
 const MAX_BUFFER_SIZE: usize = 1000;
@@ -180,12 +180,6 @@ impl HubConnectorActor {
     /// Handle disconnection event
     fn handle_disconnected(&mut self) {
         info!("Disconnected from hub");
-        self.connection_state = ConnectionState::Disconnected;
-    }
-
-    /// Handle connection error event
-    fn handle_connection_error(&mut self, error: String) {
-        warn!("Connection error: {}", error);
         self.connection_state = ConnectionState::Disconnected;
     }
 

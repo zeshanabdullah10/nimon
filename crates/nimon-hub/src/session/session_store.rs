@@ -84,7 +84,7 @@ impl SessionStore {
     }
 
     /// Iterate over all sessions
-    pub fn iter(&self) -> dashmap::iter::Iter<String, EdgeSession> {
+    pub fn iter(&self) -> dashmap::iter::Iter<'_, String, EdgeSession> {
         self.sessions.iter()
     }
 }

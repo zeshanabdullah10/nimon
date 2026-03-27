@@ -32,7 +32,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     info!("Starting NIMon Hub Server on {}:{}", config.host, config.port);
-    nimon_hub::run(config).await?;
+
+    // Actix 0.13 uses tokio::task::spawn_local internally, which requires a LocalSet.
+    let local = tokio::task::LocalSet::new();
+    local.run_until(nimon_hub::run(config)).await?;
 
     Ok(())
 }

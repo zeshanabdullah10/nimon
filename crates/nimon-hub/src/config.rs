@@ -17,7 +17,7 @@ pub struct HubConfig {
 
 fn default_host() -> String { "0.0.0.0".to_string() }
 fn default_port() -> u16 { 8080 }
-fn default_db_path() -> String { "./data/nimon.db".to_string() }
+fn default_db_path() -> String { "data/nimon.db".to_string() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertConfig {
@@ -67,7 +67,7 @@ mod tests {
         let config = HubConfig::default();
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 8080);
-        assert_eq!(config.database_path, "./data/nimon.db");
+        assert_eq!(config.database_path, "data/nimon.db");
     }
 
     #[test]
