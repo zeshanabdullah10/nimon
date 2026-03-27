@@ -96,17 +96,25 @@ pub struct AlertsResponse {
 async fn get_alerts_handler(
     axum::extract::State(state): axum::extract::State<HubState>,
 ) -> impl IntoResponse {
+    let empty_response = || Json(AlertsResponse { alerts: vec![], total: 0 });
+
     match state.alert_manager().await {
         Some(addr) => {
-            let alerts = addr.send(GetActiveAlerts).await.unwrap_or_default();
+            let alerts = match addr.send(GetActiveAlerts).await {
+                Ok(alerts) => alerts,
+                Err(e) => {
+                    error!("Failed to query AlertManager: {}", e);
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        empty_response(),
+                    ).into_response();
+                }
+            };
             let total = alerts.len();
-            Json(AlertsResponse { alerts, total })
+            Json(AlertsResponse { alerts, total }).into_response()
         }
         None => {
-            Json(AlertsResponse {
-                alerts: vec![],
-                total: 0,
-            })
+            empty_response().into_response()
         }
     }
 }

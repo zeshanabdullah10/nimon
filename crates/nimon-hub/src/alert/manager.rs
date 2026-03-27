@@ -190,6 +190,41 @@ impl AlertManager {
         }
         false
     }
+
+    /// Common logic for processing rule evaluation: checks cooldown, creates alerts,
+    /// stores them in active_alerts, and returns the newly created alerts.
+    fn process_evaluation(&mut self, ctx: &EvaluationContext) -> Vec<Alert> {
+        let mut new_alerts = Vec::new();
+
+        for rule in self.evaluate_rules(ctx) {
+            // Check cooldown
+            if self.check_cooldown(&rule.id, &ctx.device_id) {
+                debug!("Rule {} for device {} in cooldown", rule.id, ctx.device_id);
+                continue;
+            }
+
+            let alert = self.create_alert(&rule, ctx);
+            let key = format!("{}:{}", rule.id, ctx.device_id);
+
+            // Update or insert alert
+            if let Some(mut active) = self.active_alerts.get_mut(&key) {
+                active.last_fired = Utc::now();
+                active.fired_count += 1;
+                active.alert.fired_count = active.fired_count;
+            } else {
+                self.active_alerts.insert(key.clone(), ActiveAlert {
+                    alert: alert.clone(),
+                    last_fired: Utc::now(),
+                    fired_count: 1,
+                });
+            }
+
+            info!("Alert triggered: {} - {}", alert.id, alert.title);
+            new_alerts.push(alert);
+        }
+
+        new_alerts
+    }
 }
 
 impl Actor for AlertManager {
@@ -211,36 +246,7 @@ impl Handler<EvaluateRules> for AlertManager {
     type Result = Vec<Alert>;
 
     fn handle(&mut self, msg: EvaluateRules, _ctx: &mut Self::Context) -> Self::Result {
-        let mut new_alerts = Vec::new();
-
-        for rule in self.evaluate_rules(&msg.context) {
-            // Check cooldown
-            if self.check_cooldown(&rule.id, &msg.context.device_id) {
-                debug!("Rule {} for device {} in cooldown", rule.id, msg.context.device_id);
-                continue;
-            }
-
-            let alert = self.create_alert(&rule, &msg.context);
-            let key = format!("{}:{}", rule.id, msg.context.device_id);
-
-            // Update or insert alert
-            if let Some(mut active) = self.active_alerts.get_mut(&key) {
-                active.last_fired = Utc::now();
-                active.fired_count += 1;
-                active.alert.fired_count = active.fired_count;
-            } else {
-                self.active_alerts.insert(key.clone(), ActiveAlert {
-                    alert: alert.clone(),
-                    last_fired: Utc::now(),
-                    fired_count: 1,
-                });
-            }
-
-            info!("Alert triggered: {} - {}", alert.id, alert.title);
-            new_alerts.push(alert);
-        }
-
-        new_alerts
+        self.process_evaluation(&msg.context)
     }
 }
 
@@ -286,7 +292,7 @@ impl Handler<ResolveAlert> for AlertManager {
 impl Handler<DeviceStatusUpdate> for AlertManager {
     type Result = ();
 
-    fn handle(&mut self, msg: DeviceStatusUpdate, ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: DeviceStatusUpdate, _ctx: &mut Self::Context) -> Self::Result {
         let eval_ctx = EvaluationContext {
             device_id: msg.device_id.clone(),
             edge_id: msg.edge_id.clone(),
@@ -297,9 +303,8 @@ impl Handler<DeviceStatusUpdate> for AlertManager {
             predictions: vec![],
         };
 
-        let rules = self.evaluate_rules(&eval_ctx);
-        for rule in rules {
-            let alert = self.create_alert(&rule, &eval_ctx);
+        let alerts = self.process_evaluation(&eval_ctx);
+        for alert in alerts {
             let _ = self.notification_tx.send(alert);
         }
     }
@@ -331,6 +336,14 @@ impl Handler<PredictionResult> for AlertManager {
             };
 
             info!("Prediction alert: {}", alert.title);
+
+            let key = format!("{}:{}", alert.rule_id, msg.device_id);
+            self.active_alerts.insert(key, ActiveAlert {
+                alert: alert.clone(),
+                last_fired: Utc::now(),
+                fired_count: 1,
+            });
+
             let _ = self.notification_tx.send(alert);
         }
     }
