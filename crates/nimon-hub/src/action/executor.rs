@@ -218,6 +218,11 @@ impl ActionExecutor {
         ctx: &ActionContext,
         script_config: &ScriptAction,
     ) -> std::result::Result<ActionResult, anyhow::Error> {
+        // Check for unsupported run_as field
+        if script_config.run_as.is_some() {
+            warn!("run_as is not yet supported, script will run as current user");
+        }
+
         // Perform variable substitution on script and args
         let script = substitute_variables(&script_config.script, &ctx.variables);
         let args: Vec<String> = script_config
@@ -286,19 +291,41 @@ impl ActionExecutor {
         _ctx: &ActionContext,
         service_name: &str,
     ) -> std::result::Result<ActionResult, anyhow::Error> {
+        // Validate service name - alphanumeric, hyphens, underscores, dots only
+        if !service_name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Ok(ActionResult {
+                action_id: action.id.clone(),
+                status: ActionStatus::Failed,
+                exit_code: None,
+                output: String::new(),
+                error: format!("Invalid service name: {}", service_name),
+                duration_ms: 0,
+                attempt: _ctx.attempt,
+                executed_at: chrono::Utc::now(),
+            });
+        }
+
         #[cfg(target_os = "windows")]
         let result = {
-            let stop_output = TokioCommand::new("sc")
-                .args(&["stop", service_name])
-                .output()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to stop service: {}", e))?;
+            let stop_output = tokio::time::timeout(
+                Duration::from_secs(30),
+                TokioCommand::new("sc")
+                    .args(&["stop", service_name])
+                    .output(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out stopping service after 30s"))?
+            .map_err(|e| anyhow::anyhow!("Failed to stop service: {}", e))?;
 
-            let start_output = TokioCommand::new("sc")
-                .args(&["start", service_name])
-                .output()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to start service: {}", e))?;
+            let start_output = tokio::time::timeout(
+                Duration::from_secs(30),
+                TokioCommand::new("sc")
+                    .args(&["start", service_name])
+                    .output(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out starting service after 30s"))?
+            .map_err(|e| anyhow::anyhow!("Failed to start service: {}", e))?;
 
             let stdout = String::from_utf8_lossy(&stop_output.stdout).to_string()
                 + &String::from_utf8_lossy(&start_output.stdout).to_string();
@@ -311,11 +338,15 @@ impl ActionExecutor {
 
         #[cfg(not(target_os = "windows"))]
         let result = {
-            let output = TokioCommand::new("systemctl")
-                .args(&["restart", service_name])
-                .output()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to restart service: {}", e))?;
+            let output = tokio::time::timeout(
+                Duration::from_secs(30),
+                TokioCommand::new("systemctl")
+                    .args(&["restart", service_name])
+                    .output(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out restarting service after 30s"))?
+            .map_err(|e| anyhow::anyhow!("Failed to restart service: {}", e))?;
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
