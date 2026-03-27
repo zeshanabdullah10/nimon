@@ -25,11 +25,14 @@ use tower_http::{
 use tracing::{debug, error, info, warn};
 
 use crate::action::executor::ActionExecutor;
-use crate::alert::manager::{AlertManager, AlertManagerConfig, GetActiveAlerts};
+use crate::alert::manager::{AlertManager, AlertManagerConfig, GetActiveAlerts, GetRecentPredictions, GetAlertHistory};
+use crate::config::try_rule_config_to_alert_rule;
 use crate::session::SessionStore;
 
 use nimon_core::actor::messages::{DeviceStatusUpdate, PredictionResult};
+use nimon_core::db::edge_repo::EdgeRepository;
 use nimon_core::protocol::{WsMessage, WsMessageType};
+use nimon_core::{EdgeNode, EdgeStatus};
 
 /// Hub server state
 #[derive(Clone)]
@@ -38,22 +41,35 @@ pub struct HubState {
     sessions: SessionStore,
     /// Alert manager actor address
     alert_manager: Arc<Mutex<Option<actix::Addr<AlertManager>>>>,
+    /// Database pool for edge persistence
+    db_pool: Option<Arc<SqlitePool>>,
 }
 
 impl HubState {
-    /// Create a new hub state
+    /// Create a new hub state (without database pool - for testing)
     pub fn new() -> Self {
         Self {
             sessions: SessionStore::new(),
             alert_manager: Arc::new(Mutex::new(None)),
+            db_pool: None,
         }
     }
 
-    /// Create a new hub state with an alert manager
+    /// Create a new hub state with a database pool
+    pub fn with_db_pool(pool: SqlitePool) -> Self {
+        Self {
+            sessions: SessionStore::new(),
+            alert_manager: Arc::new(Mutex::new(None)),
+            db_pool: Some(Arc::new(pool)),
+        }
+    }
+
+    /// Create a new hub state with an alert manager (for backwards compatibility)
     pub fn with_alert_manager(alert_manager: actix::Addr<AlertManager>) -> Self {
         Self {
             sessions: SessionStore::new(),
             alert_manager: Arc::new(Mutex::new(Some(alert_manager))),
+            db_pool: None,
         }
     }
 
@@ -72,6 +88,11 @@ impl HubState {
     /// Get the session store
     pub fn sessions(&self) -> &SessionStore {
         &self.sessions
+    }
+
+    /// Get the database pool
+    pub fn db_pool(&self) -> Option<Arc<SqlitePool>> {
+        self.db_pool.clone()
     }
 }
 
@@ -93,6 +114,13 @@ pub struct HealthResponse {
 #[derive(serde::Serialize)]
 pub struct AlertsResponse {
     pub alerts: Vec<nimon_core::alert::Alert>,
+    pub total: usize,
+}
+
+/// Alert history response
+#[derive(serde::Serialize)]
+pub struct AlertHistoryResponse {
+    pub alerts: Vec<serde_json::Value>,
     pub total: usize,
 }
 
@@ -130,12 +158,69 @@ async fn get_alerts_handler(
     }
 }
 
+/// Handler to get alert history from the database
+async fn get_alert_history_handler(
+    axum::extract::State(state): axum::extract::State<HubState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = params.get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100);
+
+    match state.alert_manager().await {
+        Some(addr) => {
+            match addr.send(GetAlertHistory { limit }).await {
+                Ok(Ok(mut alerts)) => {
+                    // Apply client-side filtering
+                    if let Some(severity) = params.get("severity") {
+                        alerts.retain(|a| a.get("severity").and_then(|v| v.as_str()) == Some(severity));
+                    }
+                    if let Some(edge_id) = params.get("edge_id") {
+                        alerts.retain(|a| a.get("edge_id").and_then(|v| v.as_str()) == Some(edge_id));
+                    }
+                    if let Some(device_id) = params.get("device_id") {
+                        alerts.retain(|a| a.get("device_id").and_then(|v| v.as_str()) == Some(device_id));
+                    }
+                    let total = alerts.len();
+                    Json(AlertHistoryResponse { alerts, total }).into_response()
+                }
+                Ok(Err(e)) => {
+                    error!("Failed to get alert history: {}", e);
+                    Json(AlertHistoryResponse { alerts: vec![], total: 0 }).into_response()
+                }
+                Err(e) => {
+                    error!("AlertManager unavailable: {}", e);
+                    Json(AlertHistoryResponse { alerts: vec![], total: 0 }).into_response()
+                }
+            }
+        }
+        None => Json(AlertHistoryResponse { alerts: vec![], total: 0 }).into_response(),
+    }
+}
+
 /// Handler to get active predictions
-async fn get_predictions_handler() -> impl IntoResponse {
-    Json(PredictionsResponse {
-        predictions: vec![],
-        total: 0,
-    })
+async fn get_predictions_handler(
+    axum::extract::State(state): axum::extract::State<HubState>,
+) -> impl IntoResponse {
+    match state.alert_manager().await {
+        Some(addr) => {
+            match addr.send(GetRecentPredictions { limit: 100 }).await {
+                Ok(Ok(predictions)) => {
+                    let total = predictions.len();
+                    Json(PredictionsResponse { predictions, total }).into_response()
+                }
+                Ok(Err(e)) => {
+                    error!("Failed to get predictions: {}", e);
+                    Json(PredictionsResponse { predictions: vec![], total: 0 }).into_response()
+                }
+                Err(e) => {
+                    error!("AlertManager unavailable: {}", e);
+                    Json(PredictionsResponse { predictions: vec![], total: 0 }).into_response()
+                }
+            }
+        }
+        None => Json(PredictionsResponse { predictions: vec![], total: 0 }).into_response(),
+    }
 }
 
 /// Handler to acknowledge (resolve) an alert
@@ -166,8 +251,6 @@ async fn acknowledge_alert_handler(
 
 /// Start the hub server
 pub async fn run(config: crate::config::HubConfig) -> anyhow::Result<()> {
-    let state = HubState::new();
-
     // Resolve database path to absolute and ensure the data directory exists
     let db_path = std::path::Path::new(&config.database_path);
     let db_path = if db_path.is_relative() {
@@ -185,14 +268,31 @@ pub async fn run(config: crate::config::HubConfig) -> anyhow::Result<()> {
     nimon_core::db::init_database(&pool).await?;
     info!("Database initialized at {}", db_url);
 
+    // Create HubState with the database pool
+    let state = HubState::with_db_pool(pool.clone());
+
     // Create and start the ActionExecutor actor
     let action_executor = ActionExecutor::new().start();
 
     // Create and start the AlertManager actor with action executor and database pool
+    // Convert config rules to AlertRule, falling back to defaults if conversion fails or empty
+    let rules: Vec<nimon_core::alert::rules::AlertRule> = config.alert.rules.iter()
+        .filter_map(|r| {
+            match try_rule_config_to_alert_rule(r) {
+                Ok(rule) => Some(rule),
+                Err(e) => {
+                    error!("Failed to convert rule '{}': {}", r.name, e);
+                    None
+                }
+            }
+        })
+        .collect();
     let alert_config = AlertManagerConfig {
         default_cooldown_minutes: config.alert.default_cooldown_minutes,
         max_firing_count: config.alert.max_firing_count,
-        ..Default::default()
+        cleanup_interval_hours: 24,
+        notification_channels: config.alert.notification_channels.clone(),
+        rules,
     };
     let alert_manager = AlertManager::new(alert_config)
     .with_action_executor(action_executor)
@@ -208,6 +308,7 @@ pub async fn run(config: crate::config::HubConfig) -> anyhow::Result<()> {
         .route("/health", get(health_handler))
         .route("/api/v1/status", get(status_handler))
         .route("/api/v1/alerts", get(get_alerts_handler))
+        .route("/api/v1/alerts/history", get(get_alert_history_handler))
         .route("/api/v1/alerts/:alert_id/acknowledge", post(acknowledge_alert_handler))
         .route("/api/v1/predictions", get(get_predictions_handler))
         .route("/api/v1/edges", get(routes::list_edges))
@@ -303,12 +404,31 @@ async fn ws_socket_handler(socket: WebSocket, state: HubState) {
                         let session = crate::session::EdgeSession::new(
                             registration.edge_id.clone(),
                             registration.name.clone(),
-                            registration.hostname,
-                            registration.ip_address,
+                            registration.hostname.clone(),
+                            registration.ip_address.clone(),
                         );
 
                         edge_id = Some(registration.edge_id.clone());
                         state.sessions().add(session);
+
+                        // Persist edge registration to database (fire-and-forget)
+                        if let Some(pool) = state.db_pool() {
+                            let pool = pool.clone();
+                            let edge_node = EdgeNode {
+                                id: registration.edge_id.clone(),
+                                name: registration.name.clone(),
+                                hostname: registration.hostname,
+                                ip_address: registration.ip_address,
+                                last_seen: Some(chrono::Utc::now()),
+                                status: EdgeStatus::Online,
+                            };
+                            tokio::spawn(async move {
+                                let repo = EdgeRepository::new(&pool);
+                                if let Err(e) = repo.upsert(&edge_node).await {
+                                    tracing::error!("Failed to upsert edge node: {}", e);
+                                }
+                            });
+                        }
 
                         let ack = WsMessage::ack(ws_msg.msg_id, true, None);
                         if let Ok(json) = ack.to_json() {
@@ -368,6 +488,18 @@ async fn ws_socket_handler(socket: WebSocket, state: HubState) {
                             if let Some(session) = state.sessions().get(eid) {
                                 session.update_heartbeat().await;
                                 debug!("Heartbeat updated for edge: {}", eid);
+
+                                // Update last_seen in database (fire-and-forget)
+                                if let Some(pool) = state.db_pool() {
+                                    let pool = pool.clone();
+                                    let eid_clone = eid.clone();
+                                    tokio::spawn(async move {
+                                        let repo = EdgeRepository::new(&pool);
+                                        if let Err(e) = repo.update_status(&eid_clone, EdgeStatus::Online).await {
+                                            tracing::error!("Failed to update edge last_seen: {}", e);
+                                        }
+                                    });
+                                }
                             }
                         }
                     }
@@ -404,10 +536,22 @@ async fn ws_socket_handler(socket: WebSocket, state: HubState) {
         }
     }
 
-    // Remove the edge session on disconnect
+    // Remove the edge session on disconnect and mark offline in database
     if let Some(ref eid) = edge_id {
         state.sessions().remove(eid);
         info!("Edge disconnected: {}", eid);
+
+        // Mark edge as offline in database (fire-and-forget)
+        if let Some(pool) = state.db_pool() {
+            let pool = pool.clone();
+            let eid_clone = eid.clone();
+            tokio::spawn(async move {
+                let repo = EdgeRepository::new(&pool);
+                if let Err(e) = repo.update_status(&eid_clone, EdgeStatus::Offline).await {
+                    tracing::error!("Failed to update edge status to offline: {}", e);
+                }
+            });
+        }
     }
 
     info!("WebSocket connection closed");

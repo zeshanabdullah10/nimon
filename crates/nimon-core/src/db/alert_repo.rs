@@ -92,6 +92,19 @@ impl<'a> AlertRepository<'a> {
 
         Ok(records)
     }
+
+    /// List recent alerts (all statuses), most recent first.
+    pub async fn list_recent(&self, limit: i64) -> NimonResult<Vec<AlertRecord>> {
+        let records = sqlx::query_as::<_, AlertRecord>(
+            "SELECT id, device_id, edge_id, rule_name, severity, message, channels, status, action_taken, action_result, created_at, resolved_at FROM alerts ORDER BY created_at DESC LIMIT ?"
+        )
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
 }
 
 #[cfg(test)]

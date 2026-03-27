@@ -4,16 +4,18 @@ use actix::prelude::*;
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
 use sqlx::SqlitePool;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use nimon_core::alert::*;
 use nimon_core::alert::rules::{AlertRule, ComparisonOp, EvaluationContext, RuleCondition};
 use nimon_core::actor::messages::{DeviceStatusUpdate, PredictionResult};
 use nimon_core::db::{AlertRepository, PredictionRepository};
+use nimon_core::db::device_repo::DeviceRepository;
 use nimon_core::{HealthStatus, MetricValue};
 
 use crate::action::executor::{ActionContext, ExecuteAction};
 use crate::action::actions::Action;
+use crate::alert::notifier::{AlertNotifier, SendNotification};
 
 /// Prediction alert thresholds
 const PREDICTION_ALERT_THRESHOLD: f64 = 0.8;
@@ -28,6 +30,10 @@ pub struct AlertManagerConfig {
     pub max_firing_count: i32,
     /// Alert cleanup interval
     pub cleanup_interval_hours: i64,
+    /// Notification channels for alert notifications
+    pub notification_channels: Vec<crate::config::NotificationChannelConfig>,
+    /// Alert rules (uses default_rules() if empty)
+    pub rules: Vec<AlertRule>,
 }
 
 impl Default for AlertManagerConfig {
@@ -36,6 +42,8 @@ impl Default for AlertManagerConfig {
             default_cooldown_minutes: 5,
             max_firing_count: 100,
             cleanup_interval_hours: 24,
+            notification_channels: Vec::new(),
+            rules: Vec::new(),
         }
     }
 }
@@ -53,7 +61,7 @@ pub struct AlertManager {
     config: AlertManagerConfig,
     rules: Vec<AlertRule>,
     active_alerts: DashMap<String, ActiveAlert>,
-    notification_tx: tokio::sync::mpsc::UnboundedSender<Alert>,
+    notifier_addr: Option<actix::Addr<AlertNotifier>>,
     action_executor: Option<actix::Addr<crate::action::executor::ActionExecutor>>,
     /// SQLite connection pool for persisting alerts and predictions.
     /// When `Some`, alerts and predictions are written to the database.
@@ -62,12 +70,16 @@ pub struct AlertManager {
 
 impl AlertManager {
     pub fn new(config: AlertManagerConfig) -> Self {
-        let (notification_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let rules = if config.rules.is_empty() {
+            Self::default_rules()
+        } else {
+            config.rules.clone()
+        };
         Self {
             config,
-            rules: Self::default_rules(),
+            rules,
             active_alerts: DashMap::new(),
-            notification_tx,
+            notifier_addr: None,
             action_executor: None,
             db_pool: None,
         }
@@ -308,6 +320,38 @@ impl Actor for AlertManager {
 
     fn started(&mut self, _ctx: &mut Self::Context) {
         info!("AlertManager actor started");
+
+        // Start the AlertNotifier if notification channels are configured
+        if !self.config.notification_channels.is_empty() {
+            let channels: Vec<_> = self.config.notification_channels.iter().map(|c| {
+                nimon_core::alert::NotificationChannel {
+                    id: c.channel_type.clone(),
+                    name: c.channel_type.clone(),
+                    enabled: c.enabled.unwrap_or(true),
+                    channel_type: match c.channel_type.as_str() {
+                        "slack" => nimon_core::alert::ChannelType::Slack {
+                            webhook_url: c.webhook_url.clone().unwrap_or_default()
+                        },
+                        "teams" => nimon_core::alert::ChannelType::Teams {
+                            webhook_url: c.webhook_url.clone().unwrap_or_default()
+                        },
+                        "webhook" => nimon_core::alert::ChannelType::Webhook {
+                            url: c.webhook_url.clone().unwrap_or_default(),
+                            headers: Default::default(),
+                        },
+                        _ => {
+                            tracing::debug!("Unsupported notification channel type: {}, using Console", c.channel_type);
+                            nimon_core::alert::ChannelType::Console
+                        }
+                    },
+                    config: Default::default(),
+                }
+            }).collect();
+
+            let notifier = AlertNotifier::new(channels).start();
+            self.notifier_addr = Some(notifier);
+            info!("AlertNotifier started with {} channels", self.config.notification_channels.len());
+        }
     }
 }
 
@@ -328,6 +372,20 @@ impl Handler<EvaluateRules> for AlertManager {
     }
 }
 
+/// Message to get active predictions from the database
+#[derive(Message)]
+#[rtype(result = "Result<Vec<serde_json::Value>, String>")]
+pub struct GetRecentPredictions {
+    pub limit: usize,
+}
+
+/// Message to get alert history from the database
+#[derive(Message)]
+#[rtype(result = "Result<Vec<serde_json::Value>, String>")]
+pub struct GetAlertHistory {
+    pub limit: usize,
+}
+
 /// Message to get active alerts
 #[derive(Message)]
 #[rtype(result = "Vec<Alert>")]
@@ -340,6 +398,73 @@ impl Handler<GetActiveAlerts> for AlertManager {
         self.active_alerts.iter()
             .map(|entry| entry.value().alert.clone())
             .collect()
+    }
+}
+
+impl Handler<GetRecentPredictions> for AlertManager {
+    type Result = ResponseActFuture<Self, Result<Vec<serde_json::Value>, String>>;
+
+    fn handle(&mut self, msg: GetRecentPredictions, _ctx: &mut Self::Context) -> Self::Result {
+        let pool = self.db_pool.clone();
+        let limit = msg.limit;
+        let fut = async move {
+            let pool = pool.ok_or("No database pool")?;
+            let repo = PredictionRepository::new(&pool);
+            let predictions = repo.list_active()
+                .await
+                .map_err(|e| e.to_string())?;
+            // Convert to JSON, limited to requested count
+            let json: Vec<serde_json::Value> = predictions.into_iter()
+                .take(limit)
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id,
+                        "device_id": p.device_id,
+                        "edge_id": p.edge_id,
+                        "prediction_type": p.prediction_type,
+                        "probability": p.probability,
+                        "eta_minutes": p.eta_minutes,
+                        "status": p.status,
+                        "created_at": p.created_at,
+                    })
+                })
+                .collect();
+            Ok(json)
+        }.into_actor(self);
+        Box::pin(fut)
+    }
+}
+
+impl Handler<GetAlertHistory> for AlertManager {
+    type Result = ResponseActFuture<Self, Result<Vec<serde_json::Value>, String>>;
+
+    fn handle(&mut self, msg: GetAlertHistory, _ctx: &mut Self::Context) -> Self::Result {
+        let pool = self.db_pool.clone();
+        let limit = msg.limit;
+        let fut = async move {
+            let pool = pool.ok_or("No database pool")?;
+            let repo = AlertRepository::new(&pool);
+            let alerts = repo.list_recent(limit as i64)
+                .await
+                .map_err(|e| e.to_string())?;
+            let json: Vec<serde_json::Value> = alerts.into_iter()
+                .map(|a| {
+                    serde_json::json!({
+                        "id": a.id,
+                        "device_id": a.device_id,
+                        "edge_id": a.edge_id,
+                        "rule_name": a.rule_name,
+                        "severity": a.severity,
+                        "message": a.message,
+                        "status": a.status,
+                        "created_at": a.created_at,
+                        "resolved_at": a.resolved_at,
+                    })
+                })
+                .collect();
+            Ok(json)
+        }.into_actor(self);
+        Box::pin(fut)
     }
 }
 
@@ -383,8 +508,31 @@ impl Handler<DeviceStatusUpdate> for AlertManager {
 
         let alerts = self.process_evaluation(&eval_ctx);
         self.persist_alerts(&alerts, ctx);
+
+        // Persist device status to the database (fire-and-forget)
+        if let Some(ref pool) = self.db_pool {
+            let pool = pool.clone();
+            let device_status = nimon_core::DeviceStatus {
+                device_id: msg.device_id.clone(),
+                status: msg.status,
+                last_poll: msg.timestamp,
+                metrics: msg.metrics.clone(),
+                error_message: None,
+                error_count: 0,
+                uptime_seconds: 0,
+            };
+            ctx.spawn(actix::fut::wrap_future(async move {
+                let repo = DeviceRepository::new(&pool);
+                if let Err(e) = repo.upsert_status(&device_status).await {
+                    error!("Failed to persist device status: {}", e);
+                }
+            }));
+        }
+
         for alert in alerts {
-            let _ = self.notification_tx.send(alert);
+            if let Some(ref addr) = self.notifier_addr {
+                addr.do_send(SendNotification { alert });
+            }
         }
     }
 }
@@ -467,7 +615,9 @@ impl Handler<PredictionResult> for AlertManager {
         // Also persist the alert generated from this prediction
         self.persist_alerts(&[alert.clone()], ctx);
 
-        let _ = self.notification_tx.send(alert);
+        if let Some(ref addr) = self.notifier_addr {
+            addr.do_send(SendNotification { alert });
+        }
     }
 }
 
