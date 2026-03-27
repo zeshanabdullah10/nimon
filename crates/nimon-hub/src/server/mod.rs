@@ -38,8 +38,8 @@ use nimon_core::{EdgeNode, EdgeStatus};
 /// Hub server state
 #[derive(Clone)]
 pub struct HubState {
-    /// Connected edge sessions
-    sessions: SessionStore,
+    /// Connected edge sessions (shared via Arc)
+    sessions: Arc<SessionStore>,
     /// Alert manager actor address
     alert_manager: Arc<Mutex<Option<actix::Addr<AlertManager>>>>,
     /// Database pool for edge persistence
@@ -50,7 +50,7 @@ impl HubState {
     /// Create a new hub state (without database pool - for testing)
     pub fn new() -> Self {
         Self {
-            sessions: SessionStore::new(),
+            sessions: Arc::new(SessionStore::new()),
             alert_manager: Arc::new(Mutex::new(None)),
             db_pool: None,
         }
@@ -59,7 +59,7 @@ impl HubState {
     /// Create a new hub state with a database pool
     pub fn with_db_pool(pool: SqlitePool) -> Self {
         Self {
-            sessions: SessionStore::new(),
+            sessions: Arc::new(SessionStore::new()),
             alert_manager: Arc::new(Mutex::new(None)),
             db_pool: Some(Arc::new(pool)),
         }
@@ -68,7 +68,7 @@ impl HubState {
     /// Create a new hub state with an alert manager (for backwards compatibility)
     pub fn with_alert_manager(alert_manager: actix::Addr<AlertManager>) -> Self {
         Self {
-            sessions: SessionStore::new(),
+            sessions: Arc::new(SessionStore::new()),
             alert_manager: Arc::new(Mutex::new(Some(alert_manager))),
             db_pool: None,
         }
@@ -87,8 +87,8 @@ impl HubState {
     }
 
     /// Get the session store
-    pub fn sessions(&self) -> &SessionStore {
-        &self.sessions
+    pub fn sessions(&self) -> Arc<SessionStore> {
+        self.sessions.clone()
     }
 
     /// Get the database pool
@@ -393,7 +393,11 @@ async fn ws_handler(
     axum::extract::State(state): axum::extract::State<HubState>,
 ) -> impl IntoResponse {
     info!("WebSocket connection request from edge");
-    ws.on_upgrade(move |socket| ws_socket_handler(socket, state))
+    ws.on_upgrade(move |socket| {
+        async move {
+            let _ = ws_socket_handler(socket, state).await;
+        }
+    })
 }
 
 /// Handle WebSocket connection
@@ -604,7 +608,9 @@ async fn ws_socket_handler(socket: WebSocket, state: HubState) {
 async fn health_handler(
     axum::extract::State(state): axum::extract::State<HubState>,
 ) -> impl IntoResponse {
-    let connected = state.sessions().len();
+    let sessions = state.sessions();
+    let connected = sessions.len();
+    debug!("health_handler: sessions.len() = {}", connected);
 
     Json(HealthResponse {
         status: "healthy".to_string(),

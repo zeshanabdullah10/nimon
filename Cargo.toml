@@ -6,6 +6,7 @@ members = [
     "crates/nimon-hub",
     "crates/nimon-cli",
     "crates/nimon-ni",
+    "crates/nimon-sim",
 ]
 
 [workspace.package]
