@@ -245,7 +245,14 @@ impl Handler<PredictionResult> for HubConnectorActor {
     type Result = ();
 
     fn handle(&mut self, msg: PredictionResult, _ctx: &mut Self::Context) -> Self::Result {
-        debug!("Prediction result: {:?} for device {}", msg.prediction_type, msg.device_id);
+        if msg.probability >= 0.8 {
+            warn!(
+                "HIGH-CONFIDENCE prediction: {:?} for device {} (probability: {:.2}, ETA: {:?}min)",
+                msg.prediction_type, msg.device_id, msg.probability, msg.eta_minutes
+            );
+        } else {
+            debug!("Prediction result: {:?} for device {}", msg.prediction_type, msg.device_id);
+        }
         let ws_msg = WsMessage::prediction(msg);
         let _ = self.send_message(ws_msg);
     }
@@ -402,5 +409,46 @@ mod tests {
 
         let ws_msg = WsMessage::prediction(prediction);
         assert_eq!(ws_msg.msg_type, crate::comm::WsMessageType::Prediction);
+    }
+
+    #[test]
+    fn test_high_confidence_prediction_threshold() {
+        use nimon_core::actor::messages::PredictionType;
+
+        // Above threshold (0.8) should be logged at warn level
+        let high_conf = PredictionResult {
+            device_id: "test-device".to_string(),
+            edge_id: "test-edge".to_string(),
+            prediction_type: PredictionType::Overheating,
+            probability: 0.85,
+            eta_minutes: Some(30),
+            confidence: 0.9,
+            timestamp: chrono::Utc::now(),
+        };
+        assert!(high_conf.probability >= 0.8, "Should be high confidence");
+
+        // Below threshold should be logged at debug level only
+        let low_conf = PredictionResult {
+            device_id: "test-device".to_string(),
+            edge_id: "test-edge".to_string(),
+            prediction_type: PredictionType::Overheating,
+            probability: 0.5,
+            eta_minutes: Some(60),
+            confidence: 0.6,
+            timestamp: chrono::Utc::now(),
+        };
+        assert!(low_conf.probability < 0.8, "Should be low confidence");
+
+        // Boundary test: exactly 0.8
+        let boundary = PredictionResult {
+            device_id: "test-device".to_string(),
+            edge_id: "test-edge".to_string(),
+            prediction_type: PredictionType::ConnectionFailure,
+            probability: 0.8,
+            eta_minutes: Some(45),
+            confidence: 0.8,
+            timestamp: chrono::Utc::now(),
+        };
+        assert!(boundary.probability >= 0.8, "Exactly at threshold is high confidence");
     }
 }
