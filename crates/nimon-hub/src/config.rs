@@ -37,10 +37,17 @@ pub struct AlertConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationChannelConfig {
-    pub channel_type: String,  // "slack", "teams", "webhook", "console"
+    pub channel_type: String,  // "email", "slack", "teams", "webhook", "console"
+    pub name: Option<String>,
     pub webhook_url: Option<String>,
-    pub enabled: Option<bool>,  // default true
+    pub smtp_server: Option<String>,
+    pub from_addr: Option<String>,
+    pub to_addrs: Option<Vec<String>>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
 }
+
+fn default_enabled() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleConfig {

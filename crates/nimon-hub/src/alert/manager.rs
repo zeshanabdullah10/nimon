@@ -325,10 +325,15 @@ impl Actor for AlertManager {
         if !self.config.notification_channels.is_empty() {
             let channels: Vec<_> = self.config.notification_channels.iter().map(|c| {
                 nimon_core::alert::NotificationChannel {
-                    id: c.channel_type.clone(),
-                    name: c.channel_type.clone(),
-                    enabled: c.enabled.unwrap_or(true),
+                    id: c.name.clone().unwrap_or_else(|| c.channel_type.clone()),
+                    name: c.name.clone().unwrap_or_else(|| c.channel_type.clone()),
+                    enabled: c.enabled,
                     channel_type: match c.channel_type.as_str() {
+                        "email" => nimon_core::alert::ChannelType::Email {
+                            smtp_server: c.smtp_server.clone().unwrap_or_else(|| "localhost".to_string()),
+                            from_addr: c.from_addr.clone().unwrap_or_else(|| "nimon@localhost".to_string()),
+                            to_addrs: c.to_addrs.clone().unwrap_or_else(|| vec!["admin@localhost".to_string()]),
+                        },
                         "slack" => nimon_core::alert::ChannelType::Slack {
                             webhook_url: c.webhook_url.clone().unwrap_or_default()
                         },

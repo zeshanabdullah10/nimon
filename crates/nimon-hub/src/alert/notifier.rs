@@ -1,7 +1,9 @@
 //! Alert notification sender
 
 use actix::prelude::*;
-use tracing::{debug, error, info};
+use tracing::{error, info};
+
+use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use nimon_core::alert::{Alert, AlertSeverity, ChannelType, NotificationChannel};
 use actix::fut::wrap_future;
@@ -29,9 +31,10 @@ impl AlertNotifier {
                         alert.severity, alert.device_id, alert.title, alert.message
                     );
                 }
-                ChannelType::Email { .. } => {
-                    // TODO: Implement email sending
-                    debug!("Email notification for alert {}", alert.id);
+                ChannelType::Email { smtp_server, from_addr, to_addrs } => {
+                    if let Err(e) = self.send_email(smtp_server, from_addr, to_addrs, alert).await {
+                        error!("Email notification failed for {}: {}", channel.id, e);
+                    }
                 }
                 ChannelType::Webhook { url, .. } => {
                     if let Err(e) = self.send_webhook(url, alert).await {
@@ -129,6 +132,20 @@ impl AlertNotifier {
             .json(&payload)
             .send()
             .await?;
+
+        Ok(())
+    }
+
+    async fn send_email(&self, smtp_server: &str, from_addr: &str, to_addrs: &[String], alert: &Alert) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let email = Message::builder()
+            .from(from_addr.parse()?)
+            .to(to_addrs.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ").parse()?)
+            .subject(format!("[{:?}] {}", alert.severity, alert.title))
+            .body(alert.message.clone())?;
+
+        let mailer: AsyncSmtpTransport<Tokio1Executor> =
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(smtp_server).build();
+        mailer.send(email).await?;
 
         Ok(())
     }
