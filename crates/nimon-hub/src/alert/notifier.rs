@@ -4,6 +4,8 @@ use actix::prelude::*;
 use tracing::{error, info};
 
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::transport::smtp::client::Tls;
+use lettre::transport::smtp::client::TlsParameters;
 
 use nimon_core::alert::{Alert, AlertSeverity, ChannelType, NotificationChannel};
 use actix::fut::wrap_future;
@@ -32,7 +34,11 @@ impl AlertNotifier {
                     );
                 }
                 ChannelType::Email { smtp_server, from_addr, to_addrs } => {
-                    if let Err(e) = self.send_email(smtp_server, from_addr, to_addrs, alert).await {
+                    let skip_tls_verify = channel.config
+                        .get("smtp_skip_tls_verify")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if let Err(e) = self.send_email(smtp_server, from_addr, to_addrs, skip_tls_verify, alert).await {
                         error!("Email notification failed for {}: {}", channel.id, e);
                     }
                 }
@@ -136,15 +142,21 @@ impl AlertNotifier {
         Ok(())
     }
 
-    async fn send_email(&self, smtp_server: &str, from_addr: &str, to_addrs: &[String], alert: &Alert) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn send_email(&self, smtp_server: &str, from_addr: &str, to_addrs: &[String], skip_tls_verify: bool, alert: &Alert) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let email = Message::builder()
             .from(from_addr.parse()?)
             .to(to_addrs.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ").parse()?)
             .subject(format!("[{:?}] {}", alert.severity, alert.title))
             .body(alert.message.clone())?;
 
-        let mailer: AsyncSmtpTransport<Tokio1Executor> =
-            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(smtp_server).build();
+        let mailer: AsyncSmtpTransport<Tokio1Executor> = if skip_tls_verify {
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(smtp_server).build()
+        } else {
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(smtp_server)
+                .port(587)
+                .tls(Tls::Required(TlsParameters::new(smtp_server.into())?))
+                .build()
+        };
         mailer.send(email).await?;
 
         Ok(())

@@ -324,6 +324,12 @@ impl Actor for AlertManager {
         // Start the AlertNotifier if notification channels are configured
         if !self.config.notification_channels.is_empty() {
             let channels: Vec<_> = self.config.notification_channels.iter().map(|c| {
+                let skip_tls_verify = c.smtp_skip_tls_verify.unwrap_or(false);
+                let channel_config: serde_json::Value = if c.channel_type == "email" {
+                    serde_json::json!({ "smtp_skip_tls_verify": skip_tls_verify })
+                } else {
+                    serde_json::json!({})
+                };
                 nimon_core::alert::NotificationChannel {
                     id: c.name.clone().unwrap_or_else(|| c.channel_type.clone()),
                     name: c.name.clone().unwrap_or_else(|| c.channel_type.clone()),
@@ -349,7 +355,7 @@ impl Actor for AlertManager {
                             nimon_core::alert::ChannelType::Console
                         }
                     },
-                    config: Default::default(),
+                    config: channel_config,
                 }
             }).collect();
 

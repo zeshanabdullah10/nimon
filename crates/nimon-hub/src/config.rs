@@ -45,6 +45,8 @@ pub struct NotificationChannelConfig {
     pub to_addrs: Option<Vec<String>>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub smtp_skip_tls_verify: Option<bool>,
 }
 
 fn default_enabled() -> bool { true }
