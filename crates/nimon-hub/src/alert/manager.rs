@@ -12,6 +12,8 @@ use nimon_core::alert::rules::{AlertRule, ComparisonOp, EvaluationContext, RuleC
 use nimon_core::actor::messages::{DeviceStatusUpdate, PredictionResult};
 use nimon_core::{HealthStatus, MetricValue};
 
+use crate::action::executor::{ActionContext, ExecuteAction};
+use crate::action::actions::Action;
 use crate::session::SessionStore;
 
 /// Prediction alert thresholds
@@ -54,6 +56,7 @@ pub struct AlertManager {
     active_alerts: DashMap<String, ActiveAlert>,
     sessions: SessionStore,
     notification_tx: tokio::sync::mpsc::UnboundedSender<Alert>,
+    action_executor: Option<actix::Addr<crate::action::executor::ActionExecutor>>,
 }
 
 impl AlertManager {
@@ -65,7 +68,15 @@ impl AlertManager {
             active_alerts: DashMap::new(),
             sessions,
             notification_tx,
+            action_executor: None,
         }
+    }
+
+    /// Set the action executor for auto-remediation on critical alerts.
+    /// Returns Self for builder-pattern chaining.
+    pub fn with_action_executor(mut self, addr: actix::Addr<crate::action::executor::ActionExecutor>) -> Self {
+        self.action_executor = Some(addr);
+        self
     }
 
     fn default_rules() -> Vec<AlertRule> {
@@ -220,6 +231,29 @@ impl AlertManager {
             }
 
             info!("Alert triggered: {} - {}", alert.id, alert.title);
+
+            // Auto-execute remediation for critical alerts when an action executor is available
+            if alert.severity == AlertSeverity::Critical {
+                if let Some(ref executor) = self.action_executor {
+                    let action = Action::restart_service(
+                        format!("auto-remediate-{}", alert.id),
+                        format!("Auto-remediate: {}", alert.title),
+                        format!("Automatic restart triggered by critical alert {}", alert.id),
+                        "nimon-agent",
+                    );
+                    let ctx = ActionContext::new(
+                        &alert.edge_id,
+                        &alert.device_id,
+                        &alert.id,
+                    );
+                    executor.do_send(ExecuteAction { action, context: ctx });
+                    info!(
+                        "Auto-remediation action dispatched for critical alert {} on device {}",
+                        alert.id, alert.device_id
+                    );
+                }
+            }
+
             new_alerts.push(alert);
         }
 

@@ -24,6 +24,7 @@ use tower_http::{
 };
 use tracing::{debug, error, info};
 
+use crate::action::executor::ActionExecutor;
 use crate::alert::manager::{AlertManager, AlertManagerConfig, GetActiveAlerts};
 use crate::session::SessionStore;
 
@@ -123,15 +124,19 @@ async fn get_alerts_handler(
 pub async fn run() -> anyhow::Result<()> {
     let state = HubState::new();
 
-    // Create and start the AlertManager actor
+    // Create and start the ActionExecutor actor
+    let action_executor = ActionExecutor::new().start();
+
+    // Create and start the AlertManager actor with action executor for auto-remediation
     let alert_manager = AlertManager::new(
         AlertManagerConfig::default(),
         state.sessions().clone(),
-    );
+    )
+    .with_action_executor(action_executor);
     let alert_manager_addr = alert_manager.start();
     state.set_alert_manager(alert_manager_addr).await;
 
-    info!("AlertManager actor started");
+    info!("AlertManager actor started with auto-remediation enabled");
 
     // Build our application with routes
     let app = Router::new()
