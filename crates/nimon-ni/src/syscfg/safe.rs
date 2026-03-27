@@ -166,7 +166,23 @@ impl<'a> SysCfgSession<'a> {
                     break; // No more resources
                 }
 
-                let device = self.extract_device_info(resource)?;
+                let device = match self.extract_device_info(resource) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipping device: failed to extract device info: {}",
+                            e
+                        );
+                        let _ = (self.api.close_handle)(
+                            resource as *mut std::ffi::c_void,
+                        );
+                        continue;
+                    }
+                };
+                // Close the resource handle to prevent leaks
+                let _ = (self.api.close_handle)(
+                    resource as *mut std::ffi::c_void,
+                );
                 devices.push(device);
             }
 
@@ -288,21 +304,34 @@ impl<'a> SysCfgSession<'a> {
         let mut float_val: f64 = 0.0;
 
         // Product name
-        (self.api.get_property)(
+        let name_status = (self.api.get_property)(
             resource,
             properties::PRODUCT_NAME,
             buffer.as_mut_ptr() as *mut _,
         );
+        if name_status != 0 {
+            return Err(NimonError::Connection(format!(
+                "Failed to read PRODUCT_NAME from resource (status {})",
+                name_status
+            )));
+        }
         let product_name = crate::common::c_str_to_string(buffer.as_ptr())
             .unwrap_or_default();
 
         // Serial number
         buffer.fill(0);
-        (self.api.get_property)(
+        let serial_status = (self.api.get_property)(
             resource,
             properties::SERIAL_NUMBER,
             buffer.as_mut_ptr() as *mut _,
         );
+        if serial_status != 0 {
+            tracing::warn!(
+                "Failed to read SERIAL_NUMBER from resource '{}' (status {})",
+                product_name,
+                serial_status
+            );
+        }
         let serial_number = crate::common::c_str_to_string(buffer.as_ptr())
             .unwrap_or_default();
 
@@ -363,7 +392,9 @@ impl<'a> SysCfgSession<'a> {
 
 impl<'a> Drop for SysCfgSession<'a> {
     fn drop(&mut self) {
-        self.api.close_handle_ptr(self.handle as *mut _);
+        if !self.handle.is_null() {
+            self.api.close_handle_ptr(self.handle as *mut _);
+        }
     }
 }
 
