@@ -105,17 +105,26 @@ impl PredictionActor {
     pub fn with_thresholds(mut self, warning: f64, critical: f64) -> Self {
         self.config.temperature_warning = warning;
         self.config.temperature_critical = critical;
-        // Update the threshold predictor if it exists
-        if let Some(models) = self.models.get_mut("temperature") {
-            // Can't downcast through the trait object to update existing predictor,
-            // so we append a new one with the updated thresholds.
-            // The old one will still fire but the new one takes precedence.
-            models.push(Box::new(ThresholdPredictor::new(
+        // Remove existing predictors for temperature and rebuild with updated thresholds
+        self.models.remove("temperature");
+        let temp_models: Vec<Box<dyn PredictionModel>> = vec![
+            Box::new(EwmaAnomalyDetector::new(
+                self.config.ewma_alpha,
+                self.config.ewma_threshold,
+                self.config.ewma_min_samples,
+            )),
+            Box::new(TrendPredictor::new(
+                self.config.trend_window_size,
+                self.config.trend_threshold_rate,
+                PredictionType::Overheating,
+            )),
+            Box::new(ThresholdPredictor::new(
                 critical,
                 warning,
                 PredictionType::Overheating,
-            )));
-        }
+            )),
+        ];
+        self.models.insert("temperature".to_string(), temp_models);
         self
     }
 

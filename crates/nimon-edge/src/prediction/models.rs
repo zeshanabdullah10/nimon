@@ -153,10 +153,9 @@ impl PredictionModel for EwmaAnomalyDetector {
 
             // Now update state after detection
             self.mean = self.alpha * value + (1.0 - self.alpha) * old_mean;
-            let diff = value - old_mean;
             let diff_sq = value - self.mean;
             self.variance =
-                self.alpha * diff * diff_sq + (1.0 - self.alpha) * old_variance;
+                self.alpha * diff_sq * diff_sq + (1.0 - self.alpha) * old_variance;
             if self.variance < 1e-10 {
                 self.variance = 1e-10;
             }
@@ -176,10 +175,9 @@ impl PredictionModel for EwmaAnomalyDetector {
 
         // No anomaly - update EWMA state
         self.mean = self.alpha * value + (1.0 - self.alpha) * old_mean;
-        let diff = value - old_mean;
         let diff_sq = value - self.mean;
         self.variance =
-            self.alpha * diff * diff_sq + (1.0 - self.alpha) * old_variance;
+            self.alpha * diff_sq * diff_sq + (1.0 - self.alpha) * old_variance;
 
         // Ensure variance stays positive
         if self.variance < 1e-10 {
