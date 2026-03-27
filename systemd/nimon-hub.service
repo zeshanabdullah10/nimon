@@ -1,0 +1,15 @@
+[Unit]
+Description=NIMon Hub Server - NI Hardware Monitoring Platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+WorkingDirectory=/opt/nimon
+ExecStart=/opt/nimon/nimon-hub /opt/nimon/config/hub.yaml
+
+[Install]
+WantedBy=multi-user.target
