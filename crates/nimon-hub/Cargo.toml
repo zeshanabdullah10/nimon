@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 nimon-core = { path = "../nimon-core" }
+clap = { version = "4", features = ["derive"] }
 actix = "0.13"
 tokio.workspace = true
 axum = { version = "0.7", features = ["ws"] }
@@ -25,3 +26,10 @@ anyhow = "1.0"
 reqwest = { version = "0.11", features = ["json"] }
 sqlx.workspace = true
 lettre = { version = "0.11", default-features = false, features = ["tokio1-native-tls", "builder", "smtp-transport"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }
