@@ -58,7 +58,7 @@ CREATE INDEX IF NOT EXISTS idx_metrics_device_time
 -- Predictions
 CREATE TABLE IF NOT EXISTS predictions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    device_id       TEXT NOT NULL REFERENCES devices(id),
+    device_id       TEXT NOT NULL,
     edge_id         TEXT NOT NULL,
     prediction_type TEXT NOT NULL,
     probability     REAL NOT NULL,

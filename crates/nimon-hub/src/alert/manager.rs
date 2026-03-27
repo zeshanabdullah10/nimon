@@ -3,13 +3,13 @@
 use actix::prelude::*;
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
-use std::collections::HashMap;
-use std::sync::Arc;
+use sqlx::SqlitePool;
 use tracing::{debug, error, info, warn};
 
 use nimon_core::alert::*;
 use nimon_core::alert::rules::{AlertRule, ComparisonOp, EvaluationContext, RuleCondition};
 use nimon_core::actor::messages::{DeviceStatusUpdate, PredictionResult};
+use nimon_core::db::{AlertRepository, PredictionRepository};
 use nimon_core::{HealthStatus, MetricValue};
 
 use crate::action::executor::{ActionContext, ExecuteAction};
@@ -57,6 +57,9 @@ pub struct AlertManager {
     sessions: SessionStore,
     notification_tx: tokio::sync::mpsc::UnboundedSender<Alert>,
     action_executor: Option<actix::Addr<crate::action::executor::ActionExecutor>>,
+    /// SQLite connection pool for persisting alerts and predictions.
+    /// When `Some`, alerts and predictions are written to the database.
+    db_pool: Option<SqlitePool>,
 }
 
 impl AlertManager {
@@ -69,7 +72,15 @@ impl AlertManager {
             sessions,
             notification_tx,
             action_executor: None,
+            db_pool: None,
         }
+    }
+
+    /// Set the database pool for persisting alerts and predictions.
+    /// Returns Self for builder-pattern chaining.
+    pub fn with_db_pool(mut self, pool: SqlitePool) -> Self {
+        self.db_pool = Some(pool);
+        self
     }
 
     /// Set the action executor for auto-remediation on critical alerts.
@@ -259,6 +270,40 @@ impl AlertManager {
 
         new_alerts
     }
+
+    /// Persist alerts to the database (fire-and-forget).
+    fn persist_alerts(&self, alerts: &[Alert], ctx: &mut <Self as Actor>::Context) {
+        if alerts.is_empty() {
+            return;
+        }
+        if let Some(pool) = &self.db_pool {
+            let pool = pool.clone();
+            let alerts_to_persist: Vec<_> = alerts.iter().map(|a| {
+                (
+                    a.device_id.clone(),
+                    a.edge_id.clone(),
+                    a.rule_id.clone(),
+                    a.severity.to_string(),
+                    a.message.clone(),
+                )
+            }).collect();
+            let fut = async move {
+                let repo = AlertRepository::new(&pool);
+                for (device_id, edge_id, rule_name, severity, message) in alerts_to_persist {
+                    if let Err(e) = repo.insert(
+                        Some(device_id.as_str()),
+                        Some(edge_id.as_str()),
+                        &rule_name,
+                        &severity,
+                        &message,
+                    ).await {
+                        warn!("Failed to persist alert: {}", e);
+                    }
+                }
+            };
+            ctx.spawn(actix::fut::wrap_future(fut));
+        }
+    }
 }
 
 impl Actor for AlertManager {
@@ -279,8 +324,10 @@ pub struct EvaluateRules {
 impl Handler<EvaluateRules> for AlertManager {
     type Result = Vec<Alert>;
 
-    fn handle(&mut self, msg: EvaluateRules, _ctx: &mut Self::Context) -> Self::Result {
-        self.process_evaluation(&msg.context)
+    fn handle(&mut self, msg: EvaluateRules, ctx: &mut Self::Context) -> Self::Result {
+        let alerts = self.process_evaluation(&msg.context);
+        self.persist_alerts(&alerts, ctx);
+        alerts
     }
 }
 
@@ -326,7 +373,7 @@ impl Handler<ResolveAlert> for AlertManager {
 impl Handler<DeviceStatusUpdate> for AlertManager {
     type Result = ();
 
-    fn handle(&mut self, msg: DeviceStatusUpdate, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: DeviceStatusUpdate, ctx: &mut Self::Context) -> Self::Result {
         let eval_ctx = EvaluationContext {
             device_id: msg.device_id.clone(),
             edge_id: msg.edge_id.clone(),
@@ -338,6 +385,7 @@ impl Handler<DeviceStatusUpdate> for AlertManager {
         };
 
         let alerts = self.process_evaluation(&eval_ctx);
+        self.persist_alerts(&alerts, ctx);
         for alert in alerts {
             let _ = self.notification_tx.send(alert);
         }
@@ -348,7 +396,7 @@ impl Handler<DeviceStatusUpdate> for AlertManager {
 impl Handler<PredictionResult> for AlertManager {
     type Result = ();
 
-    fn handle(&mut self, msg: PredictionResult, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: PredictionResult, ctx: &mut Self::Context) -> Self::Result {
         if msg.probability < PREDICTION_ALERT_THRESHOLD {
             return;
         }
@@ -394,6 +442,33 @@ impl Handler<PredictionResult> for AlertManager {
                 fired_count: 1,
             });
         }
+
+        // Persist the prediction to the database
+        if let Some(pool) = &self.db_pool {
+            let pool = pool.clone();
+            let device_id = msg.device_id.clone();
+            let edge_id = msg.edge_id.clone();
+            let prediction_type = format!("{:?}", msg.prediction_type);
+            let probability = msg.probability;
+            let eta_minutes = msg.eta_minutes.map(|m| m as i64);
+            let fut = async move {
+                let repo = PredictionRepository::new(&pool);
+                if let Err(e) = repo.insert(
+                    &device_id,
+                    &edge_id,
+                    &prediction_type,
+                    probability,
+                    eta_minutes,
+                    None::<&str>,
+                ).await {
+                    warn!("Failed to persist prediction: {}", e);
+                }
+            };
+            ctx.spawn(actix::fut::wrap_future(fut));
+        }
+
+        // Also persist the alert generated from this prediction
+        self.persist_alerts(&[alert.clone()], ctx);
 
         let _ = self.notification_tx.send(alert);
     }

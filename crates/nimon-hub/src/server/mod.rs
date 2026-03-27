@@ -16,6 +16,7 @@ use axum::{
     routing::{get, Router},
 };
 use futures_util::{StreamExt, SinkExt};
+use sqlx::SqlitePool;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::{
@@ -93,6 +94,13 @@ pub struct AlertsResponse {
     pub total: usize,
 }
 
+/// Predictions response
+#[derive(serde::Serialize)]
+pub struct PredictionsResponse {
+    pub predictions: Vec<serde_json::Value>,
+    pub total: usize,
+}
+
 /// Handler to get active alerts from the AlertManager
 async fn get_alerts_handler(
     axum::extract::State(state): axum::extract::State<HubState>,
@@ -120,23 +128,40 @@ async fn get_alerts_handler(
     }
 }
 
+/// Handler to get active predictions
+async fn get_predictions_handler() -> impl IntoResponse {
+    Json(PredictionsResponse {
+        predictions: vec![],
+        total: 0,
+    })
+}
+
 /// Start the hub server
 pub async fn run() -> anyhow::Result<()> {
     let state = HubState::new();
 
+    // Ensure the data directory exists
+    std::fs::create_dir_all("data")?;
+
+    // Connect to SQLite database and initialize schema
+    let pool = SqlitePool::connect("sqlite:./data/nimon.db").await?;
+    nimon_core::db::init_database(&pool).await?;
+    info!("Database initialized at sqlite:./data/nimon.db");
+
     // Create and start the ActionExecutor actor
     let action_executor = ActionExecutor::new().start();
 
-    // Create and start the AlertManager actor with action executor for auto-remediation
+    // Create and start the AlertManager actor with action executor and database pool
     let alert_manager = AlertManager::new(
         AlertManagerConfig::default(),
         state.sessions().clone(),
     )
-    .with_action_executor(action_executor);
+    .with_action_executor(action_executor)
+    .with_db_pool(pool);
     let alert_manager_addr = alert_manager.start();
     state.set_alert_manager(alert_manager_addr).await;
 
-    info!("AlertManager actor started with auto-remediation enabled");
+    info!("AlertManager actor started with auto-remediation and database persistence enabled");
 
     // Build our application with routes
     let app = Router::new()
@@ -144,6 +169,7 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/health", get(health_handler))
         .route("/api/status", get(status_handler))
         .route("/api/alerts", get(get_alerts_handler))
+        .route("/api/predictions", get(get_predictions_handler))
         .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
