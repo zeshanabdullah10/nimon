@@ -315,37 +315,53 @@ impl Handler<PredictionResult> for AlertManager {
     type Result = ();
 
     fn handle(&mut self, msg: PredictionResult, _ctx: &mut Self::Context) -> Self::Result {
-        // Convert prediction to alert if high probability
-        if msg.probability >= PREDICTION_ALERT_THRESHOLD {
-            let alert = Alert {
-                id: ulid::Ulid::new().to_string(),
-                rule_id: format!("pred-{:?}", msg.prediction_type).to_lowercase(),
-                edge_id: msg.edge_id.clone(),
-                device_id: msg.device_id.clone(),
-                severity: if msg.probability >= PREDICTION_CRITICAL_THRESHOLD { AlertSeverity::Critical } else { AlertSeverity::Warning },
-                status: AlertStatus::Firing,
-                title: format!("{:?} Prediction for {}", msg.prediction_type, msg.device_id),
-                message: format!("Predicted {:?} with {:.0}% confidence", msg.prediction_type, msg.probability * 100.0),
-                metric_name: None,
-                metric_value: Some(msg.probability),
-                threshold: Some(0.8),
-                triggered_at: msg.timestamp,
-                resolved_at: None,
-                fired_count: 1,
-                notification_sent: false,
-            };
+        if msg.probability < PREDICTION_ALERT_THRESHOLD {
+            return;
+        }
 
-            info!("Prediction alert: {}", alert.title);
+        let rule_id = format!("pred-{:?}", msg.prediction_type).to_lowercase();
 
-            let key = format!("{}:{}", alert.rule_id, msg.device_id);
+        // Check cooldown
+        if self.check_cooldown(&rule_id, &msg.device_id) {
+            debug!("Prediction {} for device {} in cooldown", rule_id, msg.device_id);
+            return;
+        }
+
+        let alert = Alert {
+            id: ulid::Ulid::new().to_string(),
+            rule_id: rule_id.clone(),
+            edge_id: msg.edge_id.clone(),
+            device_id: msg.device_id.clone(),
+            severity: if msg.probability >= PREDICTION_CRITICAL_THRESHOLD { AlertSeverity::Critical } else { AlertSeverity::Warning },
+            status: AlertStatus::Firing,
+            title: format!("{:?} Prediction for {}", msg.prediction_type, msg.device_id),
+            message: format!("Predicted {:?} with {:.0}% confidence", msg.prediction_type, msg.probability * 100.0),
+            metric_name: None,
+            metric_value: Some(msg.probability),
+            threshold: Some(0.8),
+            triggered_at: msg.timestamp,
+            resolved_at: None,
+            fired_count: 1,
+            notification_sent: false,
+        };
+
+        info!("Prediction alert: {}", alert.title);
+
+        // Update or insert alert (same pattern as process_evaluation)
+        let key = format!("{}:{}", rule_id, msg.device_id);
+        if let Some(mut active) = self.active_alerts.get_mut(&key) {
+            active.last_fired = Utc::now();
+            active.fired_count += 1;
+            active.alert.fired_count = active.fired_count;
+        } else {
             self.active_alerts.insert(key, ActiveAlert {
                 alert: alert.clone(),
                 last_fired: Utc::now(),
                 fired_count: 1,
             });
-
-            let _ = self.notification_tx.send(alert);
         }
+
+        let _ = self.notification_tx.send(alert);
     }
 }
 
