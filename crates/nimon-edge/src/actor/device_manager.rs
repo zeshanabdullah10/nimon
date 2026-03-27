@@ -4,12 +4,35 @@ use actix::prelude::*;
 use std::collections::HashMap;
 
 use nimon_core::{
-    actor::{DevicePoll, DevicePollResult},
+    actor::DevicePoll,
     Device, DeviceType,
 };
 
 use super::device_actor::DeviceActor;
 use super::prediction_actor::PredictionActor;
+
+/// Attempt to classify a device product name into a DeviceType
+fn classify_device(product_name: &str) -> DeviceType {
+    let name = product_name.to_uppercase();
+    // Check more specific patterns first to avoid false matches
+    if name.contains("CDAQ") || name.contains("COMPACTDAQ") {
+        DeviceType::CDaq
+    } else if name.contains("XNET") || name.contains("NI-XNET") {
+        DeviceType::Xnet
+    } else if name.contains("GPIB") {
+        DeviceType::Gpib
+    } else if name.contains("VISA") {
+        DeviceType::Visa
+    } else if name.contains("PS") || name.contains("POWER") {
+        DeviceType::PowerSupply
+    } else if name.contains("PXI") || name.contains("PXIE") {
+        DeviceType::Pxi
+    } else if name.contains("DAQ") || name.contains("USB-") {
+        DeviceType::Daq
+    } else {
+        DeviceType::Daq
+    }
+}
 
 /// Actor that manages all device actors
 pub struct DeviceManagerActor {
@@ -65,9 +88,67 @@ impl DeviceManagerActor {
         }
     }
 
-    /// Discover devices (simulated - replace with NI-SysCfg)
+    /// Discover devices using NI-SysCfg, falling back to simulated data
     fn discover_devices(&mut self) -> Vec<Device> {
-        // In production, call NI-SysCfg to discover real devices
+        // Try real NI-SysCfg discovery first
+        match nimon_ni::syscfg::NiSysCfg::load() {
+            Ok(api) => match api.create_session() {
+                Ok(session) => match session.discover_devices() {
+                    Ok(discovered) => {
+                        if !discovered.is_empty() {
+                            tracing::info!(
+                                "Discovered {} real NI device(s) via NI-SysCfg",
+                                discovered.len()
+                            );
+                            return discovered
+                                .into_iter()
+                                .map(|d| {
+                                    let device_type = classify_device(&d.product_name);
+                                    Device {
+                                        id: format!("{}:{}", self.edge_id, d.serial_number),
+                                        edge_id: self.edge_id.clone(),
+                                        device_name: d.product_name.clone(),
+                                        device_type,
+                                        model: Some(d.product_name),
+                                        serial_number: Some(d.serial_number),
+                                        firmware_version: d.firmware_version,
+                                        driver_version: d.driver_version,
+                                        ip_address: d.ip_address,
+                                        slot: None,
+                                        chassis: None,
+                                    }
+                                })
+                                .collect();
+                        }
+                        tracing::info!(
+                            "NI-SysCfg returned no devices, using simulated fallback"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "NI-SysCfg discovery failed: {}, using simulated fallback",
+                            e
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "NI-SysCfg session creation failed: {}, using simulated fallback",
+                        e
+                    );
+                }
+            },
+            Err(_) => {
+                tracing::info!("NI-SysCfg not available, using simulated devices");
+            }
+        }
+
+        // Simulated fallback for development/testing
+        self.simulated_devices()
+    }
+
+    /// Generate simulated devices for development/testing
+    fn simulated_devices(&self) -> Vec<Device> {
         vec![
             Device {
                 id: format!("{}:daq-1", self.edge_id),
@@ -229,6 +310,57 @@ impl Handler<GetDeviceCount> for DeviceManagerActor {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn test_classify_device_pxi() {
+        assert_eq!(classify_device("PXIe-8880"), DeviceType::Pxi);
+        assert_eq!(classify_device("PXI-1042Q"), DeviceType::Pxi);
+    }
+
+    #[test]
+    fn test_classify_device_cdaq() {
+        assert_eq!(classify_device("cDAQ-9178"), DeviceType::CDaq);
+        assert_eq!(classify_device("CompactDAQ-9189"), DeviceType::CDaq);
+    }
+
+    #[test]
+    fn test_classify_device_daq() {
+        assert_eq!(classify_device("USB-6343"), DeviceType::Daq);
+        assert_eq!(classify_device("PCI-6221"), DeviceType::Daq);
+    }
+
+    #[test]
+    fn test_classify_device_xnet() {
+        assert_eq!(classify_device("NI-XNET"), DeviceType::Xnet);
+        assert_eq!(classify_device("PXIe-8510"), DeviceType::Pxi); // PXIe prefix -> Pxi
+    }
+
+    #[test]
+    fn test_classify_device_gpib() {
+        assert_eq!(classify_device("GPIB-USB-HS"), DeviceType::Gpib);
+    }
+
+    #[test]
+    fn test_classify_device_power() {
+        assert_eq!(classify_device("NIPSPS-4010"), DeviceType::PowerSupply);
+    }
+
+    #[test]
+    fn test_classify_device_unknown() {
+        // Unknown product names default to Daq
+        assert_eq!(classify_device("UNKNOWN-MODEL"), DeviceType::Daq);
+    }
+
+    #[test]
+    fn test_simulated_devices() {
+        let manager = DeviceManagerActor::new("test-edge".to_string());
+        let devices = manager.simulated_devices();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].device_type, DeviceType::Daq);
+        assert_eq!(devices[1].device_type, DeviceType::Pxi);
+        assert!(devices[0].id.starts_with("test-edge:"));
+        assert!(devices[1].id.starts_with("test-edge:"));
+    }
 
     #[actix::test]
     async fn test_device_manager_starts() {

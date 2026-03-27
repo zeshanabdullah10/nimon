@@ -3,6 +3,7 @@
 //! This module provides safe, idiomatic Rust wrappers around the NI-SysCfg C API.
 
 use libloading::os::windows::{Library, Symbol};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
 
@@ -178,15 +179,103 @@ impl<'a> SysCfgSession<'a> {
 
     /// Get health information for a specific device
     ///
-    /// Note: This is a placeholder for future implementation.
-    /// Currently returns basic health based on reachability.
-    pub fn get_device_health(&self, _device_id: &str) -> NimonResult<DeviceHealth> {
-        // TODO: Implement using NiSysCfg health APIs
+    /// Uses FindHardware with a filter for the specific device name to locate
+    /// the resource, then queries IS_REACHABLE and TEMPERATURE properties.
+    /// Returns DeviceHealth::unreachable() if the device cannot be found.
+    pub fn get_device_health(&self, device_id: &str) -> NimonResult<DeviceHealth> {
+        // Build a filter that matches the device name (product name or serial)
+        let filter = crate::common::string_to_c_string(device_id)
+            .ok_or_else(|| NimonError::Config("Device ID contains null bytes".into()))?;
+
+        let mut enum_handle: *mut NiSysCfgEnum = std::ptr::null_mut();
+
+        unsafe {
+            let status = (self.api.find_hardware)(
+                self.handle,
+                NISYSCFG_SIMPLE_SEARCH,
+                filter.as_ptr(),
+                &mut enum_handle,
+            );
+
+            if status != 0 {
+                // Device not found or error - return unreachable
+                tracing::debug!(
+                    "FindHardware for '{}' returned status {}, treating as unreachable",
+                    device_id,
+                    status
+                );
+                return Ok(DeviceHealth::unreachable());
+            }
+
+            let mut resource: *mut NiSysCfgResource = std::ptr::null_mut();
+            let next_status = (self.api.next_resource)(
+                self.handle,
+                enum_handle,
+                &mut resource,
+            );
+
+            // Clean up enum handle regardless of outcome
+            self.api.close_handle_ptr(enum_handle as *mut _);
+
+            if next_status != 0 || resource.is_null() {
+                // No matching resource found
+                return Ok(DeviceHealth::unreachable());
+            }
+
+            let health = self.query_resource_health(resource)?;
+
+            // Clean up resource handle
+            self.api.close_handle_ptr(resource as *mut _);
+
+            Ok(health)
+        }
+    }
+
+    /// Query health properties from a resource handle
+    ///
+    /// Reads IS_REACHABLE and TEMPERATURE properties and builds a DeviceHealth.
+    unsafe fn query_resource_health(
+        &self,
+        resource: *mut NiSysCfgResource,
+    ) -> NimonResult<DeviceHealth> {
+        let mut int_val: i32 = 0;
+        let mut float_val: f64 = 0.0;
+
+        // Query IS_REACHABLE
+        (self.api.get_property)(
+            resource,
+            properties::IS_REACHABLE,
+            &mut int_val as *mut _ as *mut _,
+        );
+        let is_reachable = int_val != 0;
+
+        // Query TEMPERATURE
+        let temp_status = (self.api.get_property)(
+            resource,
+            properties::TEMPERATURE,
+            &mut float_val as *mut _ as *mut _,
+        );
+        let temperature = if temp_status == 0 { Some(float_val) } else { None };
+
+        let metrics = HashMap::new();
+
+        // If device is not reachable, return early
+        if !is_reachable {
+            return Ok(DeviceHealth {
+                is_reachable: false,
+                temperature: None,
+                self_test_passed: None,
+                error_message: Some("Device not reachable".to_string()),
+                metrics,
+            });
+        }
+
         Ok(DeviceHealth {
             is_reachable: true,
-            temperature: None,
+            temperature,
             self_test_passed: None,
             error_message: None,
+            metrics,
         })
     }
 
@@ -298,5 +387,34 @@ mod tests {
         assert_eq!(device.product_name, "PXIe-8880");
         assert_eq!(device.serial_number, "12345678");
         assert!(device.ip_address.is_none());
+    }
+
+    #[test]
+    fn test_device_health_unreachable_creation() {
+        let health = DeviceHealth::unreachable();
+        assert!(!health.is_reachable);
+        assert!(health.error_message.is_some());
+    }
+
+    #[test]
+    fn test_device_health_to_status_healthy() {
+        let health = DeviceHealth {
+            is_reachable: true,
+            temperature: Some(42.0),
+            self_test_passed: None,
+            error_message: None,
+            metrics: HashMap::new(),
+        };
+        let (status, metrics) = health.to_status_and_metrics();
+        assert!(matches!(status, nimon_core::HealthStatus::Healthy));
+        assert!(metrics.contains_key("temperature"));
+        assert!(metrics.contains_key("is_reachable"));
+    }
+
+    #[test]
+    fn test_device_health_to_status_offline() {
+        let health = DeviceHealth::unreachable();
+        let (status, _) = health.to_status_and_metrics();
+        assert!(matches!(status, nimon_core::HealthStatus::Offline));
     }
 }

@@ -41,11 +41,57 @@ impl DeviceActor {
         self
     }
 
-    /// Simulate device polling (replace with actual NI API calls)
+    /// Poll device health via NI-SysCfg, falling back to simulated data
     fn poll_device(&mut self) -> DevicePollResult {
-        // In production, this would call NI-SysCfg/DAQmx/VISA APIs
-        // For now, simulate a healthy device with random temperature
+        // Try real NI-SysCfg health polling first
+        match nimon_ni::syscfg::NiSysCfg::load() {
+            Ok(api) => match api.create_session() {
+                Ok(session) => {
+                    // Use device_name (product name) as the lookup key for NI-SysCfg
+                    match session.get_device_health(&self.device.device_name) {
+                        Ok(health) => {
+                            let (status, metrics) = health.to_status_and_metrics();
+                            self.last_status = status;
+                            tracing::trace!(
+                                "Polled {} via NI-SysCfg: status={:?}",
+                                self.device.device_name,
+                                status
+                            );
+                            return DevicePollResult {
+                                success: true,
+                                status,
+                                metrics,
+                                error: None,
+                                timestamp: Utc::now(),
+                            };
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "NI-SysCfg health query failed for {}: {}, using simulated",
+                                self.device.device_name,
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "NI-SysCfg session failed: {}, using simulated polling",
+                        e
+                    );
+                }
+            },
+            Err(_) => {
+                tracing::trace!("NI-SysCfg not available, using simulated polling");
+            }
+        }
 
+        // Simulated fallback
+        self.simulated_metrics()
+    }
+
+    /// Generate simulated device metrics for development/testing
+    fn simulated_metrics(&mut self) -> DevicePollResult {
         let mut metrics = HashMap::new();
         let temperature = 40.0 + (rand_factor() * 30.0);
         metrics.insert("temperature".to_string(), MetricValue::Float(temperature));
@@ -162,6 +208,16 @@ mod tests {
         let result = actor.poll_device();
         assert!(result.success);
         assert!(result.metrics.contains_key("temperature"));
+    }
+
+    #[test]
+    fn test_simulated_metrics_fallback() {
+        let device = make_test_device();
+        let mut actor = DeviceActor::new(device, 10);
+        let result = actor.simulated_metrics();
+        assert!(result.success);
+        assert!(result.metrics.contains_key("temperature"));
+        assert!(result.error.is_none());
     }
 
     #[test]
