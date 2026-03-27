@@ -1,6 +1,6 @@
 # NIMon - NI Hardware Monitoring Platform
 
-Rust-based monitoring, prediction, and self-healing for National Instruments devices. Tracks PXI, DAQ, VISA, cDAQ, and other NI hardware in real time.
+Rust-based monitoring, prediction, and self-healing for National Instruments hardware. Monitors PXI, DAQ, VISA, cDAQ, and other NI devices in real time.
 
 ## Architecture
 
@@ -9,36 +9,56 @@ Edge Nodes (nimon-edge)              Central Hub (nimon-hub)
 ┌─────────────────────────┐           ┌──────────────────────────┐
 │  DeviceActor (per device) │           │  WebSocket Server       │
 │  ├─ NI-SysCfg polling   │           │  ├─ Session management  │
-│  └─ Simulated fallback │           │  └─ Message dispatch   │
-│  PredictionActor          │  WS/TLS   │  AlertManager            │
-│  ├─ EWMA anomaly       │──────────>│  ├─ Rule evaluation    │
-│  ├─ Trend analysis     │           │  ├─ Auto-remediation  │
-│  └─ Threshold          │           │  └─ DB persistence    │
-│  HubConnectorActor        │           │  ActionExecutor         │
-│  └─ WebSocket client    │           │  REST API /api/v1/    │
+│  └─ Simulated fallback  │           │  └─ Message dispatch    │
+│  PredictionActor         │  WS/TLS   │  AlertManager           │
+│  ├─ EWMA anomaly        │───────────│  ├─ Rule evaluation     │
+│  ├─ Trend analysis      │           │  ├─ Auto-remediation   │
+│  └─ Threshold           │           │  └─ DB persistence     │
+│  HubConnectorActor       │           │  ActionExecutor          │
+│  └─ WebSocket client    │           │  REST API /api/v1/     │
 └─────────────────────────┘           └──────────────────────────┘
-     nimon-core (shared)                 nimon-ni (FFI)
-     ├─ Types, errors                    ├─ NI-SysCfg
-     ├─ Actor messages                 ├─ NI-VISA
-     ├─ Protocol types                 ├─ NI-DAQmx
-     └─ DB repositories                └─ (graceful fallback)
+     nimon-core (shared)                  nimon-ni (FFI)
+     ├─ Types, errors                     ├─ NI-SysCfg
+     ├─ Actor messages                    ├─ NI-VISA
+     ├─ Protocol types                    ├─ NI-DAQmx
+     └─ DB repositories                   └─ (graceful fallback)
+```
+
+## Quick Start
+
+```bash
+# 1. Build everything
+cargo build --workspace --release
+
+# 2. Start the hub (terminal 1)
+./target/release/nimon-hub.exe config/test-hub.yaml
+
+# 3. Start the simulator (terminal 2)
+./target/release/nimon-sim.exe
+
+# 4. Check the dashboard
+open http://localhost:9090
+
+# 5. Use the CLI
+./target/release/nimon-cli.exe edges list
+./target/release/nimon-cli.exe alerts list
 ```
 
 ## Crates
 
 | Crate | Purpose |
 |-------|---------|
-| `nimon-core` | Shared types, error handling, DB schema, actor messages, protocol types |
-| `nimon-edge` | Edge node: device discovery, health polling, prediction, WebSocket client |
-| `nimon-hub` | Central server: WebSocket server, REST API, alert management, action execution |
-| `nimon-ni` | FFI bindings to NI APIs (NI-SysCfg, NI-VISA, NI-DAQmx) |
-| `nimon-cli` | Admin CLI tool |
-| `nimon-sim` | Edge simulator for end-to-end testing without real NI hardware |
+| `nimon-core` | Shared types, errors, DB schema, actor messages, protocol |
+| `nimon-edge` | Edge node: NI device discovery, health polling, prediction |
+| `nimon-hub` | Central server: WebSocket, REST API, alerts, actions |
+| `nimon-ni` | FFI bindings to NI-SysCfg, NI-VISA, NI-DAQmx |
+| `nimon-cli` | Admin CLI for edges, alerts, health |
+| `nimon-sim` | Edge simulator for end-to-end testing |
 
 ## Prerequisites
 
 - Rust 1.75+ (edition 2021)
-- [NI drivers](https://www.ni.com/en-us/support/drivers/software-downloads) installed on the machine running `nimon-edge` (optional — falls back to simulated data)
+- [NI drivers](https://www.ni.com/en-us/support/drivers/software-downloads) on machines running `nimon-edge` (optional — falls back to simulated data)
 
 ## Build
 
@@ -47,119 +67,227 @@ cargo build --workspace --release
 ```
 
 Binaries are produced in `target/release/`:
-- `nimon-hub.exe` — Central server
-- `nimon-cli.exe` — CLI tool
-- `nimon-sim.exe` — Edge simulator for testing
 
-## Run
+| Binary | Description |
+|--------|-------------|
+| `nimon-hub.exe` | Central server |
+| `nimon-cli.exe` | Admin CLI |
+| `nimon-sim.exe` | Edge simulator |
 
-### Hub Server
-
-Start with defaults (binds `0.0.0.0:8080`, database at `./data/nimon.db`):
-
-```bash
-cargo run -p nimon-hub --release
-```
-
-With a config file:
-
-```bash
-cargo run -p nimon-hub --release -- config/hub.yaml
-```
+## Configuration
 
 Create `config/hub.yaml`:
 
 ```yaml
+# Network
 host: "0.0.0.0"
-port: 8080
+port: 9090
+
+# Database
 database_path: "data/nimon.db"
+
+# Alerting
 alert:
   default_cooldown_minutes: 5
   max_firing_count: 100
+
+  # Notification channels (see Notification Channels section)
+  notification_channels: []
+
+  # Alert rules (see Alert Rules section)
+  rules: []
 ```
 
-A test config is provided at `config/test-hub.yaml` which uses port 9090.
+### Alert Rules
 
-### Edge Node
+```yaml
+rules:
+  - name: "High Temperature"
+    severity: "critical"
+    condition:
+      MetricThreshold:
+        metric: "temperature"
+        threshold: 75.0
+        comparison: "greater_than"
+    cooldown_minutes: 5
+    notification_channels: ["slack-ops"]
 
-The edge binary is a library crate (`nimon-edge`) — it has no `main.rs` yet. It is started programmatically or via the CLI (not yet implemented). When running, it:
-
-1. Discovers NI devices via NI-SysCfg (falls back to simulated devices if drivers not installed)
-2. Polls each device at configured intervals
-3. Runs prediction models (EWMA anomaly detection, trend analysis, thresholds)
-4. Connects to the hub via WebSocket and streams status updates
-
-Configuration: copy `config/edge.example.yaml` to `config/edge.yaml` and edit.
-
-### Edge Simulator
-
-For end-to-end testing without real NI hardware, use the edge simulator (`nimon-sim`):
-
-```bash
-# Start the hub first (requires config/test-hub.yaml)
-cargo run -p nimon-hub --release -- config/test-hub.yaml
-
-# In another terminal, run the simulator
-cargo run -p nimon-sim --release
+  - name: "Device Offline"
+    severity: "warning"
+    condition:
+      DeviceOffline:
+        max_minutes_since_poll: 10
 ```
 
-The simulator connects to the hub at `ws://localhost:9090/ws` and:
-- Simulates 3 edge devices with random temperature (35-85°C) and voltage metrics
-- Sends device status updates every 5 seconds
-- Occasionally generates prediction alerts (20% chance per cycle)
-- Auto-reconnects if the connection drops
+Condition types: `MetricThreshold`, `DeviceOffline`, `HealthStatusChange`
 
-Use the CLI to verify the simulator is connected:
+Metric comparisons: `gt`, `lt`, `eq`, `ne`, `ge`, `le`
 
-```bash
-cargo run -p nimon-cli --release -- edges list
+Severities: `info`, `warning`, `critical`
+
+### Notification Channels
+
+Configure multiple channels in `hub.yaml`:
+
+```yaml
+alert:
+  notification_channels:
+    # Console (always available)
+    - channel_type: "console"
+      enabled: true
+
+    # Slack
+    - channel_type: "slack"
+      webhook_url: "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+      enabled: true
+
+    # Microsoft Teams
+    - channel_type: "teams"
+      webhook_url: "https://outlook.office.com/webhook/XXX"
+      enabled: true
+
+    # Generic webhook
+    - channel_type: "webhook"
+      webhook_url: "https://example.com/webhook"
+      enabled: true
+
+    # Email (SMTP)
+    - channel_type: "email"
+      smtp_server: "smtp.example.com"
+      smtp_port: 587
+      from_addr: "nimon@example.com"
+      to_addrs: ["ops@example.com", "admin@example.com"]
+      smtp_skip_tls_verify: false
+      enabled: true
+```
+
+Rules can specify which channels to use:
+
+```yaml
+rules:
+  - name: "Critical Temperature"
+    notification_channels: ["slack-ops", "email"]
+    ...
 ```
 
 ## REST API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Health check |
+| `/health` | GET | Health check with connected edge count |
 | `/ws` | GET | WebSocket for edge connections |
+| `/` | GET | Web dashboard |
+| `/style.css` | GET | Dashboard stylesheet |
+| `/app.js` | GET | Dashboard JavaScript |
 | `/api/v1/status` | GET | Connected edges and device counts |
-| `/api/v1/alerts` | GET | Active alerts from AlertManager |
-| `/api/v1/alerts/{id}/acknowledge` | POST | Acknowledge/resolve an alert |
+| `/api/v1/alerts` | GET | Active alerts |
+| `/api/v1/alerts/history` | GET | Alert history (query: `?limit=100&severity=critical`) |
+| `/api/v1/alerts/:id/acknowledge` | POST | Acknowledge/resolve an alert |
 | `/api/v1/predictions` | GET | Active predictions |
-| `/api/v1/edges` | GET | List connected edge nodes |
-| `/api/v1/edges/{id}` | GET | Edge node details |
-| `/api/v1/edges/{id}/devices` | GET | Devices for an edge node |
+| `/api/v1/edges` | GET | List connected edges |
+| `/api/v1/edges/:id` | GET | Edge node details |
+| `/api/v1/edges/:id/devices` | GET | Devices for an edge |
 
-## Testing
+## CLI Tool
 
 ```bash
-cargo test --workspace
+# Health check
+nimon-cli health
+
+# Status summary
+nimon-cli status
+
+# List edges
+nimon-cli edges list
+
+# Edge details
+nimon-cli edges show <edge_id>
+
+# List active alerts
+nimon-cli alerts list
+
+# Acknowledge an alert
+nimon-cli alerts ack <alert_id>
 ```
 
-210 tests across all 5 crates. All tests use simulated data — no NI hardware required.
+## Edge Simulator
+
+For testing without real NI hardware:
+
+```bash
+cargo run -p nimon-sim --release
+```
+
+Simulates 3 edge devices with:
+- Temperature: 35-85°C (triggers alerts > 75°C)
+- Voltage 5V: 4.8-5.2V
+- Voltage 3.3V: 3.1-3.5V
+- 20% chance of prediction per cycle
+- Auto-reconnects on disconnect
+
+## Service Installation
+
+### Linux (systemd)
+
+```bash
+# Install service file
+sudo cp systemd/nimon-hub.service /etc/systemd/system/
+
+# Reload systemd
+sudo systemctl daemon-reload
+
+# Enable (start on boot)
+sudo systemctl enable nimon-hub
+
+# Start now
+sudo systemctl start nimon-hub
+
+# Check status
+sudo systemctl status nimon-hub
+
+# View logs
+journalctl -u nimon-hub -f
+```
+
+### Windows
+
+```bash
+# Install as Windows service (run as Administrator)
+nimon-hub.exe install
+
+# Start the service
+nimon-hub.exe start
+
+# Stop the service
+nimon-hub.exe stop
+
+# Uninstall the service
+nimon-hub.exe uninstall
+```
 
 ## Key Features
 
-- **Real NI API integration** with graceful fallback to simulated data when drivers aren't installed
-- **Prediction engine**: EWMA anomaly detection, trend prediction, threshold-based alerting
-- **Self-healing**: Auto-remediation actions (service restart) triggered by critical alerts
-- **Alert rule engine**: Metric thresholds, health status changes, device offline detection, prediction-based rules
-- **Multi-channel notifications**: Console, Webhook, Slack, Teams
-- **SQLite persistence**: Alerts, predictions, action history
-- **WebSocket protocol**: Versioned JSON messages with ack/error, heartbeat, and ping/pong
-- **Configurable**: YAML config for hub and edge nodes
+- **NI Hardware Integration** — NI-SysCfg, NI-VISA, NI-DAQmx with graceful simulated fallback
+- **Prediction Engine** — EWMA anomaly detection, trend analysis, threshold-based
+- **Self-Healing** — Auto-remediation actions on critical alerts
+- **Multi-Channel Alerts** — Console, Slack, Teams, Webhook, Email (SMTP)
+- **SQLite Persistence** — Alerts, predictions, and action history
+- **WebSocket Protocol** — Versioned JSON with ack/error, heartbeat, ping/pong
+- **Configurable** — YAML config with rule engine and per-rule notification channels
+- **Edge Simulator** — End-to-end testing without hardware
 
 ## Development
 
 ```bash
-# Run tests
+# Run all tests
 cargo test --workspace
 
-# Run with debug logging
+# With debug logging
 RUST_LOG=debug cargo test --workspace
 
-# Check formatting
-cargo fmt --check --workspace
+# Format
+cargo fmt --workspace
 
 # Lint
-cargo clippy --workspace
+cargo clippy --workspace --fix
 ```
