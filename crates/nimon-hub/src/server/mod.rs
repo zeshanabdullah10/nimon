@@ -6,6 +6,7 @@ pub mod routes;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::path::PathBuf;
 
 use actix::Actor;
 use axum::{
@@ -249,6 +250,45 @@ async fn acknowledge_alert_handler(
     }
 }
 
+/// Handler for the dashboard (serves index.html)
+async fn dashboard_handler() -> impl axum::response::IntoResponse {
+    let index_path = PathBuf::from("static/index.html");
+    match tokio::fs::read(&index_path).await {
+        Ok(body) => axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/html")
+            .body(body.into())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Handler for serving CSS files
+async fn static_css_handler() -> impl axum::response::IntoResponse {
+    let path = PathBuf::from("static/style.css");
+    match tokio::fs::read(&path).await {
+        Ok(body) => axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/css")
+            .body(body.into())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Handler for serving JS files
+async fn static_js_handler() -> impl axum::response::IntoResponse {
+    let path = PathBuf::from("static/app.js");
+    match tokio::fs::read(&path).await {
+        Ok(body) => axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/javascript")
+            .body(body.into())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Start the hub server
 pub async fn run(config: crate::config::HubConfig) -> anyhow::Result<()> {
     // Resolve database path to absolute and ensure the data directory exists
@@ -306,6 +346,9 @@ pub async fn run(config: crate::config::HubConfig) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
+        .route("/", get(dashboard_handler))
+        .route("/style.css", get(static_css_handler))
+        .route("/app.js", get(static_js_handler))
         .route("/api/v1/status", get(status_handler))
         .route("/api/v1/alerts", get(get_alerts_handler))
         .route("/api/v1/alerts/history", get(get_alert_history_handler))
