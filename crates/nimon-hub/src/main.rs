@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(subscriber)
         .expect("setting default subscriber failed");
 
-    let config_path = std::env::args().nth(2);
+    let config_path = std::env::args().nth(1);
     let config = match config_path {
         Some(path) => {
             let path = PathBuf::from(path);
