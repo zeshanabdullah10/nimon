@@ -5,6 +5,7 @@
 //! # Supported APIs
 //! - NI-SysCfg (System Configuration) - Device discovery and status
 //! - NI-VISA - Instrument discovery and communication
+//! - NI-DAQmx - DAQ device discovery and health monitoring
 //!
 //! # Example
 //! ```no_run
@@ -21,6 +22,7 @@
 //! ```
 
 pub mod common;
+pub mod daqmx;
 pub mod syscfg;
 pub mod visa;
 
