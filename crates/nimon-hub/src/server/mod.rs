@@ -23,11 +23,14 @@ use tower_http::{
     cors::CorsLayer,
     trace::TraceLayer,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::action::executor::ActionExecutor;
 use crate::alert::manager::{AlertManager, AlertManagerConfig, GetActiveAlerts};
 use crate::session::SessionStore;
+
+use nimon_core::actor::messages::{DeviceStatusUpdate, PredictionResult};
+use nimon_core::protocol::{WsMessage, WsMessageType};
 
 /// Hub server state
 #[derive(Clone)]
@@ -202,21 +205,137 @@ async fn ws_socket_handler(socket: WebSocket, state: HubState) {
     // Split the socket into sender and receiver
     let (mut sender, mut receiver) = socket.split();
 
-    // TODO: Implement proper session management and message handling
-    // For now, just echo back messages
+    // Track the edge ID so we can unregister on disconnect
+    let mut edge_id: Option<String> = None;
 
     while let Some(msg) = receiver.next().await {
         match msg {
             Ok(axum::extract::ws::Message::Text(text)) => {
                 debug!("Received text message: {}", text);
 
-                // Echo back
-                if sender
-                    .send(axum::extract::ws::Message::Text(text))
-                    .await
-                    .is_err()
-                {
-                    break;
+                let ws_msg = match WsMessage::from_json(&text) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("Failed to parse WebSocket message: {}", e);
+                        let err_msg = WsMessage::error(
+                            "PARSE_ERROR".to_string(),
+                            format!("Failed to parse message: {}", e),
+                            None,
+                        );
+                        if let Ok(json) = err_msg.to_json() {
+                            let _ = sender
+                                .send(axum::extract::ws::Message::Text(json))
+                                .await;
+                        }
+                        continue;
+                    }
+                };
+
+                match ws_msg.msg_type {
+                    WsMessageType::EdgeRegister => {
+                        let registration = match ws_msg.payload::<nimon_core::actor::messages::EdgeRegister>() {
+                            Ok(r) => r,
+                            Err(e) => {
+                                warn!("Failed to parse EdgeRegister payload: {}", e);
+                                continue;
+                            }
+                        };
+
+                        info!(
+                            "Edge registered: {} ({})",
+                            registration.edge_id, registration.name
+                        );
+
+                        let session = crate::session::EdgeSession::new(
+                            registration.edge_id.clone(),
+                            registration.name.clone(),
+                            registration.hostname,
+                            registration.ip_address,
+                        );
+
+                        edge_id = Some(registration.edge_id.clone());
+                        state.sessions().add(session);
+
+                        let ack = WsMessage::ack(ws_msg.msg_id, true, None);
+                        if let Ok(json) = ack.to_json() {
+                            if sender
+                                .send(axum::extract::ws::Message::Text(json))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    WsMessageType::DeviceStatus => {
+                        let status = match ws_msg.payload::<DeviceStatusUpdate>() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("Failed to parse DeviceStatus payload: {}", e);
+                                continue;
+                            }
+                        };
+
+                        debug!(
+                            "Device status from {}: device={}, status={:?}",
+                            status.edge_id, status.device_id, status.status
+                        );
+
+                        if let Some(alert_manager) = state.alert_manager().await {
+                            alert_manager.do_send(status);
+                        }
+                    }
+                    WsMessageType::Prediction => {
+                        let prediction = match ws_msg.payload::<PredictionResult>() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!("Failed to parse Prediction payload: {}", e);
+                                continue;
+                            }
+                        };
+
+                        debug!(
+                            "Prediction from {}: device={}, type={:?}, prob={:.2}",
+                            prediction.edge_id,
+                            prediction.device_id,
+                            prediction.prediction_type,
+                            prediction.probability
+                        );
+
+                        if let Some(alert_manager) = state.alert_manager().await {
+                            alert_manager.do_send(prediction);
+                        }
+                    }
+                    WsMessageType::DeviceAlert => {
+                        info!("Device alert received: {}", ws_msg.msg_id);
+                    }
+                    WsMessageType::Heartbeat => {
+                        if let Some(ref eid) = edge_id {
+                            if let Some(session) = state.sessions().get(eid) {
+                                session.update_heartbeat().await;
+                                debug!("Heartbeat updated for edge: {}", eid);
+                            }
+                        }
+                    }
+                    WsMessageType::Ping => {
+                        let ping_ts = match ws_msg.payload::<nimon_core::protocol::PingMessage>() {
+                            Ok(p) => p.timestamp,
+                            Err(_) => ws_msg.timestamp,
+                        };
+                        let pong = WsMessage::pong(ping_ts);
+                        if let Ok(json) = pong.to_json() {
+                            if sender
+                                .send(axum::extract::ws::Message::Text(json))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        debug!("Unhandled message type: {:?}", ws_msg.msg_type);
+                    }
                 }
             }
             Ok(axum::extract::ws::Message::Close(_)) => {
@@ -229,6 +348,12 @@ async fn ws_socket_handler(socket: WebSocket, state: HubState) {
             }
             _ => {}
         }
+    }
+
+    // Remove the edge session on disconnect
+    if let Some(ref eid) = edge_id {
+        state.sessions().remove(eid);
+        info!("Edge disconnected: {}", eid);
     }
 
     info!("WebSocket connection closed");
