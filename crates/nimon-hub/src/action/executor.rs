@@ -12,7 +12,7 @@ use tokio::process::Command as TokioCommand;
 use tracing::{debug, error, info, warn};
 
 use super::actions::{
-    Action, ActionResult, ActionStatus, ActionType,
+    Action, ActionResult, ActionStatus, ActionType, ScriptAction,
 };
 
 /// Context in which an action is being executed
@@ -183,11 +183,15 @@ impl ActionExecutor {
     ) -> ActionResult {
         let start = Instant::now();
 
-        match action.action_type {
-            ActionType::Script => self.execute_script(action, ctx).await,
-            ActionType::RestartService => self.execute_restart(action, ctx).await,
-            ActionType::EdgeCommand => self.execute_edge_command(action, ctx).await,
-            ActionType::PowerCycle => self.execute_power_cycle(action, ctx).await,
+        match &action.action_type {
+            ActionType::Script(script_config) => {
+                self.execute_script(action, ctx, script_config).await
+            }
+            ActionType::RestartService { service_name } => {
+                self.execute_restart(action, ctx, service_name).await
+            }
+            ActionType::EdgeCommand { .. } => self.execute_edge_command(action, ctx).await,
+            ActionType::PowerCycle { .. } => self.execute_power_cycle(action, ctx).await,
         }
         .map(|mut result| {
             result.duration_ms = start.elapsed().as_millis() as u64;
@@ -212,12 +216,8 @@ impl ActionExecutor {
         &self,
         action: &Action,
         ctx: &ActionContext,
+        script_config: &ScriptAction,
     ) -> std::result::Result<ActionResult, anyhow::Error> {
-        let script_config = action
-            .script_config
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Script action has no script configuration"))?;
-
         // Perform variable substitution on script and args
         let script = substitute_variables(&script_config.script, &ctx.variables);
         let args: Vec<String> = script_config
@@ -284,12 +284,8 @@ impl ActionExecutor {
         &self,
         action: &Action,
         _ctx: &ActionContext,
+        service_name: &str,
     ) -> std::result::Result<ActionResult, anyhow::Error> {
-        let service_name = action
-            .service_name
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Restart action has no service name"))?;
-
         #[cfg(target_os = "windows")]
         let result = {
             let stop_output = TokioCommand::new("sc")
@@ -572,14 +568,14 @@ mod tests {
         // Set up args based on platform
         #[cfg(target_os = "windows")]
         {
-            if let Some(ref mut sc) = action.script_config {
+            if let ActionType::Script(ref mut sc) = action.action_type {
                 sc.args.push("/C".to_string());
                 sc.args.push("echo hello".to_string());
             }
         }
         #[cfg(not(target_os = "windows"))]
         {
-            if let Some(ref mut sc) = action.script_config {
+            if let ActionType::Script(ref mut sc) = action.action_type {
                 sc.args.push("hello".to_string());
             }
         }

@@ -29,19 +29,23 @@ impl Default for RetryConfig {
 
 /// The type of remediation action to execute
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActionType {
     /// Run a custom script or command
-    Script,
+    Script(ScriptAction),
     /// Restart a system service
-    RestartService,
+    RestartService { service_name: String },
     /// Send a command to an edge node
-    EdgeCommand,
+    EdgeCommand {
+        command: String,
+        parameters: HashMap<String, String>,
+    },
     /// Power cycle a device
-    PowerCycle,
+    PowerCycle { delay_secs: u64 },
 }
 
 /// Configuration for a script-type action
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScriptAction {
     /// The script or command to execute
     pub script: String,
@@ -89,10 +93,6 @@ pub struct Action {
     pub timeout_secs: u64,
     /// Retry configuration
     pub retry_config: RetryConfig,
-    /// Script-specific configuration (only for Script type)
-    pub script_config: Option<ScriptAction>,
-    /// Service name (only for RestartService type)
-    pub service_name: Option<String>,
 }
 
 impl Action {
@@ -107,18 +107,16 @@ impl Action {
             id: id.into(),
             name: name.into(),
             description: description.into(),
-            action_type: ActionType::Script,
-            enabled: true,
-            timeout_secs: 30,
-            retry_config: RetryConfig::default(),
-            script_config: Some(ScriptAction {
+            action_type: ActionType::Script(ScriptAction {
                 script: script.into(),
                 args: Vec::new(),
                 env: HashMap::new(),
                 working_dir: None,
                 run_as: None,
             }),
-            service_name: None,
+            enabled: true,
+            timeout_secs: 30,
+            retry_config: RetryConfig::default(),
         }
     }
 
@@ -133,12 +131,12 @@ impl Action {
             id: id.into(),
             name: name.into(),
             description: description.into(),
-            action_type: ActionType::RestartService,
+            action_type: ActionType::RestartService {
+                service_name: service_name.into(),
+            },
             enabled: true,
             timeout_secs: 60,
             retry_config: RetryConfig::default(),
-            script_config: None,
-            service_name: Some(service_name.into()),
         }
     }
 
@@ -152,15 +150,13 @@ impl Action {
             id: id.into(),
             name: name.into(),
             description: description.into(),
-            action_type: ActionType::PowerCycle,
+            action_type: ActionType::PowerCycle { delay_secs: 0 },
             enabled: true,
             timeout_secs: 120,
             retry_config: RetryConfig {
                 max_attempts: 1,
                 ..Default::default()
             },
-            script_config: None,
-            service_name: None,
         }
     }
 }
@@ -201,16 +197,16 @@ mod tests {
         );
         assert_eq!(script_action.id, "action-restart-app");
         assert_eq!(script_action.name, "Restart Application");
-        assert_eq!(script_action.action_type, ActionType::Script);
+        assert!(matches!(script_action.action_type, ActionType::Script(_)));
         assert!(script_action.enabled);
         assert_eq!(script_action.timeout_secs, 30);
-        assert!(script_action.script_config.is_some());
-        let script_cfg = script_action.script_config.unwrap();
-        assert_eq!(script_cfg.script, "/usr/local/bin/restart-app.sh");
-        assert!(script_cfg.args.is_empty());
-        assert!(script_cfg.env.is_empty());
-        assert!(script_cfg.working_dir.is_none());
-        assert!(script_cfg.run_as.is_none());
+        if let ActionType::Script(ref script_cfg) = script_action.action_type {
+            assert_eq!(script_cfg.script, "/usr/local/bin/restart-app.sh");
+            assert!(script_cfg.args.is_empty());
+            assert!(script_cfg.env.is_empty());
+            assert!(script_cfg.working_dir.is_none());
+            assert!(script_cfg.run_as.is_none());
+        }
 
         // Test restart service action
         let restart_action = Action::restart_service(
@@ -219,8 +215,10 @@ mod tests {
             "Restarts a system service",
             "nimon-agent",
         );
-        assert_eq!(restart_action.action_type, ActionType::RestartService);
-        assert_eq!(restart_action.service_name.as_deref(), Some("nimon-agent"));
+        assert!(matches!(restart_action.action_type, ActionType::RestartService { .. }));
+        if let ActionType::RestartService { ref service_name } = restart_action.action_type {
+            assert_eq!(service_name, "nimon-agent");
+        }
         assert_eq!(restart_action.timeout_secs, 60);
 
         // Test power cycle action
@@ -229,11 +227,9 @@ mod tests {
             "Power Cycle Device",
             "Power cycles the device hardware",
         );
-        assert_eq!(power_action.action_type, ActionType::PowerCycle);
+        assert!(matches!(power_action.action_type, ActionType::PowerCycle { .. }));
         assert_eq!(power_action.timeout_secs, 120);
         assert_eq!(power_action.retry_config.max_attempts, 1);
-        assert!(power_action.script_config.is_none());
-        assert!(power_action.service_name.is_none());
     }
 
     #[test]
@@ -254,9 +250,25 @@ mod tests {
 
     #[test]
     fn test_action_type_equality() {
-        assert_eq!(ActionType::Script, ActionType::Script);
-        assert_ne!(ActionType::Script, ActionType::RestartService);
-        assert_ne!(ActionType::EdgeCommand, ActionType::PowerCycle);
+        let script_a = ActionType::Script(ScriptAction {
+            script: "a".into(),
+            args: vec![],
+            env: HashMap::new(),
+            working_dir: None,
+            run_as: None,
+        });
+        let script_b = ActionType::Script(ScriptAction {
+            script: "a".into(),
+            args: vec![],
+            env: HashMap::new(),
+            working_dir: None,
+            run_as: None,
+        });
+        let restart = ActionType::RestartService {
+            service_name: "svc".into(),
+        };
+        assert_eq!(script_a, script_b);
+        assert_ne!(script_a, restart);
     }
 
     #[test]
@@ -267,18 +279,19 @@ mod tests {
             "A script with arguments and environment",
             "/usr/bin/python3",
         );
-        if let Some(ref mut cfg) = action.script_config {
+        if let ActionType::Script(ref mut cfg) = action.action_type {
             cfg.args.push("-c".to_string());
             cfg.args.push("print('hello')".to_string());
             cfg.env.insert("PYTHONPATH".to_string(), "/opt/lib".to_string());
             cfg.working_dir = Some("/tmp".to_string());
             cfg.run_as = Some("nobody".to_string());
         }
-        let cfg = action.script_config.as_ref().unwrap();
-        assert_eq!(cfg.args.len(), 2);
-        assert_eq!(cfg.args[0], "-c");
-        assert_eq!(cfg.env.get("PYTHONPATH").unwrap(), "/opt/lib");
-        assert_eq!(cfg.working_dir.as_deref(), Some("/tmp"));
-        assert_eq!(cfg.run_as.as_deref(), Some("nobody"));
+        if let ActionType::Script(ref cfg) = action.action_type {
+            assert_eq!(cfg.args.len(), 2);
+            assert_eq!(cfg.args[0], "-c");
+            assert_eq!(cfg.env.get("PYTHONPATH").unwrap(), "/opt/lib");
+            assert_eq!(cfg.working_dir.as_deref(), Some("/tmp"));
+            assert_eq!(cfg.run_as.as_deref(), Some("nobody"));
+        }
     }
 }
