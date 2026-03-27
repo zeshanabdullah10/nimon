@@ -21,5 +21,6 @@
 pub mod actor;
 pub mod comm;
 pub mod config;
+pub mod prediction;
 
 pub use config::EdgeConfig;
