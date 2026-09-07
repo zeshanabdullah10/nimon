@@ -1,8 +1,20 @@
 //! Edge session representation
 
 use chrono::{DateTime, Utc};
+use nimon_core::{HealthStatus, MetricValue};
+use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Latest observed state of a device reported by an edge node
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceSnapshot {
+    pub device_id: String,
+    pub status: String,
+    pub metrics: HashMap<String, MetricValue>,
+    pub last_seen: DateTime<Utc>,
+}
 
 /// Session for a connected edge node
 #[derive(Clone)]
@@ -17,8 +29,8 @@ pub struct EdgeSession {
     ip_address: Option<String>,
     /// Connection timestamp
     connected_at: DateTime<Utc>,
-    /// Number of devices being monitored
-    device_count: Arc<RwLock<usize>>,
+    /// Latest device states reported by this edge
+    devices: Arc<RwLock<HashMap<String, DeviceSnapshot>>>,
     /// Last heartbeat timestamp
     last_heartbeat: Arc<RwLock<DateTime<Utc>>>,
 }
@@ -38,7 +50,7 @@ impl EdgeSession {
             hostname,
             ip_address,
             connected_at: now,
-            device_count: Arc::new(RwLock::new(0)),
+            devices: Arc::new(RwLock::new(HashMap::new())),
             last_heartbeat: Arc::new(RwLock::new(now)),
         }
     }
@@ -70,12 +82,31 @@ impl EdgeSession {
 
     /// Get the device count
     pub async fn device_count(&self) -> usize {
-        *self.device_count.read().await
+        self.devices.read().await.len()
     }
 
-    /// Set the device count
-    pub async fn set_device_count(&self, count: usize) {
-        *self.device_count.write().await = count;
+    /// Record the latest status for a device reported by this edge
+    pub async fn update_device(
+        &self,
+        device_id: String,
+        status: HealthStatus,
+        metrics: HashMap<String, MetricValue>,
+    ) {
+        let snapshot = DeviceSnapshot {
+            device_id: device_id.clone(),
+            status: status.to_string(),
+            metrics,
+            last_seen: Utc::now(),
+        };
+        self.devices.write().await.insert(device_id, snapshot);
+    }
+
+    /// Get snapshots of all devices, sorted by device ID
+    pub async fn devices(&self) -> Vec<DeviceSnapshot> {
+        let map = self.devices.read().await;
+        let mut list: Vec<DeviceSnapshot> = map.values().cloned().collect();
+        list.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        list
     }
 
     /// Get the last heartbeat timestamp
@@ -130,8 +161,29 @@ mod tests {
             .block_on(async {
                 assert_eq!(session.device_count().await, 0);
 
-                session.set_device_count(5).await;
-                assert_eq!(session.device_count().await, 5);
+                let mut metrics = HashMap::new();
+                metrics.insert("temperature".to_string(), MetricValue::Float(42.0));
+                session
+                    .update_device("dev-1".to_string(), HealthStatus::Healthy, metrics)
+                    .await;
+                session
+                    .update_device(
+                        "dev-2".to_string(),
+                        HealthStatus::Warning,
+                        HashMap::new(),
+                    )
+                    .await;
+                assert_eq!(session.device_count().await, 2);
+
+                // Re-reporting the same device must not grow the registry
+                session
+                    .update_device("dev-1".to_string(), HealthStatus::Healthy, HashMap::new())
+                    .await;
+                assert_eq!(session.device_count().await, 2);
+
+                let devices = session.devices().await;
+                assert_eq!(devices[0].device_id, "dev-1");
+                assert_eq!(devices[0].status, "healthy");
             });
     }
 

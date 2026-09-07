@@ -502,6 +502,17 @@ async fn ws_socket_handler(socket: WebSocket, state: HubState) {
                             status.edge_id, status.device_id, status.status
                         );
 
+                        // Track latest device state on the edge session
+                        if let Some(session) = state.sessions().get(&status.edge_id) {
+                            session
+                                .update_device(
+                                    status.device_id.clone(),
+                                    status.status,
+                                    status.metrics.clone(),
+                                )
+                                .await;
+                        }
+
                         if let Some(alert_manager) = state.alert_manager().await {
                             alert_manager.do_send(status);
                         }

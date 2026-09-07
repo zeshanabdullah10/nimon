@@ -65,12 +65,17 @@ pub async fn get_edge_devices(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     info!("Getting devices for edge: {}", edge_id);
 
-    // Only return devices if the edge session exists
+    // Return the latest device states reported by this edge
     match state.sessions().get(&edge_id) {
-        Some(_) => Ok(Json(json!({
-            "edge_id": edge_id,
-            "devices": [],
-        }))),
+        Some(session) => {
+            let devices = session.devices().await;
+            let total = devices.len();
+            Ok(Json(json!({
+                "edge_id": edge_id,
+                "devices": devices,
+                "total": total,
+            })))
+        }
         None => Err(StatusCode::NOT_FOUND),
     }
 }
