@@ -5,6 +5,7 @@
 use libloading::os::windows::{Library, Symbol};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::os::raw::c_int;
 use std::path::Path;
 
 use super::ffi::*;
@@ -19,11 +20,11 @@ use crate::{NimonError, NimonResult};
 pub struct NiSysCfg {
     #[allow(dead_code)]
     library: Library,
-    initialize: Symbol<NiSysCfgInitialize>,
-    close_handle: Symbol<NiSysCfgCloseHandle>,
-    find_hardware: Symbol<NiSysCfgFindHardware>,
-    next_resource: Symbol<NiSysCfgNextResource>,
-    get_property: Symbol<NiSysCfgGetResourceProperty>,
+    initialize_session: Symbol<NISysCfgInitializeSession>,
+    close_handle: Symbol<NISysCfgCloseHandle>,
+    find_hardware: Symbol<NISysCfgFindHardware>,
+    next_resource: Symbol<NISysCfgNextResource>,
+    get_property: Symbol<NISysCfgGetResourceProperty>,
 }
 
 impl NiSysCfg {
@@ -45,15 +46,17 @@ impl NiSysCfg {
                 ))
             })?;
 
-            let initialize = Self::get_symbol(&library, b"NiSysCfg_Initialize")?;
-            let close_handle = Self::get_symbol(&library, b"NiSysCfg_CloseHandle")?;
-            let find_hardware = Self::get_symbol(&library, b"NiSysCfg_FindHardware")?;
-            let next_resource = Self::get_symbol(&library, b"NiSysCfg_NextResource")?;
-            let get_property = Self::get_symbol(&library, b"NiSysCfg_GetResourceProperty")?;
+            let initialize_session =
+                Self::get_symbol(&library, b"NISysCfgInitializeSession")?;
+            let close_handle = Self::get_symbol(&library, b"NISysCfgCloseHandle")?;
+            let find_hardware = Self::get_symbol(&library, b"NISysCfgFindHardware")?;
+            let next_resource = Self::get_symbol(&library, b"NISysCfgNextResource")?;
+            let get_property =
+                Self::get_symbol(&library, b"NISysCfgGetResourceProperty")?;
 
             Ok(Self {
                 library,
-                initialize,
+                initialize_session,
                 close_handle,
                 find_hardware,
                 next_resource,
@@ -63,9 +66,13 @@ impl NiSysCfg {
     }
 
     unsafe fn get_symbol<T>(library: &Library, name: &[u8]) -> NimonResult<Symbol<T>> {
-        library
-            .get(name)
-            .map_err(|e| NimonError::Connection(format!("Symbol not found: {}", e)))
+        library.get(name).map_err(|e| {
+            NimonError::Connection(format!(
+                "Symbol not found: {} ({}). The installed niSysCfg.dll may be an incompatible version.",
+                String::from_utf8_lossy(name),
+                e
+            ))
+        })
     }
 
     /// Find the NI-SysCfg DLL location
@@ -97,7 +104,7 @@ impl NiSysCfg {
         Self::find_dll().is_ok()
     }
 
-    /// Create a new NI-SysCfg session
+    /// Create a new NI-SysCfg session for the local system
     ///
     /// A session is required for most operations.
     /// The session will be automatically closed when dropped.
@@ -105,13 +112,17 @@ impl NiSysCfg {
         let mut handle: *mut NiSysCfgSession = std::ptr::null_mut();
 
         unsafe {
-            let status = (self.initialize)(
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
+            let status = (self.initialize_session)(
+                std::ptr::null(),                      // target: NULL => localhost
+                std::ptr::null(),                      // username: NULL => no credentials
+                std::ptr::null(),                      // password: NULL => no credentials
+                NISYSCFG_LOCALE_DEFAULT,
+                NISYSCFG_BOOL_FALSE, // TRUE here crashes NextResource on NI 26.3
+                10_000,              // connect timeout ms
+                std::ptr::null_mut(), // expert enum handle (optional)
                 &mut handle,
             );
-            check_status("NiSysCfg_Initialize", status)?;
+            check_status("NISysCfgInitializeSession", status)?;
         }
 
         Ok(SysCfgSession {
@@ -123,6 +134,85 @@ impl NiSysCfg {
     fn close_handle_ptr(&self, handle: *mut c_void) {
         unsafe {
             (self.close_handle)(handle);
+        }
+    }
+
+    /// Read a string property into a caller-provided buffer.
+    ///
+    /// String properties copy into a buffer of at least
+    /// NISYSCFG_SIMPLE_STRING_LENGTH bytes; they do not return allocations.
+    unsafe fn get_string_prop(
+        &self,
+        resource: *mut NiSysCfgResource,
+        property_id: c_int,
+    ) -> Option<String> {
+        let mut buffer = [0 as std::os::raw::c_char; NISYSCFG_SIMPLE_STRING_LENGTH];
+        let status = (self.get_property)(
+            resource,
+            property_id,
+            buffer.as_mut_ptr() as *mut c_void,
+        );
+        if status != 0 {
+            return None;
+        }
+        let s = crate::common::c_str_to_string(buffer.as_ptr());
+        s.filter(|s| !s.is_empty())
+    }
+
+    /// Read an integer property (e.g., slot number, presence)
+    unsafe fn get_int_prop(
+        &self,
+        resource: *mut NiSysCfgResource,
+        property_id: c_int,
+    ) -> Option<c_int> {
+        let mut value: c_int = 0;
+        let status = (self.get_property)(
+            resource,
+            property_id,
+            &mut value as *mut _ as *mut c_void,
+        );
+        if status != 0 {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    /// Read a floating-point property (e.g., temperature)
+    unsafe fn get_f64_prop(
+        &self,
+        resource: *mut NiSysCfgResource,
+        property_id: c_int,
+    ) -> Option<f64> {
+        let mut value: f64 = 0.0;
+        let status = (self.get_property)(
+            resource,
+            property_id,
+            &mut value as *mut _ as *mut c_void,
+        );
+        if status != 0 {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    /// Read a boolean (NISysCfgBool) property
+    unsafe fn get_bool_prop(
+        &self,
+        resource: *mut NiSysCfgResource,
+        property_id: c_int,
+    ) -> Option<bool> {
+        let mut value: i32 = 0;
+        let status = (self.get_property)(
+            resource,
+            property_id,
+            &mut value as *mut _ as *mut c_void,
+        );
+        if status != 0 {
+            None
+        } else {
+            Some(value != 0)
         }
     }
 }
@@ -140,19 +230,88 @@ impl<'a> SysCfgSession<'a> {
     /// Discover all NI devices on the system
     ///
     /// Returns a list of all discovered devices with their properties.
-    /// This uses simple search mode which finds all locally connected devices.
+    /// This uses filter-syntax search with an empty filter, which returns all
+    /// locally available resources.
     pub fn discover_devices(&self) -> NimonResult<Vec<DiscoveredDevice>> {
-        let mut enum_handle: *mut NiSysCfgEnum = std::ptr::null_mut();
         let mut devices = Vec::new();
+
+        for resource in self.enumerate_all()? {
+            let device = match unsafe { self.extract_device_info(resource) } {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(
+                        "Skipping device: failed to extract device info: {}",
+                        e
+                    );
+                    self.api.close_handle_ptr(resource as *mut c_void);
+                    continue;
+                }
+            };
+            self.api.close_handle_ptr(resource as *mut c_void);
+            devices.push(device);
+        }
+
+        Ok(devices)
+    }
+
+    /// Get health information for a specific device
+    ///
+    /// Locates the resource whose product name (or formatted serial number)
+    /// matches `device_name`, then queries its health properties.
+    /// Returns DeviceHealth::unreachable() if the device cannot be found.
+    pub fn get_device_health(&self, device_name: &str) -> NimonResult<DeviceHealth> {
+        let mut result = DeviceHealth::unreachable();
+        let mut found = false;
+
+        for resource in self.enumerate_all()? {
+            if !found {
+                let product = unsafe {
+                    self.api
+                        .get_string_prop(resource, properties::PRODUCT_NAME)
+                }
+                .unwrap_or_default();
+                let serial = unsafe {
+                    self.api
+                        .get_string_prop(resource, properties::SERIAL_NUMBER)
+                }
+                .unwrap_or_default();
+
+                if product == device_name || serial == device_name {
+                    result = unsafe { self.query_resource_health(resource) };
+                    found = true;
+                }
+            }
+
+            self.api.close_handle_ptr(resource as *mut c_void);
+        }
+
+        if !found {
+            tracing::debug!(
+                "Device '{}' not found via NI-SysCfg, treating as unreachable",
+                device_name
+            );
+        }
+        Ok(result)
+    }
+
+    /// Enumerate all resources, returning raw resource handles.
+    ///
+    /// Each handle is opened with NextResource; callers must close every
+    /// returned handle via `close_handle_ptr` (handles are NOT closed here
+    /// beyond the enumeration itself).
+    fn enumerate_all(&self) -> NimonResult<Vec<*mut NiSysCfgResource>> {
+        let mut enum_handle: *mut NiSysCfgEnum = std::ptr::null_mut();
+        let mut resources = Vec::new();
 
         unsafe {
             let status = (self.api.find_hardware)(
                 self.handle,
-                NISYSCFG_SIMPLE_SEARCH,
-                std::ptr::null(),
+                NISYSCFG_FILTER_MODE_MATCH_VALUES_ALL, // ignored: filter is NULL
+                std::ptr::null_mut(),                  // filter: NULL => all resources
+                std::ptr::null(),                      // expert names: NULL => all experts
                 &mut enum_handle,
             );
-            check_status("NiSysCfg_FindHardware", status)?;
+            check_status("NISysCfgFindHardware", status)?;
 
             loop {
                 let mut resource: *mut NiSysCfgResource = std::ptr::null_mut();
@@ -162,221 +321,82 @@ impl<'a> SysCfgSession<'a> {
                     &mut resource,
                 );
 
-                if status != 0 {
+                if status != 0 || resource.is_null() {
                     break; // No more resources
                 }
 
-                let device = match self.extract_device_info(resource) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Skipping device: failed to extract device info: {}",
-                            e
-                        );
-                        let _ = (self.api.close_handle)(
-                            resource as *mut std::ffi::c_void,
-                        );
-                        continue;
-                    }
-                };
-                // Close the resource handle to prevent leaks
-                let _ = (self.api.close_handle)(
-                    resource as *mut std::ffi::c_void,
-                );
-                devices.push(device);
+                resources.push(resource);
             }
 
             // Clean up enumeration handle
-            self.api.close_handle_ptr(enum_handle as *mut _);
+            self.api.close_handle_ptr(enum_handle as *mut c_void);
         }
 
-        Ok(devices)
-    }
-
-    /// Get health information for a specific device
-    ///
-    /// Uses FindHardware with a filter for the specific device name to locate
-    /// the resource, then queries IS_REACHABLE and TEMPERATURE properties.
-    /// Returns DeviceHealth::unreachable() if the device cannot be found.
-    pub fn get_device_health(&self, device_id: &str) -> NimonResult<DeviceHealth> {
-        // Build a filter that matches the device name (product name or serial)
-        let filter = crate::common::string_to_c_string(device_id)
-            .ok_or_else(|| NimonError::Config("Device ID contains null bytes".into()))?;
-
-        let mut enum_handle: *mut NiSysCfgEnum = std::ptr::null_mut();
-
-        unsafe {
-            let status = (self.api.find_hardware)(
-                self.handle,
-                NISYSCFG_SIMPLE_SEARCH,
-                filter.as_ptr(),
-                &mut enum_handle,
-            );
-
-            if status != 0 {
-                // Device not found or error - return unreachable
-                tracing::debug!(
-                    "FindHardware for '{}' returned status {}, treating as unreachable",
-                    device_id,
-                    status
-                );
-                return Ok(DeviceHealth::unreachable());
-            }
-
-            let mut resource: *mut NiSysCfgResource = std::ptr::null_mut();
-            let next_status = (self.api.next_resource)(
-                self.handle,
-                enum_handle,
-                &mut resource,
-            );
-
-            // Clean up enum handle regardless of outcome
-            self.api.close_handle_ptr(enum_handle as *mut _);
-
-            if next_status != 0 || resource.is_null() {
-                // No matching resource found
-                return Ok(DeviceHealth::unreachable());
-            }
-
-            let health = self.query_resource_health(resource)?;
-
-            // Clean up resource handle
-            self.api.close_handle_ptr(resource as *mut _);
-
-            Ok(health)
-        }
+        Ok(resources)
     }
 
     /// Query health properties from a resource handle
     ///
-    /// Reads IS_REACHABLE and TEMPERATURE properties and builds a DeviceHealth.
+    /// Reads IS_PRESENT and CURRENT_TEMP properties and builds a DeviceHealth.
     unsafe fn query_resource_health(
         &self,
         resource: *mut NiSysCfgResource,
-    ) -> NimonResult<DeviceHealth> {
-        let mut int_val: i32 = 0;
-        let mut float_val: f64 = 0.0;
-
-        // Query IS_REACHABLE
-        (self.api.get_property)(
-            resource,
-            properties::IS_REACHABLE,
-            &mut int_val as *mut _ as *mut _,
-        );
-        let is_reachable = int_val != 0;
-
-        // Query TEMPERATURE
-        let temp_status = (self.api.get_property)(
-            resource,
-            properties::TEMPERATURE,
-            &mut float_val as *mut _ as *mut _,
-        );
-        let temperature = if temp_status == 0 { Some(float_val) } else { None };
-
+    ) -> DeviceHealth {
+        let is_reachable = self
+            .api
+            .get_int_prop(resource, properties::IS_PRESENT)
+            .map(|present| present == NISYSCFG_IS_PRESENT_TYPE_PRESENT)
+            .unwrap_or(false);
+        let temperature = self.api.get_f64_prop(resource, properties::CURRENT_TEMP);
         let metrics = HashMap::new();
 
-        // If device is not reachable, return early
         if !is_reachable {
-            return Ok(DeviceHealth {
+            return DeviceHealth {
                 is_reachable: false,
                 temperature: None,
                 self_test_passed: None,
                 error_message: Some("Device not reachable".to_string()),
                 metrics,
-            });
+            };
         }
 
-        Ok(DeviceHealth {
+        DeviceHealth {
             is_reachable: true,
             temperature,
             self_test_passed: None,
             error_message: None,
             metrics,
-        })
+        }
     }
 
     unsafe fn extract_device_info(
         &self,
         resource: *mut NiSysCfgResource,
     ) -> NimonResult<DiscoveredDevice> {
-        let mut buffer = [0i8; 512];
-        let mut int_val: i32 = 0;
-        let mut float_val: f64 = 0.0;
+        let api = self.api;
 
         // Product name
-        let name_status = (self.api.get_property)(
-            resource,
-            properties::PRODUCT_NAME,
-            buffer.as_mut_ptr() as *mut _,
-        );
-        if name_status != 0 {
-            return Err(NimonError::Connection(format!(
-                "Failed to read PRODUCT_NAME from resource (status {})",
-                name_status
-            )));
-        }
-        let product_name = crate::common::c_str_to_string(buffer.as_ptr())
+        let product_name = api
+            .get_string_prop(resource, properties::PRODUCT_NAME)
+            .ok_or_else(|| {
+                NimonError::Connection(
+                    "Failed to read PRODUCT_NAME from resource".to_string(),
+                )
+            })?;
+
+        // Serial number (string property in current NI versions)
+        let serial_number = api
+            .get_string_prop(resource, properties::SERIAL_NUMBER)
             .unwrap_or_default();
 
-        // Serial number
-        buffer.fill(0);
-        let serial_status = (self.api.get_property)(
-            resource,
-            properties::SERIAL_NUMBER,
-            buffer.as_mut_ptr() as *mut _,
-        );
-        if serial_status != 0 {
-            tracing::warn!(
-                "Failed to read SERIAL_NUMBER from resource '{}' (status {})",
-                product_name,
-                serial_status
-            );
-        }
-        let serial_number = crate::common::c_str_to_string(buffer.as_ptr())
-            .unwrap_or_default();
-
-        // IP address
-        buffer.fill(0);
-        (self.api.get_property)(
-            resource,
-            properties::IPADDRESS,
-            buffer.as_mut_ptr() as *mut _,
-        );
-        let ip_address = crate::common::c_str_to_string(buffer.as_ptr());
-
-        // Is reachable
-        (self.api.get_property)(
-            resource,
-            properties::IS_REACHABLE,
-            &mut int_val as *mut _ as *mut _,
-        );
-        let is_reachable = int_val != 0;
-
-        // Temperature
-        let temp_status = (self.api.get_property)(
-            resource,
-            properties::TEMPERATURE,
-            &mut float_val as *mut _ as *mut _,
-        );
-        let temperature = if temp_status == 0 { Some(float_val) } else { None };
-
-        // Firmware version
-        buffer.fill(0);
-        (self.api.get_property)(
-            resource,
-            properties::FIRMWARE_REVISION,
-            buffer.as_mut_ptr() as *mut _,
-        );
-        let firmware_version = crate::common::c_str_to_string(buffer.as_ptr());
-
-        // Driver version
-        buffer.fill(0);
-        (self.api.get_property)(
-            resource,
-            properties::DRIVER_VERSION,
-            buffer.as_mut_ptr() as *mut _,
-        );
-        let driver_version = crate::common::c_str_to_string(buffer.as_ptr());
+        let ip_address = api.get_string_prop(resource, properties::TCP_IP_ADDRESS);
+        let firmware_version =
+            api.get_string_prop(resource, properties::FIRMWARE_REVISION);
+        let is_reachable = api
+            .get_int_prop(resource, properties::IS_PRESENT)
+            .map(|present| present == NISYSCFG_IS_PRESENT_TYPE_PRESENT)
+            .unwrap_or(false);
+        let temperature = api.get_f64_prop(resource, properties::CURRENT_TEMP);
 
         Ok(DiscoveredDevice {
             product_name,
@@ -385,7 +405,8 @@ impl<'a> SysCfgSession<'a> {
             is_reachable,
             temperature,
             firmware_version,
-            driver_version,
+            // Not exposed by this NI-SysCfg version's resource properties
+            driver_version: None,
         })
     }
 }
