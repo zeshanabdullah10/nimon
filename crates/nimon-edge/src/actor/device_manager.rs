@@ -4,7 +4,7 @@ use actix::prelude::*;
 use std::collections::HashMap;
 
 use nimon_core::{
-    actor::DevicePoll,
+    actor::{DevicePoll, DeviceStatusUpdate},
     Device, DeviceType,
 };
 
@@ -86,7 +86,12 @@ impl DeviceManagerActor {
     fn add_device(&mut self, device: Device) {
         let device_id = device.id.clone();
 
-        let actor = DeviceActor::new(device, self.default_poll_interval);
+        let mut actor = DeviceActor::new(device, self.default_poll_interval);
+        // Route status updates through the prediction actor, which forwards
+        // them (plus any predictions) to the hub connector
+        if let Some(ref prediction) = self.prediction_actor {
+            actor = actor.with_status_recipient(prediction.clone().recipient::<DeviceStatusUpdate>());
+        }
         let addr = actor.start();
 
         self.device_actors.insert(device_id.clone(), addr);
@@ -115,15 +120,24 @@ impl DeviceManagerActor {
                             );
                             return discovered
                                 .into_iter()
-                                .map(|d| {
+                                .enumerate()
+                                .map(|(i, d)| {
                                     let device_type = classify_device(&d.product_name);
+                                    // Simulated NI MAX devices often report empty
+                                    // serials; fall back to product name + index
+                                    // so every device gets a unique ID
+                                    let serial = if d.serial_number.is_empty() {
+                                        format!("{}#{}", d.product_name, i + 1)
+                                    } else {
+                                        d.serial_number.clone()
+                                    };
                                     Device {
-                                        id: format!("{}:{}", self.edge_id, d.serial_number),
+                                        id: format!("{}:{}", self.edge_id, serial),
                                         edge_id: self.edge_id.clone(),
                                         device_name: d.product_name.clone(),
                                         device_type,
                                         model: Some(d.product_name),
-                                        serial_number: Some(d.serial_number),
+                                        serial_number: Some(serial),
                                         firmware_version: d.firmware_version,
                                         driver_version: d.driver_version,
                                         ip_address: d.ip_address,
@@ -392,9 +406,8 @@ mod tests {
         actix_rt::time::sleep(Duration::from_millis(100)).await;
 
         let devices = addr.send(ListDevices).await.unwrap();
+        // Real NI-SysCfg devices when available, simulated fallback otherwise
         assert!(!devices.is_empty());
-        assert!(devices.contains(&"test-edge:daq-1".to_string()));
-        assert!(devices.contains(&"test-edge:pxi-1".to_string()));
     }
 
     #[actix::test]
@@ -450,11 +463,11 @@ mod tests {
 
         let initial_count = addr.send(GetDeviceCount).await.unwrap();
 
-        // Remove a device
+        // Remove an existing device (whatever discovery provided)
+        let devices = addr.send(ListDevices).await.unwrap();
+        let device_id = devices[0].clone();
         let removed = addr
-            .send(RemoveDevice {
-                device_id: "test-edge:daq-1".to_string(),
-            })
+            .send(RemoveDevice { device_id })
             .await
             .unwrap();
         assert!(removed);

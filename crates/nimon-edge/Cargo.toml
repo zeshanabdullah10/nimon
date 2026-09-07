@@ -5,6 +5,14 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lib]
+name = "nimon_edge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nimon-edge"
+path = "src/main.rs"
+
 [dependencies]
 nimon-core = { path = "../nimon-core" }
 nimon-ni = { path = "../nimon-ni" }

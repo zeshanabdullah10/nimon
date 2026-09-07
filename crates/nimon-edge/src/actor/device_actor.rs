@@ -207,7 +207,14 @@ mod tests {
         let mut actor = DeviceActor::new(device, 10);
         let result = actor.poll_device();
         assert!(result.success);
-        assert!(result.metrics.contains_key("temperature"));
+        // With real NI-SysCfg available an unknown device name resolves to an
+        // offline status without simulated metrics; without NI software the
+        // simulated fallback always reports a temperature metric.
+        if nimon_ni::syscfg::NiSysCfg::is_available() {
+            assert_eq!(result.status, HealthStatus::Offline);
+        } else {
+            assert!(result.metrics.contains_key("temperature"));
+        }
     }
 
     #[test]

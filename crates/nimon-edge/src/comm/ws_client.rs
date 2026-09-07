@@ -78,7 +78,9 @@ pub struct WsClient {
     message_buffer: Arc<tokio::sync::Mutex<Vec<WsMessage>>>,
     shutdown_tx: Option<mpsc::UnboundedSender<()>>,
     /// Shared send channel so reconnect_task can update it after reconnecting.
-    send_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    /// std Mutex is fine here: critical sections are short and never await
+    /// while the guard is held, and the actor thread must lock it synchronously.
+    send_tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
 }
 
 impl WsClient {
@@ -91,7 +93,7 @@ impl WsClient {
             event_tx,
             message_buffer: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             shutdown_tx: None,
-            send_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            send_tx: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -128,7 +130,7 @@ impl WsClient {
 
         // Send through channel to connection task
         let json = msg.to_json().map_err(|e| NimonError::Connection(e.to_string()))?;
-        let tx_guard = self.send_tx.lock().await;
+        let tx_guard = self.send_tx.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(ref tx) = *tx_guard {
             tx.send(json).map_err(|e| NimonError::Connection(e.to_string()))?;
         } else {
@@ -140,7 +142,6 @@ impl WsClient {
     /// Connect to the hub
     pub async fn connect(&mut self) -> Result<(), NimonError> {
         *self.state.write().await = ConnectionState::Connecting;
-        self.emit_event(WsClientEvent::Connected);
 
         let url = self.config.hub_url.clone();
         let state = self.state.clone();
@@ -148,16 +149,19 @@ impl WsClient {
         match connect_async(&url).await {
             Ok((ws_stream, _)) => {
                 *state.write().await = ConnectionState::Connected;
+                self.emit_event(WsClientEvent::Connected);
                 info!("Connected to hub at {}", url);
 
                 let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
                 self.shutdown_tx = Some(shutdown_tx);
 
                 let (send_tx, outgoing_rx) = mpsc::unbounded_channel();
-                *self.send_tx.lock().await = Some(send_tx);
+                *self.send_tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(send_tx);
 
+                let event_tx = self.event_tx.clone();
                 tokio::spawn(async move {
-                    Self::handle_connection(ws_stream, &mut shutdown_rx, outgoing_rx).await;
+                    Self::handle_connection(ws_stream, &mut shutdown_rx, outgoing_rx, event_tx)
+                        .await;
                 });
 
                 self.send_buffered_messages().await;
@@ -177,6 +181,7 @@ impl WsClient {
                         self.config.clone(),
                         state.clone(),
                         self.send_tx.clone(),
+                        self.event_tx.clone(),
                     ));
                 }
 
@@ -205,6 +210,7 @@ impl WsClient {
         >,
         shutdown: &mut mpsc::UnboundedReceiver<()>,
         mut outgoing: mpsc::UnboundedReceiver<String>,
+        event_tx: mpsc::UnboundedSender<WsClientEvent>,
     ) {
         let (mut write, mut read) = ws_stream.split();
         let ping_interval = Duration::from_secs(30);
@@ -254,13 +260,17 @@ impl WsClient {
                 }
             }
         }
+
+        // Notify subscribers that the connection dropped
+        event_tx.send(WsClientEvent::Disconnected).ok();
     }
 
     /// Reconnection task
     async fn reconnect_task(
         config: WsClientConfig,
         state: Arc<tokio::sync::RwLock<ConnectionState>>,
-        send_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
+        send_tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
+        event_tx: mpsc::UnboundedSender<WsClientEvent>,
     ) {
         let mut attempts = 0;
 
@@ -277,14 +287,21 @@ impl WsClient {
                 Ok((ws_stream, _)) => {
                     info!("Reconnected to hub");
                     *state.write().await = ConnectionState::Connected;
+                    event_tx.send(WsClientEvent::Connected).ok();
                     let (_shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
                     let (new_send_tx, outgoing_rx) = mpsc::unbounded_channel();
 
                     // Update the shared send_tx so the actor can send messages again
-                    *send_tx.lock().await = Some(new_send_tx);
+                    *send_tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_send_tx);
 
                     tokio::spawn(async move {
-                        Self::handle_connection(ws_stream, &mut shutdown_rx, outgoing_rx).await;
+                        Self::handle_connection(
+                            ws_stream,
+                            &mut shutdown_rx,
+                            outgoing_rx,
+                            event_tx.clone(),
+                        )
+                        .await;
                     });
                     break;
                 }
@@ -305,7 +322,7 @@ impl WsClient {
 
         info!("Sending {} buffered messages", buffer.len());
         for msg in buffer.drain(..) {
-            if let Some(ref tx) = *self.send_tx.lock().await {
+            if let Some(ref tx) = *self.send_tx.lock().unwrap_or_else(|p| p.into_inner()) {
                 match msg.to_json() {
                     Ok(json) => {
                         if let Err(e) = tx.send(json) {
@@ -356,6 +373,8 @@ impl Handler<Connect> for WsClient {
         let message_buffer = self.message_buffer.clone();
         let send_tx_shared = self.send_tx.clone();
         let send_tx_for_map = self.send_tx.clone();
+        let event_tx = self.event_tx.clone();
+        let event_tx_for_reconnect = self.event_tx.clone();
 
         let connect_fut = async move {
             *state.write().await = ConnectionState::Connecting;
@@ -368,7 +387,13 @@ impl Handler<Connect> for WsClient {
                     let (send_tx, outgoing_rx) = mpsc::unbounded_channel();
 
                     tokio::spawn(async move {
-                        Self::handle_connection(ws_stream, &mut shutdown_rx, outgoing_rx).await;
+                        Self::handle_connection(
+                            ws_stream,
+                            &mut shutdown_rx,
+                            outgoing_rx,
+                            event_tx,
+                        )
+                        .await;
                     });
 
                     // Send any buffered messages through the channel
@@ -401,6 +426,7 @@ impl Handler<Connect> for WsClient {
                             config_for_reconnect,
                             state,
                             Arc::clone(&send_tx_shared),
+                            event_tx_for_reconnect,
                         ));
                     }
 
@@ -414,7 +440,11 @@ impl Handler<Connect> for WsClient {
                 Ok((shutdown_tx, send_tx)) => {
                     act.shutdown_tx = Some(shutdown_tx);
                     // Update the shared send_tx (this runs on the actor thread, safe to set directly)
-                    let _ = send_tx_for_map.blocking_lock().insert(send_tx);
+                    let _ = send_tx_for_map
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(send_tx);
+                    act.emit_event(WsClientEvent::Connected);
                     Ok(())
                 }
                 Err(e) => Err(e),

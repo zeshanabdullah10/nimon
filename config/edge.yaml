@@ -1,0 +1,26 @@
+# NIMon Edge Node Configuration
+
+node:
+  id: "edge-01"
+  name: "Local Edge 1"
+  hub_address: "localhost:9090"
+  reconnect_interval_secs: 5
+
+api:
+  syscfg:
+    enabled: true
+    poll_interval_secs: 10
+
+prediction:
+  enabled: true
+  temperature_warning: 65
+  temperature_critical: 75
+
+buffer:
+  enabled: true
+  max_size_mb: 100
+  persist_path: "./data/buffer.db"
+
+logging:
+  level: info
+  file: "./logs/nimon-edge.log"
