@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light">
+<title>NIMon Widget</title>
+<style>
+/* ── Material tokens (same family as the dashboard) ── */
+:root {
+    --primary: #00696d;
+    --primary-container: #9cf1f2;
+    --on-primary-container: #002021;
+    --tertiary: #4b607c;
+    --tertiary-container: #d3e4ff;
+    --on-tertiary-container: #043051;
+    --error: #ba1a1a;
+    --error-container: #ffdad6;
+    --on-error-container: #93000a;
+    --success: #146c2e;
+    --success-container: #c4eed0;
+    --on-success-container: #0f5223;
+    --warning: #8f5000;
+    --warning-container: #ffdf9e;
+    --on-warning-container: #4a3900;
+    --surface: #f4fbfa;
+    --on-surface: #161d1d;
+    --on-surface-variant: #3f4948;
+    --outline: #6f7979;
+    --outline-variant: #bec8c8;
+    --sc-lowest: #ffffff;
+    --sc: #e8eeed;
+    --sc-high: #e2e8e7;
+    --sc-highest: #dce2e1;
+    --font: 'Segoe UI', 'Segoe UI Variable', system-ui, sans-serif;
+    --mono: 'Cascadia Mono', Consolas, 'Roboto Mono', monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body {
+    font-family: var(--font);
+    font-size: 13px;
+    color: var(--on-surface);
+    background: var(--sc-lowest);
+    display: flex;
+    user-select: none;
+}
+
+/* ═══ RAIL (always visible, 64px) ════════════════════════════════════ */
+#rail {
+    width: 64px;
+    height: 100%;
+    background: var(--surface);
+    border-left: 1px solid var(--outline-variant);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+}
+#railHead {
+    padding: 10px 0 8px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    border-bottom: 1px solid var(--sc-highest);
+    cursor: default;
+}
+.monogram {
+    width: 30px; height: 30px;
+    border-radius: 9px;
+    background: var(--primary);
+    color: #fff;
+    font-weight: 700;
+    font-size: 15px;
+    display: grid;
+    place-items: center;
+}
+#hubDot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--outline);
+}
+#hubDot.up { background: var(--success); }
+#hubDot.down { background: var(--error); animation: blink 1.2s infinite; }
+@keyframes blink { 50% { opacity: .3; } }
+
+#railDevices {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-width: none;
+}
+#railDevices::-webkit-scrollbar { display: none; }
+
+.rdev {
+    position: relative;
+    height: 58px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1px;
+    cursor: default;
+    border-bottom: 1px solid var(--sc-highest);
+    background: transparent;
+    transition: background .12s;
+}
+.rdev:hover, .rdev.sel { background: var(--sc); }
+.rdev .led {
+    position: absolute;
+    top: 8px; left: 8px;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--success);
+}
+.rdev.s-warning .led { background: var(--warning); }
+.rdev.s-error .led { background: var(--error); animation: blink 1.2s infinite; }
+.rdev.s-offline .led { background: var(--outline); }
+.rname {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--on-surface-variant);
+    max-width: 52px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.rtemp {
+    font-family: var(--mono);
+    font-size: 14.5px;
+    font-weight: 500;
+    color: var(--primary);
+    font-variant-numeric: tabular-nums;
+}
+.rtemp.w { color: var(--warning); }
+.rtemp.e { color: var(--error); }
+.rtemp.na { color: var(--outline); font-size: 12px; }
+.rgauge {
+    position: absolute;
+    right: 0; top: 7px; bottom: 7px;
+    width: 3px;
+    background: var(--sc-highest);
+    border-radius: 2px;
+    overflow: hidden;
+}
+.rgauge i {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    background: var(--primary);
+}
+.rgauge i.w { background: var(--warning); }
+.rgauge i.e { background: var(--error); }
+
+#railFoot {
+    padding: 9px 0;
+    text-align: center;
+    font-family: var(--mono);
+    font-size: 8.5px;
+    letter-spacing: .8px;
+    color: var(--outline);
+    border-top: 1px solid var(--sc-highest);
+}
+
+/* ═══ DETAIL PANE (revealed when expanded) ═══════════════════════════ */
+#pane {
+    width: 336px;
+    height: 100%;
+    background: var(--sc-lowest);
+    border-left: 1px solid var(--outline-variant);
+    overflow-y: auto;
+    overflow-x: hidden;
+    flex-shrink: 0;
+    opacity: 0;
+    transform: translateX(8px);
+    transition: opacity .18s ease, transform .18s ease;
+    scrollbar-width: thin;
+    scrollbar-color: var(--outline-variant) transparent;
+}
+#pane::-webkit-scrollbar { width: 8px; }
+#pane::-webkit-scrollbar-thumb { background: var(--outline-variant); border-radius: 6px; }
+body.expanded #pane { opacity: 1; transform: none; }
+
+.p-inner { padding: 18px 20px 24px; }
+
+.p-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 14px;
+}
+.p-title { font-size: 17px; font-weight: 600; flex: 1; min-width: 0; }
+.p-title small {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 400;
+    color: var(--on-surface-variant);
+    display: block;
+    margin-top: 1px;
+}
+
+.chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 24px;
+    padding: 0 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    background: var(--success-container);
+    color: var(--on-success-container);
+    flex-shrink: 0;
+}
+.chip.warn { background: var(--warning-container); color: var(--on-warning-container); }
+.chip.err { background: var(--error-container); color: var(--on-error-container); }
+.chip.off { background: var(--sc-high); color: var(--on-surface-variant); }
+.chip.info { background: var(--tertiary-container); color: var(--on-tertiary-container); }
+
+.minigrid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-bottom: 16px;
+}
+.mini {
+    background: var(--surface);
+    border: 1px solid var(--sc-highest);
+    border-radius: 12px;
+    padding: 10px 14px;
+}
+.mini .k { font-size: 11px; color: var(--on-surface-variant); }
+.mini .v {
+    font-family: var(--mono);
+    font-size: 21px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+}
+.mini .v.warn { color: var(--warning); }
+.mini .v.err { color: var(--error); }
+.mini .v.ok { color: var(--success); }
+
+.sect {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .8px;
+    text-transform: uppercase;
+    color: var(--on-surface-variant);
+    margin: 14px 0 8px;
+}
+
+.row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--sc);
+    font-size: 12.5px;
+}
+.row:last-child { border-bottom: none; }
+.row .dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--warning);
+    flex-shrink: 0;
+    align-self: center;
+}
+.row .dot.crit { background: var(--error); }
+.row .dot.info { background: var(--tertiary); }
+.row .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .m { font-family: var(--mono); font-size: 10.5px; color: var(--on-surface-variant); flex-shrink: 0; }
+
+/* device detail */
+.bigtemp {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin: 2px 0 10px;
+}
+.bigtemp .num {
+    font-family: var(--mono);
+    font-size: 34px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+}
+.bigtemp .num.w { color: var(--warning); }
+.bigtemp .num.e { color: var(--error); }
+.bigtemp .unit { font-size: 14px; color: var(--on-surface-variant); }
+
+.bar {
+    position: relative;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--sc-highest);
+    overflow: hidden;
+    margin-bottom: 14px;
+}
+.bar i {
+    position: absolute;
+    inset: 0 auto 0 0;
+    border-radius: 999px;
+    background: var(--primary);
+    transition: width .5s ease;
+}
+.bar i.w { background: var(--warning); }
+.bar i.e { background: var(--error); }
+.bar::after {
+    content: '';
+    position: absolute;
+    right: 2px; top: 50%;
+    width: 4px; height: 4px;
+    border-radius: 50%;
+    background: var(--primary);
+    transform: translateY(-50%);
+}
+.bar.w::after { background: var(--warning); }
+.bar.e::after { background: var(--error); }
+
+.kv { width: 100%; border-collapse: collapse; }
+.kv td { padding: 5px 0; font-size: 12.5px; border-bottom: 1px solid var(--sc); }
+.kv td:first-child { color: var(--on-surface-variant); width: 55%; }
+.kv td:last-child { font-family: var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+
+.spark { margin-top: 4px; }
+.spark svg { display: block; width: 100%; height: 44px; }
+.spark .cap { font-size: 10.5px; color: var(--outline); margin-top: 2px; }
+
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 36px;
+    padding: 0 18px;
+    border: none;
+    border-radius: 999px;
+    background: var(--primary);
+    color: #fff;
+    font-family: var(--font);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    margin-top: 14px;
+}
+.btn:hover { filter: brightness(1.1); }
+
+.back {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--primary);
+    cursor: pointer;
+    margin-bottom: 8px;
+    font-weight: 600;
+}
+.back:hover { text-decoration: underline; }
+
+.null {
+    padding: 30px 10px;
+    text-align: center;
+    color: var(--on-surface-variant);
+    font-size: 12.5px;
+}
+</style>
+</head>
+<body>
+
+<div id="rail">
+    <div id="railHead" data-hover="overview">
+        <div class="monogram">N</div>
+        <div id="hubDot"></div>
+    </div>
+    <div id="railDevices"></div>
+    <div id="railFoot" data-hover="overview">NIMON</div>
+</div>
+
+<div id="pane"><div class="p-inner" id="paneInner"></div></div>
+
+<script>
+'use strict';
+const invoke = window.__TAURI__.core.invoke;
+const POLL_MS = 5000;
+const HIST_MAX = 40;
+
+const S = {
+    up: false,
+    edges: [], devices: [], alerts: [], predictions: [],
+    history: {},           // device_id -> [{t, temp}]
+    selected: null,        // null = overview
+    expanded: false,
+};
+
+/* ── helpers ── */
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
+    (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function parseTs(ts) {
+    if (!ts) return null;
+    let s = String(ts).trim().replace(' ', 'T');
+    if (!/[zZ]$/.test(s) && !/[+-]\d{2}:?\d{2}$/.test(s)) s += 'Z';
+    const t = Date.parse(s);
+    return Number.isNaN(t) ? null : t;
+}
+function relTime(ts) {
+    const t = parseTs(ts);
+    if (t === null) return '';
+    const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+    if (s < 60) return s + 's ago';
+    const m = Math.floor(s / 60); if (m < 60) return m + 'm ago';
+    const h = Math.floor(m / 60); if (h < 24) return h + 'h ago';
+    return Math.floor(h / 24) + 'd ago';
+}
+function deviceTitle(id) {
+    const i = id.indexOf(':');
+    let short = i === -1 ? id : id.slice(i + 1);
+    const h = short.lastIndexOf('#');
+    let name = h === -1 ? short : short.slice(0, h);
+    const tag = h === -1 ? '' : short.slice(h + 1);
+    return { name: name.trim(), tag };
+}
+function railName(name) {
+    return name.replace(/^NI\s+/i, '')
+        .split(/[\s\-_]+/)
+        .filter(Boolean).pop() || name;
+}
+function tempState(t) {
+    if (t === null || t === undefined) return 'na';
+    if (t >= 75) return 'e';
+    if (t >= 65) return 'w';
+    return '';
+}
+function tempColor(t) {
+    const s = tempState(t);
+    return s === 'e' ? 'var(--error)' : s === 'w' ? 'var(--warning)' : 'var(--primary)';
+}
+
+/* ── expand / collapse ── */
+async function setExpanded(on) {
+    if (S.expanded === on) return;
+    S.expanded = on;
+    document.body.classList.toggle('expanded', on);
+    try { await invoke('set_expanded', { expanded: on }); } catch {}
+}
+
+/* ── rail ── */
+function renderRail() {
+    const hubDot = document.getElementById('hubDot');
+    hubDot.className = S.up ? 'up' : 'down';
+
+    const el = document.getElementById('railDevices');
+    if (!S.up) {
+        el.innerHTML = '<div class="null" style="padding:20px 6px;font-size:10px;">HUB OFFLINE</div>';
+        return;
+    }
+    el.innerHTML = S.devices.map((d) => {
+        const st = (d.status || 'offline').toLowerCase();
+        const temp = typeof d.metrics?.temperature === 'number' ? d.metrics.temperature : null;
+        const { name } = deviceTitle(d.device_id);
+        const ts = tempState(temp);
+        const pct = temp === null ? 0 : Math.max(0, Math.min(100, temp));
+        return `<div class="rdev s-${st} ${S.selected === d.device_id ? 'sel' : ''}"
+                     data-id="${esc(d.device_id)}">
+            <span class="led"></span>
+            <span class="rname">${esc(railName(name))}</span>
+            <span class="rtemp ${ts}">${temp !== null ? temp.toFixed(1) + '°' : '—'}</span>
+            <span class="rgauge"><i class="${ts}" style="height:${pct}%"></i></span>
+        </div>`;
+    }).join('');
+
+    el.querySelectorAll('.rdev').forEach((node) => {
+        node.addEventListener('pointerenter', () => {
+            select(node.dataset.id, false);
+        });
+    });
+}
+
+function select(id, keepCollapsed) {
+    S.selected = id;
+    renderRail();
+    renderPane();
+    if (!keepCollapsed) setExpanded(true);
+}
+
+/* ── pane ── */
+function renderPane() {
+    const el = document.getElementById('paneInner');
+    el.innerHTML = S.selected ? devicePane(S.selected) : overviewPane();
+    const back = el.querySelector('.back');
+    if (back) back.addEventListener('click', () => select(null, true));
+}
+
+function overviewPane() {
+    if (!S.up) {
+        return `<div class="p-head"><div class="p-title">NIMon</div></div>
+                <div class="null">Hub unreachable.<br>Retrying every 5 s…</div>`;
+    }
+    const devices = S.devices;
+    const online = devices.filter((d) =>
+        ['healthy', 'warning'].includes((d.status || '').toLowerCase())).length;
+    const crit = S.alerts.filter((a) => (a.severity || '').toLowerCase() === 'critical').length;
+    const preds = S.predictions.filter((p) => (p.probability ?? 0) >= 0.8);
+
+    const alertRows = S.alerts.slice(0, 6).map((a) => {
+        const sev = (a.severity || 'warning').toLowerCase();
+        return `<div class="row">
+            <span class="dot ${sev === 'critical' ? 'crit' : ''}"></span>
+            <span class="t">${esc(a.rule_name || 'Alert')}</span>
+            <span class="m">${relTime(a.created_at)}</span>
+        </div>`;
+    }).join('');
+
+    const predRows = preds.slice(0, 6).map((p) => {
+        const type = (p.prediction_type || '').replace(/([a-z])([A-Z])/g, '$1 $2');
+        return `<div class="row">
+            <span class="dot info"></span>
+            <span class="t">${esc(type)}</span>
+            <span class="m">${Math.round(p.probability * 100)}%</span>
+        </div>`;
+    }).join('');
+
+    return `
+        <div class="p-head">
+            <div class="p-title">NIMon<small>${S.edges.length} edge${S.edges.length === 1 ? '' : 's'} · ${devices.length} devices</small></div>
+        </div>
+        <div class="minigrid">
+            <div class="mini"><div class="k">Online</div>
+                <div class="v ${online === devices.length && devices.length ? 'ok' : online === 0 ? 'err' : 'warn'}">${online}/${devices.length}</div></div>
+            <div class="mini"><div class="k">Alerts</div>
+                <div class="v ${crit ? 'err' : S.alerts.length ? 'warn' : 'ok'}">${S.alerts.length}</div></div>
+        </div>
+        ${S.alerts.length ? `<div class="sect">Active alerts</div>${alertRows}` : ''}
+        ${preds.length ? `<div class="sect">Predictions</div>${predRows}` : ''}
+        ${!S.alerts.length && !preds.length ? '<div class="null">All channels nominal</div>' : ''}
+        <button class="btn" id="openDash">Open Dashboard</button>`;
+}
+
+function devicePane(id) {
+    const d = S.devices.find((x) => x.device_id === id);
+    if (!d) {
+        S.selected = null;
+        return overviewPane();
+    }
+    const st = (d.status || 'offline').toLowerCase();
+    const { name, tag } = deviceTitle(d.device_id);
+    const temp = typeof d.metrics?.temperature === 'number' ? d.metrics.temperature : null;
+    const ts = tempState(temp);
+    const pct = temp === null ? 0 : Math.max(0, Math.min(100, temp));
+    const edgeId = d.device_id.slice(0, d.device_id.indexOf(':')) || '';
+    const edge = S.edges.find((e) => e.edge_id === edgeId);
+
+    const chipCls = st === 'error' ? 'err' : st === 'warning' ? 'warn' : st === 'offline' ? 'off' : '';
+    const chipTxt = st.charAt(0).toUpperCase() + st.slice(1);
+
+    const metricRows = Object.entries(d.metrics || {})
+        .filter(([k]) => k !== 'temperature')
+        .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(typeof v === 'boolean' ? (v ? 'true' : 'false') : String(v))}</td></tr>`)
+        .join('');
+
+    const hist = S.history[id] || [];
+    const spark = sparkline(hist);
+
+    const alerts = S.alerts.filter((a) => a.device_id === id).slice(0, 4).map((a) => {
+        const sev = (a.severity || 'warning').toLowerCase();
+        return `<div class="row"><span class="dot ${sev === 'critical' ? 'crit' : ''}"></span>
+            <span class="t">${esc(a.rule_name || 'Alert')}</span><span class="m">${relTime(a.created_at)}</span></div>`;
+    }).join('');
+
+    const preds = S.predictions.filter((p) => p.device_id === id && p.probability >= 0.8)
+        .slice(0, 4).map((p) => {
+            const type = (p.prediction_type || '').replace(/([a-z])([A-Z])/g, '$1 $2');
+            return `<div class="row"><span class="dot info"></span>
+                <span class="t">${esc(type)}</span><span class="m">${Math.round(p.probability * 100)}%${p.eta_minutes ? ' · ~' + p.eta_minutes + 'm' : ''}</span></div>`;
+        }).join('');
+
+    return `
+        <span class="back">‹ Overview</span>
+        <div class="p-head">
+            <div class="p-title">${esc(name)}${tag ? ' <span style="font-weight:400;color:var(--on-surface-variant)">#' + esc(tag) + '</span>' : ''}
+                <small>${esc(edge ? edge.name : edgeId)} · ${esc(d.device_id)}</small></div>
+            <span class="chip ${chipCls}">${chipTxt}</span>
+        </div>
+        <div class="bigtemp">
+            <span class="num ${ts}" style="color:${tempColor(temp)}">${temp !== null ? temp.toFixed(1) : '—'}</span>
+            <span class="unit">°C</span>
+        </div>
+        <div class="bar ${ts}"><i class="${ts}" style="width:${pct}%"></i></div>
+        <div class="sect">Metrics</div>
+        <table class="kv">
+            <tr><td>Temperature</td><td>${temp !== null ? temp.toFixed(1) + ' °C' : '—'}</td></tr>
+            ${metricRows}
+            <tr><td>Last seen</td><td>${relTime(d.last_seen)}</td></tr>
+        </table>
+        ${hist.length > 2 ? `<div class="sect">Trend</div><div class="spark">${spark}<div class="cap">last ${hist.length} polls</div></div>` : ''}
+        ${alerts ? `<div class="sect">Alerts</div>${alerts}` : ''}
+        ${preds ? `<div class="sect">Predictions</div>${preds}` : ''}`;
+}
+
+function sparkline(hist) {
+    const temps = hist.map((h) => h.temp).filter((t) => t !== null);
+    if (temps.length < 2) return '';
+    const w = 290, h = 44, pad = 4;
+    const min = Math.min(...temps), max = Math.max(...temps);
+    const span = Math.max(1, max - min);
+    const pts = temps.map((t, i) => {
+        const x = pad + (i / (temps.length - 1)) * (w - pad * 2);
+        const y = h - pad - ((t - min) / span) * (h - pad * 2);
+        return [x.toFixed(1), y.toFixed(1)];
+    });
+    const line = pts.map((p) => p.join(',')).join(' ');
+    const last = pts[pts.length - 1];
+    return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+        <polyline points="${line}" fill="none" stroke="var(--primary)" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="${last[0]}" cy="${last[1]}" r="3" fill="var(--primary)"/>
+    </svg>`;
+}
+
+/* ── polling ── */
+async function poll() {
+    let data;
+    try {
+        data = await invoke('poll');
+    } catch {
+        data = { up: false };
+    }
+    const wasUp = S.up;
+    S.up = !!data.up;
+    if (S.up) {
+        S.edges = data.edges || [];
+        S.devices = data.devices || [];
+        S.alerts = data.alerts || [];
+        S.predictions = data.predictions || [];
+        const now = Date.now();
+        for (const d of S.devices) {
+            const t = typeof d.metrics?.temperature === 'number' ? d.metrics.temperature : null;
+            if (t !== null) {
+                const arr = S.history[d.device_id] || (S.history[d.device_id] = []);
+                arr.push({ t: now, temp: t });
+                if (arr.length > HIST_MAX) arr.shift();
+            }
+        }
+    }
+    renderRail();
+    renderPane();
+    const btn = document.getElementById('openDash');
+    if (btn) btn.addEventListener('click', () => invoke('open_dashboard'));
+    if (wasUp !== S.up) renderPane();
+}
+
+/* ── wiring ── */
+document.getElementById('railHead').addEventListener('pointerenter', () => select(null));
+document.getElementById('railFoot').addEventListener('pointerenter', () => select(null));
+document.addEventListener('mouseleave', () => setExpanded(false));
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') setExpanded(false);
+});
+
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>

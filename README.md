@@ -44,6 +44,19 @@ open http://localhost:9090
 ./target/release/nimon-cli.exe alerts list
 ```
 
+### Real NI hardware
+
+To monitor real (or NI MAX simulated) hardware instead of the simulator, run an
+edge node with `config/edge.yaml` (see `config/edge.example.yaml`):
+
+```bash
+# Requires NI drivers / NI MAX on this machine (niSysCfg.dll).
+./target/release/nimon-edge.exe config/edge.yaml
+```
+
+The edge auto-discovers devices via NI-SysCfg and streams health data to the
+hub at the address set in `node.hub_address`.
+
 ## Crates
 
 | Crate | Purpose |
@@ -71,6 +84,7 @@ Binaries are produced in `target/release/`:
 | Binary | Description |
 |--------|-------------|
 | `nimon-hub.exe` | Central server |
+| `nimon-edge.exe` | Edge node (NI-SysCfg device discovery + polling) |
 | `nimon-cli.exe` | Admin CLI |
 | `nimon-sim.exe` | Edge simulator |
 
