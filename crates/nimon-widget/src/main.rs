@@ -10,6 +10,11 @@
 //!
 //! Usage: nimon-widget [--hub <url>] [--port <n>] [--no-hub] [--no-edge]
 
+// Tray/widget app: no console window in release builds. Closing the
+// auto-spawned console would otherwise kill the whole process.
+// Debug builds keep the console so logs stay visible during development.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
