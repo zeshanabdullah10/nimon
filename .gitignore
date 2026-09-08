@@ -5,4 +5,5 @@
 *.log
 /data
 /dist
+widget-state.json
 .env

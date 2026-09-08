@@ -3,391 +3,408 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="dark">
 <title>NIMon Widget</title>
 <style>
-/* ── Material tokens (same family as the dashboard) ── */
+/* ═══ tokens ═════════════════════════════════════════════════════════ */
 :root {
-    --primary: #00696d;
-    --primary-container: #9cf1f2;
-    --on-primary-container: #002021;
-    --tertiary: #4b607c;
-    --tertiary-container: #d3e4ff;
-    --on-tertiary-container: #043051;
-    --error: #ba1a1a;
-    --error-container: #ffdad6;
-    --on-error-container: #93000a;
-    --success: #146c2e;
-    --success-container: #c4eed0;
-    --on-success-container: #0f5223;
-    --warning: #8f5000;
-    --warning-container: #ffdf9e;
-    --on-warning-container: #4a3900;
-    --surface: #f4fbfa;
-    --on-surface: #161d1d;
-    --on-surface-variant: #3f4948;
-    --outline: #6f7979;
-    --outline-variant: #bec8c8;
-    --sc-lowest: #ffffff;
-    --sc: #e8eeed;
-    --sc-high: #e2e8e7;
-    --sc-highest: #dce2e1;
-    --font: 'Segoe UI', 'Segoe UI Variable', system-ui, sans-serif;
-    --mono: 'Cascadia Mono', Consolas, 'Roboto Mono', monospace;
+    --bg-panel: #101010;
+    --bg-card: rgba(255, 255, 255, 0.045);
+    --text-1: #ffffff;
+    --text-2: rgba(255, 255, 255, 0.55);
+    --text-3: rgba(255, 255, 255, 0.33);
+    --divider: rgba(255, 255, 255, 0.08);
+    --panel-border: rgba(255, 255, 255, 0.09);
+
+    --ok: #30d158;
+    --warn: #ffd60a;
+    --crit: #ff453a;
+    --idle: rgba(255, 255, 255, 0.45);
+
+    --fill-ok: linear-gradient(90deg, rgba(48, 209, 88, 0.30) 0%, rgba(48, 209, 88, 0.06) 100%);
+    --fill-warn: linear-gradient(90deg, rgba(255, 214, 10, 0.30) 0%, rgba(255, 214, 10, 0.06) 100%);
+    --fill-crit: linear-gradient(90deg, rgba(255, 69, 58, 0.32) 0%, rgba(255, 69, 58, 0.07) 100%);
+
+    --font: 'Segoe UI Variable Display', 'Segoe UI Variable Text', 'Inter',
+            'Segoe UI', system-ui, sans-serif;
+    --shadow: 0 18px 50px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.4);
 }
+
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { height: 100%; overflow: hidden; }
+html, body {
+    height: 100%;
+    overflow: hidden;
+    background: transparent;
+}
 body {
     font-family: var(--font);
     font-size: 13px;
-    color: var(--on-surface);
-    background: var(--sc-lowest);
+    color: var(--text-1);
     display: flex;
+    flex-direction: row;
+    font-variant-numeric: tabular-nums;
     user-select: none;
+    cursor: default;
 }
 
-/* ═══ RAIL (always visible, 64px) ════════════════════════════════════ */
-#rail {
-    width: 64px;
-    height: 100%;
-    background: var(--surface);
-    border-left: 1px solid var(--outline-variant);
-    display: flex;
-    flex-direction: column;
+#panelArea { flex: 1; position: relative; min-width: 0; }
+#strip {
+    width: 60px;
     flex-shrink: 0;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 6px;
 }
-#railHead {
-    padding: 10px 0 8px;
+
+/* ═══ notch bar (the visible strip) ══════════════════════════════════ */
+
+#bar {
+    width: 48px;
+    background: var(--bg-panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 16px;
+    box-shadow: var(--shadow);
+    padding: 8px 0 6px;
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 6px;
-    border-bottom: 1px solid var(--sc-highest);
-    cursor: default;
+    gap: 7px;
+    cursor: grab;
+    touch-action: none;
 }
-.monogram {
-    width: 30px; height: 30px;
-    border-radius: 9px;
-    background: var(--primary);
-    color: #fff;
-    font-weight: 700;
-    font-size: 15px;
+#bar.dragging { cursor: grabbing; }
+#bar.locked { cursor: default; }
+#bar.locked.dragging { cursor: default; }
+
+#tiles {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+}
+
+.bar-sep {
+    width: 22px;
+    height: 1px;
+    background: var(--divider);
+    margin: 1px 0;
+}
+
+.lockbtn {
+    width: 26px;
+    height: 22px;
     display: grid;
     place-items: center;
+    color: var(--text-3);
+    border-radius: 7px;
+    cursor: pointer;
 }
-#hubDot {
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    background: var(--outline);
-}
-#hubDot.up { background: var(--success); }
-#hubDot.down { background: var(--error); animation: blink 1.2s infinite; }
-@keyframes blink { 50% { opacity: .3; } }
+.lockbtn:hover { color: var(--text-1); background: rgba(255, 255, 255, 0.06); }
+#bar.locked .lockbtn { color: var(--warn); }
 
-#railDevices {
-    flex: 1;
-    overflow-y: auto;
-    overflow-x: hidden;
-    scrollbar-width: none;
-}
-#railDevices::-webkit-scrollbar { display: none; }
+/* ═══ chassis tiles ══════════════════════════════════════════════════ */
 
-.rdev {
-    position: relative;
-    height: 58px;
+.tile {
     display: flex;
     flex-direction: column;
     align-items: center;
-    justify-content: center;
-    gap: 1px;
+    gap: 2px;
     cursor: default;
-    border-bottom: 1px solid var(--sc-highest);
-    background: transparent;
-    transition: background .12s;
 }
-.rdev:hover, .rdev.sel { background: var(--sc); }
-.rdev .led {
+.tile .box { position: relative; width: 40px; height: 40px; }
+.tile svg.ring { position: absolute; inset: 0; }
+.tile .glyph {
     position: absolute;
-    top: 8px; left: 8px;
-    width: 6px; height: 6px;
-    border-radius: 50%;
-    background: var(--success);
+    inset: 0;
+    display: grid;
+    place-items: center;
+    color: var(--text-1);
 }
-.rdev.s-warning .led { background: var(--warning); }
-.rdev.s-error .led { background: var(--error); animation: blink 1.2s infinite; }
-.rdev.s-offline .led { background: var(--outline); }
-.rname {
+.tile .glyph.txt {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+}
+.tile .pct {
     font-size: 10px;
     font-weight: 600;
-    color: var(--on-surface-variant);
-    max-width: 52px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-.rtemp {
-    font-family: var(--mono);
-    font-size: 14.5px;
-    font-weight: 500;
-    color: var(--primary);
+    color: var(--text-2);
+    line-height: 1;
     font-variant-numeric: tabular-nums;
 }
-.rtemp.w { color: var(--warning); }
-.rtemp.e { color: var(--error); }
-.rtemp.na { color: var(--outline); font-size: 12px; }
-.rgauge {
+.tile.hub .glyph { color: var(--warn); }
+.ring-prog { transition: stroke-dashoffset .5s ease-out; }
+
+/* ═══ main panel ═════════════════════════════════════════════════════ */
+
+#panel {
     position: absolute;
-    right: 0; top: 7px; bottom: 7px;
-    width: 3px;
-    background: var(--sc-highest);
-    border-radius: 2px;
+    right: 10px;
+    top: 24px;
+    width: 380px;
+    max-height: calc(100% - 16px);
     overflow: hidden;
-}
-.rgauge i {
-    position: absolute;
-    bottom: 0; left: 0; right: 0;
-    background: var(--primary);
-}
-.rgauge i.w { background: var(--warning); }
-.rgauge i.e { background: var(--error); }
-
-#railFoot {
-    padding: 9px 0;
-    text-align: center;
-    font-family: var(--mono);
-    font-size: 8.5px;
-    letter-spacing: .8px;
-    color: var(--outline);
-    border-top: 1px solid var(--sc-highest);
-}
-
-/* ═══ DETAIL PANE (revealed when expanded) ═══════════════════════════ */
-#pane {
-    width: 336px;
-    height: 100%;
-    background: var(--sc-lowest);
-    border-left: 1px solid var(--outline-variant);
-    overflow-y: auto;
-    overflow-x: hidden;
-    flex-shrink: 0;
+    background: var(--bg-panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 20px;
+    padding: 14px;
+    box-shadow: var(--shadow);
     opacity: 0;
-    transform: translateX(8px);
-    transition: opacity .18s ease, transform .18s ease;
-    scrollbar-width: thin;
-    scrollbar-color: var(--outline-variant) transparent;
-}
-#pane::-webkit-scrollbar { width: 8px; }
-#pane::-webkit-scrollbar-thumb { background: var(--outline-variant); border-radius: 6px; }
-body.expanded #pane { opacity: 1; transform: none; }
-
-.p-inner { padding: 18px 20px 24px; }
-
-.p-head {
+    transform: translateX(6px);
+    transition: opacity .16s ease, transform .16s ease;
+    pointer-events: none;
     display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 14px;
+    flex-direction: column;
 }
-.p-title { font-size: 17px; font-weight: 600; flex: 1; min-width: 0; }
-.p-title small {
-    font-family: var(--mono);
-    font-size: 10.5px;
-    font-weight: 400;
-    color: var(--on-surface-variant);
-    display: block;
-    margin-top: 1px;
+body.expanded #panel { opacity: 1; transform: none; pointer-events: auto; }
+
+#panel > * { flex: none; }
+#panel .cards { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
+#panel .cards::-webkit-scrollbar { width: 5px; }
+#panel .cards::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.14);
+    border-radius: 3px;
 }
 
-.chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    height: 24px;
-    padding: 0 10px;
-    border-radius: 999px;
-    font-size: 11px;
-    font-weight: 600;
-    background: var(--success-container);
-    color: var(--on-success-container);
-    flex-shrink: 0;
-}
-.chip.warn { background: var(--warning-container); color: var(--on-warning-container); }
-.chip.err { background: var(--error-container); color: var(--on-error-container); }
-.chip.off { background: var(--sc-high); color: var(--on-surface-variant); }
-.chip.info { background: var(--tertiary-container); color: var(--on-tertiary-container); }
-
-.minigrid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-    margin-bottom: 16px;
-}
-.mini {
-    background: var(--surface);
-    border: 1px solid var(--sc-highest);
-    border-radius: 12px;
-    padding: 10px 14px;
-}
-.mini .k { font-size: 11px; color: var(--on-surface-variant); }
-.mini .v {
-    font-family: var(--mono);
-    font-size: 21px;
-    font-weight: 500;
-    font-variant-numeric: tabular-nums;
-}
-.mini .v.warn { color: var(--warning); }
-.mini .v.err { color: var(--error); }
-.mini .v.ok { color: var(--success); }
-
-.sect {
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: .8px;
-    text-transform: uppercase;
-    color: var(--on-surface-variant);
-    margin: 14px 0 8px;
-}
-
-.row {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    padding: 6px 0;
-    border-bottom: 1px solid var(--sc);
-    font-size: 12.5px;
-}
-.row:last-child { border-bottom: none; }
-.row .dot {
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    background: var(--warning);
-    flex-shrink: 0;
-    align-self: center;
-}
-.row .dot.crit { background: var(--error); }
-.row .dot.info { background: var(--tertiary); }
-.row .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row .m { font-family: var(--mono); font-size: 10.5px; color: var(--on-surface-variant); flex-shrink: 0; }
-
-/* device detail */
-.bigtemp {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-    margin: 2px 0 10px;
-}
-.bigtemp .num {
-    font-family: var(--mono);
-    font-size: 34px;
-    font-weight: 500;
-    font-variant-numeric: tabular-nums;
-}
-.bigtemp .num.w { color: var(--warning); }
-.bigtemp .num.e { color: var(--error); }
-.bigtemp .unit { font-size: 14px; color: var(--on-surface-variant); }
-
-.bar {
-    position: relative;
-    height: 8px;
-    border-radius: 999px;
-    background: var(--sc-highest);
-    overflow: hidden;
-    margin-bottom: 14px;
-}
-.bar i {
-    position: absolute;
-    inset: 0 auto 0 0;
-    border-radius: 999px;
-    background: var(--primary);
-    transition: width .5s ease;
-}
-.bar i.w { background: var(--warning); }
-.bar i.e { background: var(--error); }
-.bar::after {
+#panel::after {
     content: '';
     position: absolute;
-    right: 2px; top: 50%;
-    width: 4px; height: 4px;
-    border-radius: 50%;
-    background: var(--primary);
-    transform: translateY(-50%);
+    right: -5.5px;
+    top: var(--notch-y, 60px);
+    width: 10px;
+    height: 10px;
+    background: var(--bg-panel);
+    border-top: 1px solid var(--panel-border);
+    border-right: 1px solid var(--panel-border);
+    transform: rotate(45deg);
 }
-.bar.w::after { background: var(--warning); }
-.bar.e::after { background: var(--error); }
 
-.kv { width: 100%; border-collapse: collapse; }
-.kv td { padding: 5px 0; font-size: 12.5px; border-bottom: 1px solid var(--sc); }
-.kv td:first-child { color: var(--on-surface-variant); width: 55%; }
-.kv td:last-child { font-family: var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+.titlebar {
+    height: 34px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+}
+.titlebar .t {
+    font-size: 22px;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: -0.2px;
+}
 
-.spark { margin-top: 4px; }
-.spark svg { display: block; width: 100%; height: 44px; }
-.spark .cap { font-size: 10.5px; color: var(--outline); margin-top: 2px; }
+.divider { height: 1px; background: var(--divider); margin: 10px 0; }
 
-.btn {
-    display: inline-flex;
+.sechead {
+    min-height: 18px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+.sechead .sl {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-2);
+    line-height: 1.4;
+    padding-top: 1px;
+    white-space: nowrap;
+}
+.sechead .stack { text-align: right; }
+.sechead .stack .a,
+.sechead .stack .b {
+    display: block;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.4;
+}
+.sechead .stack .a { color: var(--text-2); }
+.sechead .stack .b { color: var(--text-1); }
+
+/* ═══ cards ══════════════════════════════════════════════════════════ */
+
+.card {
+    position: relative;
+    height: 56px;
+    border-radius: 12px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 9px 12px;
+    margin-bottom: 6px;
+    background: var(--bg-card);
+}
+.card:hover { background: rgba(255, 255, 255, 0.07); }
+.card:last-of-type { margin-bottom: 0; }
+
+.card .fill {
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 0%;
+    transition: width .4s ease-out;
+}
+.card .fill.f-ok   { background: var(--fill-ok); }
+.card .fill.f-warn { background: var(--fill-warn); }
+.card .fill.f-crit { background: var(--fill-crit); }
+
+.card .content {
+    position: relative;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+}
+.card .left { min-width: 0; }
+.card .l1 {
+    font-size: 13px; font-weight: 500; color: var(--text-1);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    line-height: 1.35;
+}
+.card .l2 {
+    font-size: 11px; font-weight: 400; color: var(--text-3);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    line-height: 1.35;
+}
+.card .right { width: 76px; flex-shrink: 0; text-align: right; }
+.card .metric {
+    display: block;
+    font-size: 16px; font-weight: 600; line-height: 1.25;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+.card .metric .unit { font-size: 11px; font-weight: 500; opacity: 0.6; }
+.card .sub {
+    display: block;
+    font-size: 11px; font-weight: 400; color: var(--text-2);
+    line-height: 1.35; font-variant-numeric: tabular-nums;
+    white-space: nowrap; margin-top: 1px;
+}
+
+.c-ok   { color: var(--ok); }
+.c-warn { color: var(--warn); }
+.c-crit { color: var(--crit); }
+.c-idle { color: var(--idle); }
+.card.dead .l1, .card.dead .l2 { color: var(--text-3); }
+
+.more {
+    min-height: 22px;
+    display: flex;
     align-items: center;
     justify-content: center;
-    gap: 6px;
-    height: 36px;
-    padding: 0 18px;
-    border: none;
-    border-radius: 999px;
-    background: var(--primary);
-    color: #fff;
-    font-family: var(--font);
-    font-size: 13px;
-    font-weight: 600;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-3);
     cursor: pointer;
-    margin-top: 14px;
+    padding: 2px 0;
 }
-.btn:hover { filter: brightness(1.1); }
+.more:hover { color: var(--text-1); }
 
-.back {
-    display: inline-flex;
+.empty-note {
+    min-height: 22px;
+    display: flex;
     align-items: center;
-    gap: 4px;
-    font-size: 12px;
-    color: var(--primary);
-    cursor: pointer;
-    margin-bottom: 8px;
-    font-weight: 600;
+    justify-content: center;
+    font-size: 11px;
+    color: var(--text-3);
+    padding: 6px 0;
 }
-.back:hover { text-decoration: underline; }
 
-.null {
-    padding: 30px 10px;
+/* ═══ hero ═══════════════════════════════════════════════════════════ */
+
+.section-label {
+    height: 18px;
+    font-size: 11px; font-weight: 500; color: var(--text-2);
+    margin-bottom: 6px;
+}
+.hero {
+    min-height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+.hero .left { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.hero .num {
+    font-size: 34px; font-weight: 700; line-height: 1;
+    letter-spacing: -0.5px; white-space: nowrap;
+}
+.hero .word { font-size: 14px; font-weight: 500; color: var(--text-3); }
+.hero .stats {
+    text-align: right;
+    font-size: 12px; font-weight: 500; color: var(--text-2);
+    line-height: 1.5; flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+}
+
+/* ═══ footer meters ══════════════════════════════════════════════════ */
+
+.meters { display: grid; grid-template-columns: 1fr 1fr 1fr; min-height: 58px; }
+.meter { text-align: center; min-width: 0; }
+.meter .n {
+    font-size: 22px; font-weight: 700; line-height: 1.15;
+    font-variant-numeric: tabular-nums;
+}
+.meter .l { font-size: 11px; font-weight: 500; color: var(--text-2); line-height: 1.3; }
+.meter .s {
+    font-size: 10px; font-weight: 400; color: var(--text-3); line-height: 1.3;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.offline {
+    padding: 40px 10px;
     text-align: center;
-    color: var(--on-surface-variant);
+    color: var(--text-3);
     font-size: 12.5px;
+    line-height: 1.6;
 }
 </style>
 </head>
 <body>
 
-<div id="rail">
-    <div id="railHead" data-hover="overview">
-        <div class="monogram">N</div>
-        <div id="hubDot"></div>
-    </div>
-    <div id="railDevices"></div>
-    <div id="railFoot" data-hover="overview">NIMON</div>
+<div id="panelArea">
+    <div id="panel"></div>
 </div>
 
-<div id="pane"><div class="p-inner" id="paneInner"></div></div>
+<div id="strip">
+    <div id="bar">
+        <div id="tiles"></div>
+        <div class="bar-sep"></div>
+        <div class="lockbtn" id="lockBtn" title="Lock position"></div>
+    </div>
+</div>
 
 <script>
 'use strict';
 const invoke = window.__TAURI__.core.invoke;
+const listen = window.__TAURI__.event.listen;
 const POLL_MS = 5000;
-const HIST_MAX = 40;
+const T_MAX = 85;
+const STALE_MS = 45000;
+const MAX_CARDS = 6;
+
+/* PXI chassis mark — used for brand + hub tile (never a foreign glyph) */
+const CHASSIS = (size) => `<svg width="${size}" height="${size}" viewBox="0 0 24 24"
+    fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+    <rect x="3" y="5" width="18" height="14" rx="2.6"/>
+    <path d="M7.6 9.2v5.6M12 9.2v5.6M16.4 9.2v5.6"/></svg>`;
+const PADLOCK = (locked) => locked
+    ? `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>`
+    : `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 7.7-1.5"/></svg>`;
 
 const S = {
-    up: false,
+    up: false, locked: false, dragging: false,
     edges: [], devices: [], alerts: [], predictions: [],
-    history: {},           // device_id -> [{t, temp}]
-    selected: null,        // null = overview
+    selected: null,
+    showAll: false,
     expanded: false,
+    winH: 336,          // last requested window height (logical px)
+    tileY: 0,
+    lastGeo: '',        // dedupe geometry IPC
 };
 
 /* ── helpers ── */
@@ -410,253 +427,374 @@ function relTime(ts) {
     const h = Math.floor(m / 60); if (h < 24) return h + 'h ago';
     return Math.floor(h / 24) + 'd ago';
 }
+function isStale(ts) {
+    const t = parseTs(ts);
+    return t === null ? true : Date.now() - t > STALE_MS;
+}
 function deviceTitle(id) {
     const i = id.indexOf(':');
     let short = i === -1 ? id : id.slice(i + 1);
     const h = short.lastIndexOf('#');
-    let name = h === -1 ? short : short.slice(0, h);
-    const tag = h === -1 ? '' : short.slice(h + 1);
-    return { name: name.trim(), tag };
+    return {
+        name: (h === -1 ? short : short.slice(0, h)).trim(),
+        tag: h === -1 ? '' : short.slice(h + 1),
+    };
 }
-function railName(name) {
-    return name.replace(/^NI\s+/i, '')
-        .split(/[\s\-_]+/)
-        .filter(Boolean).pop() || name;
+function sevClass(pct) {
+    if (pct === null || pct === undefined) return 'idle';
+    if (pct >= 85) return 'crit';
+    if (pct >= 60) return 'warn';
+    return 'ok';
 }
-function tempState(t) {
-    if (t === null || t === undefined) return 'na';
-    if (t >= 75) return 'e';
-    if (t >= 65) return 'w';
-    return '';
-}
-function tempColor(t) {
-    const s = tempState(t);
-    return s === 'e' ? 'var(--error)' : s === 'w' ? 'var(--warning)' : 'var(--primary)';
+const tempPct = (t) => (t === null || t === undefined)
+    ? null : Math.max(0, Math.min(100, (t / T_MAX) * 100));
+const initials = (name) =>
+    (name.split(/\s+/).map((w) => w[0]).join('') || '?').slice(0, 2).toUpperCase();
+
+/* ── geometry (window resize via Rust) ── */
+
+/* measure the panel at its natural height, ignoring the window clamp */
+function naturalPanelHeight() {
+    const panel = document.getElementById('panel');
+    const prev = panel.style.maxHeight;
+    panel.style.maxHeight = 'none';
+    const h = panel.offsetHeight;
+    panel.style.maxHeight = prev;
+    return h;
 }
 
-/* ── expand / collapse ── */
+async function sendGeo(mode, h) {
+    const key = mode + ':' + Math.round(h);
+    if (key === S.lastGeo) {
+        positionPanel();
+        return;
+    }
+    S.lastGeo = key;
+    try {
+        const finalH = await invoke('update_geometry', { mode, height: h });
+        S.winH = finalH;
+        if (mode === 'panel') {
+            document.getElementById('panel').style.maxHeight =
+                (finalH - 16) + 'px';
+        }
+        positionPanel();
+    } catch {}
+}
+
 async function setExpanded(on) {
     if (S.expanded === on) return;
     S.expanded = on;
     document.body.classList.toggle('expanded', on);
-    try { await invoke('set_expanded', { expanded: on }); } catch {}
+    if (on) {
+        renderPanel();
+        const bar = document.getElementById('bar');
+        const h = Math.max(
+            naturalPanelHeight() + 16,
+            bar.getBoundingClientRect().height + 16);
+        await sendGeo('panel', h);
+    } else {
+        const bar = document.getElementById('bar');
+        await sendGeo('strip', bar.getBoundingClientRect().height + 16);
+    }
 }
 
-/* ── rail ── */
-function renderRail() {
-    const hubDot = document.getElementById('hubDot');
-    hubDot.className = S.up ? 'up' : 'down';
+/* ── strip / notch bar ── */
+function tileSVG(pct, colorClass) {
+    const stroke = pct === null ? 'var(--idle)'
+        : colorClass === 'crit' ? 'var(--crit)'
+        : colorClass === 'warn' ? 'var(--warn)' : 'var(--ok)';
+    const offset = pct === null ? 40 : Math.max(0, 100 - pct);
+    return `<svg class="ring" viewBox="0 0 40 40">
+        <rect x="3" y="3" width="34" height="34" rx="11" fill="rgba(16,16,16,0.85)"
+              stroke="rgba(255,255,255,0.08)" stroke-width="2.25"/>
+        <rect class="ring-prog" x="3" y="3" width="34" height="34" rx="11" fill="none"
+              stroke="${stroke}" stroke-width="2.25" stroke-linecap="round"
+              pathLength="100" stroke-dasharray="100" stroke-dashoffset="${offset}"
+              transform="rotate(-90 20 20)"/>
+    </svg>`;
+}
 
-    const el = document.getElementById('railDevices');
-    if (!S.up) {
-        el.innerHTML = '<div class="null" style="padding:20px 6px;font-size:10px;">HUB OFFLINE</div>';
-        return;
-    }
-    el.innerHTML = S.devices.map((d) => {
-        const st = (d.status || 'offline').toLowerCase();
-        const temp = typeof d.metrics?.temperature === 'number' ? d.metrics.temperature : null;
-        const { name } = deviceTitle(d.device_id);
-        const ts = tempState(temp);
-        const pct = temp === null ? 0 : Math.max(0, Math.min(100, temp));
-        return `<div class="rdev s-${st} ${S.selected === d.device_id ? 'sel' : ''}"
-                     data-id="${esc(d.device_id)}">
-            <span class="led"></span>
-            <span class="rname">${esc(railName(name))}</span>
-            <span class="rtemp ${ts}">${temp !== null ? temp.toFixed(1) + '°' : '—'}</span>
-            <span class="rgauge"><i class="${ts}" style="height:${pct}%"></i></span>
+function renderStrip() {
+    const el = document.getElementById('tiles');
+    const bar = document.getElementById('bar');
+    bar.classList.toggle('locked', S.locked);
+    document.getElementById('lockBtn').innerHTML = PADLOCK(S.locked);
+
+    const hub = `<div class="tile hub" data-edge="__hub">
+        <div class="box">${tileSVG(100, S.up ? 'ok' : 'crit')}
+            <span class="glyph">${CHASSIS(15)}</span></div>
+    </div>`;
+
+    const tiles = S.edges.map((e) => {
+        const devs = S.devices.filter((d) => d.device_id.startsWith(e.edge_id + ':'));
+        const temps = devs.map((d) => d.metrics?.temperature)
+            .filter((t) => typeof t === 'number');
+        const hot = temps.length ? Math.max(...temps) : null;
+        const pct = tempPct(hot);
+        const cls = sevClass(pct);
+        const color = cls === 'crit' ? 'var(--crit)' : cls === 'warn' ? 'var(--warn)' : 'var(--ok)';
+        return `<div class="tile" data-edge="${esc(e.edge_id)}" title="${esc(e.name)} — ${devs.length} devices">
+            <div class="box">${tileSVG(pct, cls)}
+                <span class="glyph txt">${esc(initials(e.name))}</span></div>
+            <span class="pct" style="${pct === null ? '' : `color:${color}`}">
+                ${pct === null ? '—' : Math.round(pct) + '%'}</span>
         </div>`;
     }).join('');
 
-    el.querySelectorAll('.rdev').forEach((node) => {
+    el.innerHTML = hub + tiles;
+
+    el.querySelectorAll('.tile').forEach((node) => {
         node.addEventListener('pointerenter', () => {
-            select(node.dataset.id, false);
+            if (S.dragging) return;
+            const id = node.dataset.edge;
+            const rect = node.getBoundingClientRect();
+            S.tileY = rect.top + rect.height / 2;
+            select(id === '__hub' ? null : id);
         });
     });
+
+    if (!S.expanded) {
+        sendGeo('strip', bar.getBoundingClientRect().height + 16);
+    }
 }
 
-function select(id, keepCollapsed) {
+function select(id) {
+    if (S.selected !== id) S.showAll = false;
     S.selected = id;
-    renderRail();
-    renderPane();
-    if (!keepCollapsed) setExpanded(true);
+    renderPanel();
+    setExpanded(true);
 }
 
-/* ── pane ── */
-function renderPane() {
-    const el = document.getElementById('paneInner');
-    el.innerHTML = S.selected ? devicePane(S.selected) : overviewPane();
-    const back = el.querySelector('.back');
-    if (back) back.addEventListener('click', () => select(null, true));
-}
-
-function overviewPane() {
-    if (!S.up) {
-        return `<div class="p-head"><div class="p-title">NIMon</div></div>
-                <div class="null">Hub unreachable.<br>Retrying every 5 s…</div>`;
-    }
-    const devices = S.devices;
-    const online = devices.filter((d) =>
-        ['healthy', 'warning'].includes((d.status || '').toLowerCase())).length;
-    const crit = S.alerts.filter((a) => (a.severity || '').toLowerCase() === 'critical').length;
-    const preds = S.predictions.filter((p) => (p.probability ?? 0) >= 0.8);
-
-    const alertRows = S.alerts.slice(0, 6).map((a) => {
-        const sev = (a.severity || 'warning').toLowerCase();
-        return `<div class="row">
-            <span class="dot ${sev === 'critical' ? 'crit' : ''}"></span>
-            <span class="t">${esc(a.rule_name || 'Alert')}</span>
-            <span class="m">${relTime(a.created_at)}</span>
-        </div>`;
-    }).join('');
-
-    const predRows = preds.slice(0, 6).map((p) => {
-        const type = (p.prediction_type || '').replace(/([a-z])([A-Z])/g, '$1 $2');
-        return `<div class="row">
-            <span class="dot info"></span>
-            <span class="t">${esc(type)}</span>
-            <span class="m">${Math.round(p.probability * 100)}%</span>
-        </div>`;
-    }).join('');
-
-    return `
-        <div class="p-head">
-            <div class="p-title">NIMon<small>${S.edges.length} edge${S.edges.length === 1 ? '' : 's'} · ${devices.length} devices</small></div>
-        </div>
-        <div class="minigrid">
-            <div class="mini"><div class="k">Online</div>
-                <div class="v ${online === devices.length && devices.length ? 'ok' : online === 0 ? 'err' : 'warn'}">${online}/${devices.length}</div></div>
-            <div class="mini"><div class="k">Alerts</div>
-                <div class="v ${crit ? 'err' : S.alerts.length ? 'warn' : 'ok'}">${S.alerts.length}</div></div>
-        </div>
-        ${S.alerts.length ? `<div class="sect">Active alerts</div>${alertRows}` : ''}
-        ${preds.length ? `<div class="sect">Predictions</div>${predRows}` : ''}
-        ${!S.alerts.length && !preds.length ? '<div class="null">All channels nominal</div>' : ''}
-        <button class="btn" id="openDash">Open Dashboard</button>`;
-}
-
-function devicePane(id) {
-    const d = S.devices.find((x) => x.device_id === id);
-    if (!d) {
-        S.selected = null;
-        return overviewPane();
-    }
-    const st = (d.status || 'offline').toLowerCase();
+/* ── panel ── */
+function cardHTML(d) {
+    const reachable = d.metrics?.is_reachable !== false;
+    const temp = typeof d.metrics?.temperature === 'number'
+        ? d.metrics.temperature : null;
+    const pct = tempPct(temp);
+    const cls = sevClass(pct);
     const { name, tag } = deviceTitle(d.device_id);
-    const temp = typeof d.metrics?.temperature === 'number' ? d.metrics.temperature : null;
-    const ts = tempState(temp);
-    const pct = temp === null ? 0 : Math.max(0, Math.min(100, temp));
     const edgeId = d.device_id.slice(0, d.device_id.indexOf(':')) || '';
     const edge = S.edges.find((e) => e.edge_id === edgeId);
 
-    const chipCls = st === 'error' ? 'err' : st === 'warning' ? 'warn' : st === 'offline' ? 'off' : '';
-    const chipTxt = st.charAt(0).toUpperCase() + st.slice(1);
+    const l1 = `${name}${tag ? ' · #' + tag : ''}`;
+    const l2 = reachable
+        ? `${edge ? edge.name : edgeId} · link ok · ${relTime(d.last_seen)}`
+        : `${edge ? edge.name : edgeId} · no link`;
 
-    const metricRows = Object.entries(d.metrics || {})
-        .filter(([k]) => k !== 'temperature')
-        .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(typeof v === 'boolean' ? (v ? 'true' : 'false') : String(v))}</td></tr>`)
-        .join('');
+    const dead = !reachable || temp === null;
+    const metric = dead
+        ? `<span class="metric c-idle">—</span>`
+        : `<span class="metric c-${cls}">${temp.toFixed(1)}<span class="unit">°C</span></span>`;
+    const sub = dead
+        ? `<span class="sub">no data</span>`
+        : `<span class="sub">${Math.round(T_MAX - temp)}° headroom</span>`;
 
-    const hist = S.history[id] || [];
-    const spark = sparkline(hist);
-
-    const alerts = S.alerts.filter((a) => a.device_id === id).slice(0, 4).map((a) => {
-        const sev = (a.severity || 'warning').toLowerCase();
-        return `<div class="row"><span class="dot ${sev === 'critical' ? 'crit' : ''}"></span>
-            <span class="t">${esc(a.rule_name || 'Alert')}</span><span class="m">${relTime(a.created_at)}</span></div>`;
-    }).join('');
-
-    const preds = S.predictions.filter((p) => p.device_id === id && p.probability >= 0.8)
-        .slice(0, 4).map((p) => {
-            const type = (p.prediction_type || '').replace(/([a-z])([A-Z])/g, '$1 $2');
-            return `<div class="row"><span class="dot info"></span>
-                <span class="t">${esc(type)}</span><span class="m">${Math.round(p.probability * 100)}%${p.eta_minutes ? ' · ~' + p.eta_minutes + 'm' : ''}</span></div>`;
-        }).join('');
-
-    return `
-        <span class="back">‹ Overview</span>
-        <div class="p-head">
-            <div class="p-title">${esc(name)}${tag ? ' <span style="font-weight:400;color:var(--on-surface-variant)">#' + esc(tag) + '</span>' : ''}
-                <small>${esc(edge ? edge.name : edgeId)} · ${esc(d.device_id)}</small></div>
-            <span class="chip ${chipCls}">${chipTxt}</span>
+    return `<div class="card ${dead ? 'dead' : ''}">
+        <div class="fill f-${cls}" style="width:${dead ? 0 : pct}%"></div>
+        <div class="content">
+            <div class="left">
+                <div class="l1">${esc(l1)}</div>
+                <div class="l2">${esc(l2)}</div>
+            </div>
+            <div class="right">${metric}${sub}</div>
         </div>
-        <div class="bigtemp">
-            <span class="num ${ts}" style="color:${tempColor(temp)}">${temp !== null ? temp.toFixed(1) : '—'}</span>
-            <span class="unit">°C</span>
-        </div>
-        <div class="bar ${ts}"><i class="${ts}" style="width:${pct}%"></i></div>
-        <div class="sect">Metrics</div>
-        <table class="kv">
-            <tr><td>Temperature</td><td>${temp !== null ? temp.toFixed(1) + ' °C' : '—'}</td></tr>
-            ${metricRows}
-            <tr><td>Last seen</td><td>${relTime(d.last_seen)}</td></tr>
-        </table>
-        ${hist.length > 2 ? `<div class="sect">Trend</div><div class="spark">${spark}<div class="cap">last ${hist.length} polls</div></div>` : ''}
-        ${alerts ? `<div class="sect">Alerts</div>${alerts}` : ''}
-        ${preds ? `<div class="sect">Predictions</div>${preds}` : ''}`;
+    </div>`;
 }
 
-function sparkline(hist) {
-    const temps = hist.map((h) => h.temp).filter((t) => t !== null);
-    if (temps.length < 2) return '';
-    const w = 290, h = 44, pad = 4;
-    const min = Math.min(...temps), max = Math.max(...temps);
-    const span = Math.max(1, max - min);
-    const pts = temps.map((t, i) => {
-        const x = pad + (i / (temps.length - 1)) * (w - pad * 2);
-        const y = h - pad - ((t - min) / span) * (h - pad * 2);
-        return [x.toFixed(1), y.toFixed(1)];
+function renderPanel() {
+    const el = document.getElementById('panel');
+    if (!S.up) {
+        el.innerHTML = `<div class="titlebar">${CHASSIS(20)}<span class="t">PXI Monitor</span></div>
+            <div class="divider"></div>
+            <div class="offline">Hub unreachable.<br>Retrying every 5 s…</div>`;
+        positionPanel();
+        return;
+    }
+
+    const id = S.selected;
+    const edge = id ? S.edges.find((e) => e.edge_id === id) : null;
+    const devs = id
+        ? S.devices.filter((d) => d.device_id.startsWith(id + ':'))
+        : S.devices;
+    const alerts = S.alerts;
+    const preds = S.predictions.filter((p) => (p.probability ?? 0) >= 0.8);
+
+    const sorted = [...devs].sort((a, b) => {
+        const pa = tempPct(a.metrics?.temperature ?? null) ?? -1;
+        const pb = tempPct(b.metrics?.temperature ?? null) ?? -1;
+        if (pb !== pa) return pb - pa;
+        return a.device_id.localeCompare(b.device_id);
     });
-    const line = pts.map((p) => p.join(',')).join(' ');
-    const last = pts[pts.length - 1];
-    return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
-        <polyline points="${line}" fill="none" stroke="var(--primary)" stroke-width="2"
-            stroke-linecap="round" stroke-linejoin="round"/>
-        <circle cx="${last[0]}" cy="${last[1]}" r="3" fill="var(--primary)"/>
-    </svg>`;
+    const overflow = sorted.length - MAX_CARDS;
+    const shown = S.showAll ? sorted : sorted.slice(0, MAX_CARDS);
+
+    const cards = shown.map(cardHTML).join('') +
+        (overflow > 0
+            ? `<div class="more" role="button">${S.showAll ? 'show less' : `+${overflow} more`}</div>`
+            : '');
+
+    const active = devs.filter((d) =>
+        ['healthy', 'warning'].includes((d.status || '').toLowerCase())).length;
+    const head = `<div class="sechead">
+        <span class="sl">Modules</span>
+        <span class="stack">
+            <span class="a">${esc(edge ? edge.name : 'All edges')} · ${devs.length} device${devs.length === 1 ? '' : 's'}</span><br>
+            <span class="b">${active} active</span>
+        </span>
+    </div>`;
+
+    const temps = devs.map((d) => d.metrics?.temperature)
+        .filter((t) => typeof t === 'number');
+    const peak = temps.length ? Math.max(...temps) : null;
+    const crit = alerts.filter((a) => (a.severity || '').toLowerCase() === 'critical').length;
+    const hero = `<div class="section-label">Today</div>
+    <div class="hero">
+        <div class="left">
+            <span class="num">${peak !== null ? peak.toFixed(1) + '°' : '—'}</span>
+            <span class="word">peak</span>
+        </div>
+        <div class="stats">
+            ↓ ${alerts.length} alert${alerts.length === 1 ? '' : 's'}<br>
+            ↑ ${preds.length} pred${preds.length === 1 ? '' : 's'}<br>
+            ${S.devices.length} modules
+        </div>
+    </div>`;
+
+    const online = S.devices.filter((d) =>
+        ['healthy', 'warning'].includes((d.status || '').toLowerCase())).length;
+    const onlinePct = S.devices.length ? Math.round((online / S.devices.length) * 100) : null;
+    const fresh = S.devices.filter((d) => !isStale(d.last_seen)).length;
+    const freshPct = S.devices.length ? Math.round((fresh / S.devices.length) * 100) : null;
+    const meters = `<div class="divider"></div>
+    <div class="meters">
+        <div class="meter">
+            <div class="n c-${sevClass(onlinePct === null ? null : 100 - onlinePct)}">${onlinePct ?? '—'}%</div>
+            <div class="l">Online</div>
+            <div class="s">${online} of ${S.devices.length}</div>
+        </div>
+        <div class="meter">
+            <div class="n c-${sevClass(freshPct === null ? null : 100 - freshPct)}">${freshPct ?? '—'}%</div>
+            <div class="l">Fresh</div>
+            <div class="s">${fresh} reporting</div>
+        </div>
+        <div class="meter">
+            <div class="n c-${alerts.length === 0 ? 'ok' : crit > 0 ? 'crit' : 'warn'}">${alerts.length}</div>
+            <div class="l">Alerts</div>
+            <div class="s">${crit} critical</div>
+        </div>
+    </div>`;
+
+    el.innerHTML = `
+        <div class="titlebar">${CHASSIS(20)}<span class="t">PXI Monitor</span></div>
+        <div class="divider"></div>
+        ${head}
+        <div class="cards">${cards || '<div class="empty-note">no populated slots</div>'}</div>
+        <div class="divider"></div>
+        ${hero}
+        ${meters}`;
+
+    positionPanel();
+
+    /* keep the window matched to content while open */
+    if (S.expanded) {
+        const bar = document.getElementById('bar');
+        const h = Math.max(
+            naturalPanelHeight() + 16,
+            bar.getBoundingClientRect().height + 16);
+        sendGeo('panel', h); /* deduped via lastGeo */
+    }
+}
+
+/* center the panel on the bar / hovered tile; clamp to the window */
+function positionPanel() {
+    const panel = document.getElementById('panel');
+    const bar = document.getElementById('bar');
+    if (!panel || !bar) return;
+    const ph = panel.offsetHeight;
+    const barRect = bar.getBoundingClientRect();
+    const barCenter = barRect.top + barRect.height / 2;
+    const top = Math.max(8, Math.min(S.winH - ph - 8, barCenter - ph / 2));
+    panel.style.top = top + 'px';
+    panel.style.setProperty('--notch-y',
+        Math.max(14, Math.min(ph - 14, S.tileY - top - 5)) + 'px');
 }
 
 /* ── polling ── */
 async function poll() {
     let data;
-    try {
-        data = await invoke('poll');
-    } catch {
-        data = { up: false };
-    }
-    const wasUp = S.up;
+    try { data = await invoke('poll'); } catch { data = { up: false }; }
     S.up = !!data.up;
     if (S.up) {
         S.edges = data.edges || [];
         S.devices = data.devices || [];
         S.alerts = data.alerts || [];
         S.predictions = data.predictions || [];
-        const now = Date.now();
-        for (const d of S.devices) {
-            const t = typeof d.metrics?.temperature === 'number' ? d.metrics.temperature : null;
-            if (t !== null) {
-                const arr = S.history[d.device_id] || (S.history[d.device_id] = []);
-                arr.push({ t: now, temp: t });
-                if (arr.length > HIST_MAX) arr.shift();
-            }
-        }
     }
-    renderRail();
-    renderPane();
-    const btn = document.getElementById('openDash');
-    if (btn) btn.addEventListener('click', () => invoke('open_dashboard'));
-    if (wasUp !== S.up) renderPane();
+    renderStrip();
+    renderPanel();
 }
 
-/* ── wiring ── */
-document.getElementById('railHead').addEventListener('pointerenter', () => select(null));
-document.getElementById('railFoot').addEventListener('pointerenter', () => select(null));
-document.addEventListener('mouseleave', () => setExpanded(false));
-document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') setExpanded(false);
-});
+/* ── drag + lock wiring ── */
+function initDrag() {
+    const bar = document.getElementById('bar');
 
-poll();
-setInterval(poll, POLL_MS);
+    bar.addEventListener('pointerdown', (e) => {
+        if (S.locked) return;
+        if (e.target.closest('.tile') || e.target.closest('.lockbtn')) return;
+        S.dragging = true;
+        bar.classList.add('dragging');
+        bar.setPointerCapture(e.pointerId);
+    });
+    bar.addEventListener('pointermove', (e) => {
+        if (!S.dragging) return;
+        invoke('move_by', { dx: e.movementX, dy: e.movementY });
+    });
+    const end = (e) => {
+        if (!S.dragging) return;
+        S.dragging = false;
+        bar.classList.remove('dragging');
+        bar.releasePointerCapture(e.pointerId);
+        invoke('save_state');
+    };
+    bar.addEventListener('pointerup', end);
+    bar.addEventListener('pointercancel', end);
+
+    document.getElementById('lockBtn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        invoke('set_locked', { locked: !S.locked });
+    });
+
+    /* "+N more" / "show less" toggle */
+    document.getElementById('panel').addEventListener('click', (e) => {
+        if (e.target.closest('.more')) {
+            S.showAll = !S.showAll;
+            renderPanel();
+        }
+    });
+
+    document.addEventListener('mouseleave', () => {
+        if (!S.dragging) setExpanded(false);
+    });
+}
+
+/* ── boot ── */
+async function init() {
+    initDrag();
+    try {
+        const state = await invoke('get_state');
+        S.locked = !!state.locked;
+    } catch {}
+    listen('lock-changed', (e) => { S.locked = !!e.payload; renderStrip(); });
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') setExpanded(false);
+    });
+
+    await poll();
+    setInterval(poll, POLL_MS);
+}
+
+init();
 </script>
 </body>
 </html>

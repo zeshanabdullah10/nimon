@@ -3,16 +3,30 @@
 //! Single executable that runs:
 //! - the NIMon hub (in-process, own runtime thread)
 //! - the NIMon edge node (in-process, actix thread)
-//! - a slim always-on-top widget docked to the right edge of the screen
+//! - a slim draggable "notch" strip docked at the right of the screen;
+//!   hovering a chassis tile opens the detail panel beside it
 //!
-//! If the hub port is already occupied (hub running externally), the widget
-//! starts in attach mode: no hub/edge spawned, it just renders hub data.
+//! If a hub is already reachable, the widget attaches as a pure viewer.
 //!
 //! Usage: nimon-widget [--hub <url>] [--port <n>] [--no-hub] [--no-edge]
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
+
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl,
+    WebviewWindowBuilder,
+};
+
+/* window geometry (logical px; converted via monitor scale) */
+const STRIP_W: f64 = 60.0; // bar column incl. transparent margins
+const PANEL_W: f64 = 380.0;
+const PANEL_GAP: f64 = 10.0;
+const EXPANDED_W: f64 = STRIP_W + PANEL_GAP + PANEL_W; // 450
+const MARGIN: f64 = 8.0;
 
 fn probe_hub(base: &str) -> bool {
     ureq::get(&format!("{base}/health"))
@@ -22,18 +36,47 @@ fn probe_hub(base: &str) -> bool {
         .unwrap_or(false)
 }
 
-use tauri::{
-    AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder,
-};
-
-const RAIL_WIDTH: f64 = 64.0;
-const EXPANDED_WIDTH: f64 = 400.0;
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PersistedState {
+    locked: Option<bool>,
+    x: Option<i32>,
+    y: Option<i32>,
+}
 
 struct WidgetState {
     hub_base: String,
-    /// (x, y, height) of the right-docked window, physical pixels
-    dock: (i32, i32, u32),
     scale: f64,
+    /// physical work area (x, y, w, h)
+    work: (i32, i32, u32, u32),
+    /// collapsed window geometry, physical (x, y, w, h)
+    dock: Mutex<(i32, i32, u32, u32)>,
+    expanded: AtomicBool,
+    locked: AtomicBool,
+    lock_item: Mutex<Option<tauri::menu::CheckMenuItem<tauri::Wry>>>,
+    state_path: PathBuf,
+}
+
+impl WidgetState {
+    fn persist(&self) {
+        let dock = *self.dock.lock().unwrap();
+        let state = PersistedState {
+            locked: Some(self.locked.load(Ordering::Relaxed)),
+            x: Some(dock.0),
+            y: Some(dock.1),
+        };
+        if let Ok(text) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(&self.state_path, text);
+        }
+    }
+
+    fn set_locked(&self, app: &AppHandle, locked: bool) {
+        self.locked.store(locked, Ordering::Relaxed);
+        if let Some(item) = self.lock_item.lock().unwrap().as_ref() {
+            let _ = item.set_checked(locked);
+        }
+        let _ = app.emit("lock-changed", locked);
+        self.persist();
+    }
 }
 
 fn main() {
@@ -58,9 +101,7 @@ fn main() {
 
     let root = resolve_root();
 
-    /* ── 1. hub: probe for an already-running hub first ──
-     * A TCP bind probe is unreliable on Windows (a specific-address bind
-     * can succeed over an existing wildcard bind), so probe HTTP instead. */
+    /* ── 1. hub: probe for an already-running hub first ── */
     let external_hub = probe_hub(&hub_base);
     if external_hub {
         eprintln!("nimon-widget: hub already running at {hub_base} — attach mode");
@@ -111,7 +152,11 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             poll,
-            set_expanded,
+            update_geometry,
+            move_by,
+            set_locked,
+            get_state,
+            save_state,
             open_dashboard,
             quit
         ])
@@ -129,17 +174,38 @@ fn main() {
 
             let scale = monitor.scale_factor();
             let area = monitor.work_area();
-            let (wx, wy, ww, wh) = (
-                area.position.x as i64,
-                area.position.y as i64,
-                area.size.width as i64,
-                area.size.height as i64,
+            let work = (
+                area.position.x,
+                area.position.y,
+                area.size.width,
+                area.size.height,
             );
 
-            let rail_px = (RAIL_WIDTH * scale) as i64;
-            let height = wh as u32;
-            let x = wx + ww - rail_px; // right edge
-            let y = wy as i32;
+            /* restore position/lock, or default to the right edge, centered */
+            let state_path = root.join("widget-state.json");
+            let saved: PersistedState = std::fs::read(&state_path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+
+            let strip_w = (STRIP_W * scale) as u32;
+            let default_h = (320.0 * scale) as u32;
+            let default_x =
+                work.0 + work.2 as i32 - strip_w as i32 - (MARGIN * scale) as i32;
+            let default_y = work.1 + ((work.3 as i32 - default_h as i32) / 2).max(0);
+
+            let (x, y) = match (saved.x, saved.y) {
+                (Some(x), Some(y))
+                    if x >= work.0 - 40
+                        && x <= work.0 + work.2 as i32
+                        && y >= work.1
+                        && y <= work.1 + work.3 as i32 =>
+                {
+                    (x, y)
+                }
+                _ => (default_x, default_y),
+            };
+            let locked = saved.locked.unwrap_or(false);
 
             let window = WebviewWindowBuilder::new(
                 app,
@@ -148,31 +214,43 @@ fn main() {
             )
                 .title("NIMon Widget")
                 .decorations(false)
+                .transparent(true)
                 .always_on_top(true)
                 .skip_taskbar(true)
                 .resizable(false)
                 .shadow(false)
                 .focused(false)
-                .inner_size(RAIL_WIDTH, wh as f64)
-                .position(x as f64, y as f64)
+                .inner_size(STRIP_W, 320.0)
+                .position(x as f64 / scale, y as f64 / scale)
                 .build()?;
-
-            window.set_size(PhysicalSize::new(rail_px as u32, height))?;
-            window.set_position(PhysicalPosition::new(x as i32, y))?;
+            let _ = window.set_size(PhysicalSize::new(strip_w, default_h));
+            let _ = window.set_position(PhysicalPosition::new(x, y));
 
             app.manage(WidgetState {
                 hub_base,
-                dock: (x as i32, y, height),
                 scale,
+                work,
+                dock: Mutex::new((x, y, strip_w, default_h)),
+                expanded: AtomicBool::new(false),
+                locked: AtomicBool::new(locked),
+                lock_item: Mutex::new(None),
+                state_path,
             });
 
-            /* tray icon drawn in code — no asset files needed */
+            /* tray: PXI-branded icon drawn in code */
             let icon = tauri::image::Image::new_owned(tray_icon_rgba(), 32, 32);
             let open = tauri::menu::MenuItem::with_id(
                 app, "open", "Open Dashboard", true, None::<&str>)?;
+            let lock = tauri::menu::CheckMenuItem::with_id(
+                app, "lock", "Lock position", true, locked, None::<&str>)?;
             let quit = tauri::menu::MenuItem::with_id(
                 app, "quit", "Quit NIMon", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&open, &quit])?;
+            let menu = tauri::menu::Menu::with_items(app, &[&open, &lock, &quit])?;
+
+            if let Some(state) = app.try_state::<WidgetState>() {
+                *state.lock_item.lock().unwrap() = Some(lock);
+            }
+
             tauri::tray::TrayIconBuilder::with_id("nimon")
                 .icon(icon)
                 .tooltip("NIMon Widget")
@@ -180,6 +258,12 @@ fn main() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => open_dashboard_cmd(app),
                     "quit" => app.exit(0),
+                    "lock" => {
+                        if let Some(state) = app.try_state::<WidgetState>() {
+                            let locked = state.locked.load(Ordering::Relaxed);
+                            state.set_locked(app, !locked);
+                        }
+                    }
                     _ => {}
                 })
                 .build(app)?;
@@ -197,7 +281,7 @@ async fn poll(app: AppHandle) -> Result<Value, String> {
     let base = app
         .try_state::<WidgetState>()
         .map(|s| s.hub_base.clone())
-        .unwrap_or_else(|| "http://localhost:9090".to_string());
+        .unwrap_or_else(|| "http://127.0.0.1:9090".to_string());
     tauri::async_runtime::spawn_blocking(move || poll_blocking(&base))
         .await
         .map_err(|e| e.to_string())
@@ -217,7 +301,7 @@ fn poll_blocking(base: &str) -> Value {
         Err(e) => {
             static FAILURES: std::sync::atomic::AtomicU32 =
                 std::sync::atomic::AtomicU32::new(0);
-            let n = FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = FAILURES.fetch_add(1, Ordering::Relaxed);
             if n == 0 || n % 12 == 0 {
                 eprintln!("nimon-widget: poll failed ({base}): {e}");
             }
@@ -252,16 +336,101 @@ fn poll_blocking(base: &str) -> Value {
     })
 }
 
+/// Resize the window for the requested mode. `height` is logical px.
+/// Strip mode anchors to the dock's top-left; panel mode grows leftward
+/// from the dock and keeps the bar at its on-screen position.
+/// Returns the final window height in logical px (clamped to the work area).
 #[tauri::command]
-fn set_expanded(app: AppHandle, expanded: bool) {
+fn update_geometry(app: AppHandle, mode: String, height: f64) -> f64 {
+    let (Some(state), Some(window)) = (
+        app.try_state::<WidgetState>(),
+        app.get_webview_window("main"),
+    ) else {
+        return height;
+    };
+
+    let scale = state.scale;
+    let (wx, wy, ww, wh) = state.work;
+    let margin = (MARGIN * scale) as u32;
+    let h = ((height * scale) as u32)
+        .min(wh.saturating_sub(margin * 2))
+        .max(160);
+
+    if mode == "panel" {
+        state.expanded.store(true, Ordering::Relaxed);
+        let exp_w = (EXPANDED_W * scale) as u32;
+        let (dock_x, dock_y, dock_w, _) = *state.dock.lock().unwrap();
+        let x = dock_x + dock_w as i32 - exp_w as i32;
+        let max_y = wy + wh as i32 - h as i32 - margin as i32;
+        let y = dock_y.min(max_y).max(wy);
+        let _ = window.set_size(PhysicalSize::new(exp_w, h));
+        let _ = window.set_position(PhysicalPosition::new(x, y));
+    } else {
+        state.expanded.store(false, Ordering::Relaxed);
+        let strip_w = (STRIP_W * scale) as u32;
+        let (dock_x, dock_y, _, _) = *state.dock.lock().unwrap();
+        let _ = window.set_size(PhysicalSize::new(strip_w, h));
+        let _ = window.set_position(PhysicalPosition::new(dock_x, dock_y));
+        *state.dock.lock().unwrap() = (dock_x, dock_y, strip_w, h);
+    }
+
+    h as f64 / scale
+}
+
+/// Manual drag: move by logical deltas from the current window position.
+/// The dock is always kept in sync so collapsing never snaps the bar back:
+/// while expanded, the bar's on-screen position is derived from the window
+/// (bar column = window x + EXPANDED_W - STRIP_W, top = window y).
+#[tauri::command]
+fn move_by(app: AppHandle, dx: f64, dy: f64) {
     let Some(state) = app.try_state::<WidgetState>() else { return };
     let Some(window) = app.get_webview_window("main") else { return };
-    let (x, y, height) = state.dock;
-    let rail_px = (RAIL_WIDTH * state.scale) as i32;
-    let width = ((if expanded { EXPANDED_WIDTH } else { RAIL_WIDTH }
-    ) * state.scale) as i32;
-    let _ = window.set_size(PhysicalSize::new(width as u32, height));
-    let _ = window.set_position(PhysicalPosition::new(x + rail_px - width, y));
+    if state.locked.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let Ok(pos) = window.outer_position() else { return };
+    let Ok(size) = window.outer_size() else { return };
+    let (wx, wy, ww, wh) = state.work;
+
+    let nx = (pos.x + (dx * state.scale) as i32)
+        .clamp(wx, wx + ww as i32 - size.width as i32);
+    let ny = (pos.y + (dy * state.scale) as i32)
+        .clamp(wy, wy + wh as i32 - size.height as i32);
+    let _ = window.set_position(PhysicalPosition::new(nx, ny));
+
+    let mut dock = state.dock.lock().unwrap();
+    if state.expanded.load(Ordering::Relaxed) {
+        let exp_w = (EXPANDED_W * state.scale) as i32;
+        let strip_w = (STRIP_W * state.scale) as i32;
+        // bar lives in the right column of the expanded window
+        let (dw, dh) = (dock.2, dock.3);
+        *dock = (nx + exp_w - strip_w, ny, dw, dh);
+    } else {
+        *dock = (nx, ny, size.width, size.height);
+    }
+}
+
+#[tauri::command]
+fn set_locked(app: AppHandle, locked: bool) {
+    if let Some(state) = app.try_state::<WidgetState>() {
+        state.set_locked(&app, locked);
+    }
+}
+
+#[tauri::command]
+fn get_state(app: AppHandle) -> Value {
+    match app.try_state::<WidgetState>() {
+        Some(state) => json!({ "locked": state.locked.load(Ordering::Relaxed) }),
+        None => json!({ "locked": false }),
+    }
+}
+
+#[tauri::command]
+fn save_state(app: AppHandle) {
+    if let Some(state) = app.try_state::<WidgetState>() {
+        state.persist();
+    }
 }
 
 #[tauri::command]
@@ -278,7 +447,7 @@ fn open_dashboard_cmd(app: &AppHandle) {
     let base = app
         .try_state::<WidgetState>()
         .map(|s| s.hub_base.clone())
-        .unwrap_or_else(|| "http://localhost:9090".to_string());
+        .unwrap_or_else(|| "http://127.0.0.1:9090".to_string());
     let url = format!("{base}/");
     #[cfg(windows)]
     {
@@ -338,7 +507,7 @@ fn load_edge_config(root: &PathBuf, port: u16) -> nimon_edge::config::EdgeConfig
         node: NodeConfig {
             id: "edge-01".to_string(),
             name: "Local Edge 1".to_string(),
-            hub_address: format!("localhost:{port}"),
+            hub_address: format!("127.0.0.1:{port}"),
             reconnect_interval_secs: 5,
         },
         api: ApiConfig::default(),
@@ -360,7 +529,6 @@ fn tray_icon_rgba() -> Vec<u8> {
         for x in 0..S {
             let fx = x as f32;
             let fy = y as f32;
-            // rounded-rect mask
             let cx = fx.min(S as f32 - 1.0 - fx).min(radius);
             let cy = fy.min(S as f32 - 1.0 - fy).min(radius);
             let inside = cx == radius || cy == radius
