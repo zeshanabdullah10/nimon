@@ -9,7 +9,7 @@ node:
 api:
   syscfg:
     enabled: true
-    poll_interval_secs: 10
+    poll_interval_secs: 30
 
 prediction:
   enabled: true

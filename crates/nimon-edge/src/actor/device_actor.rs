@@ -22,6 +22,9 @@ pub struct DeviceActor {
     last_status: HealthStatus,
     /// Consecutive error count
     error_count: u32,
+    /// When true the device manager drives updates via HealthUpdate
+    /// (shared single-enumeration sweep) and this actor does not poll.
+    managed: bool,
 }
 
 impl DeviceActor {
@@ -32,6 +35,7 @@ impl DeviceActor {
             status_recipient: None,
             last_status: HealthStatus::Offline,
             error_count: 0,
+            managed: false,
         }
     }
 
@@ -39,6 +43,39 @@ impl DeviceActor {
     pub fn with_status_recipient(mut self, recipient: Recipient<DeviceStatusUpdate>) -> Self {
         self.status_recipient = Some(recipient);
         self
+    }
+
+    /// Mark this actor as externally driven (no self-polling)
+    pub fn with_managed_polling(mut self) -> Self {
+        self.managed = true;
+        self
+    }
+
+    /// Convert a health report into a poll result and emit it downstream
+    fn apply_health(&mut self, health: nimon_ni::syscfg::DeviceHealth) -> DevicePollResult {
+        let (status, metrics) = health.to_status_and_metrics();
+        self.last_status = status;
+        DevicePollResult {
+            success: true,
+            status,
+            metrics,
+            error: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// Forward a poll result to the status recipient
+    fn emit(&self, result: DevicePollResult) {
+        if let Some(recipient) = &self.status_recipient {
+            let update = DeviceStatusUpdate {
+                device_id: self.device.id.clone(),
+                edge_id: self.device.edge_id.clone(),
+                status: result.status,
+                metrics: result.metrics,
+                timestamp: result.timestamp,
+            };
+            let _ = recipient.do_send(update);
+        }
     }
 
     /// Poll device health via NI-SysCfg, falling back to simulated data
@@ -50,20 +87,13 @@ impl DeviceActor {
                     // Use device_name (product name) as the lookup key for NI-SysCfg
                     match session.get_device_health(&self.device.device_name) {
                         Ok(health) => {
-                            let (status, metrics) = health.to_status_and_metrics();
-                            self.last_status = status;
+                            let result = self.apply_health(health);
                             tracing::trace!(
                                 "Polled {} via NI-SysCfg: status={:?}",
                                 self.device.device_name,
-                                status
+                                result.status
                             );
-                            return DevicePollResult {
-                                success: true,
-                                status,
-                                metrics,
-                                error: None,
-                                timestamp: Utc::now(),
-                            };
+                            return result;
                         }
                         Err(e) => {
                             tracing::debug!(
@@ -121,22 +151,17 @@ impl DeviceActor {
 
     /// Start periodic polling
     fn start_polling(&self, ctx: &mut Context<Self>) {
+        if self.managed {
+            // The device manager sweeps NI-SysCfg once per interval and
+            // pushes HealthUpdate messages; nothing to do here.
+            return;
+        }
+
         let interval_duration = self.poll_interval;
 
         ctx.run_interval(interval_duration, |act, _ctx| {
             let result = act.poll_device();
-
-            // Send status update if recipient is set
-            if let Some(recipient) = &act.status_recipient {
-                let update = DeviceStatusUpdate {
-                    device_id: act.device.id.clone(),
-                    edge_id: act.device.edge_id.clone(),
-                    status: result.status,
-                    metrics: result.metrics.clone(),
-                    timestamp: result.timestamp,
-                };
-                let _ = recipient.do_send(update);
-            }
+            act.emit(result);
         });
     }
 }
@@ -159,6 +184,36 @@ impl Handler<DevicePoll> for DeviceActor {
 
     fn handle(&mut self, _msg: DevicePoll, _ctx: &mut Self::Context) -> Self::Result {
         MessageResult(self.poll_device())
+    }
+}
+
+/// Health report pushed by the device manager's shared sweep
+/// (one NI-SysCfg enumeration per cycle for all devices)
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct HealthUpdate {
+    pub health: nimon_ni::syscfg::DeviceHealth,
+}
+
+impl Handler<HealthUpdate> for DeviceActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: HealthUpdate, _ctx: &mut Self::Context) -> Self::Result {
+        let result = self.apply_health(msg.health);
+        self.emit(result);
+    }
+}
+
+/// Ask the actor to stop (used when hardware topology changes)
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct StopDevice;
+
+impl Handler<StopDevice> for DeviceActor {
+    type Result = ();
+
+    fn handle(&mut self, _msg: StopDevice, ctx: &mut Self::Context) -> Self::Result {
+        ctx.stop();
     }
 }
 
