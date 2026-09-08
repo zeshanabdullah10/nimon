@@ -383,6 +383,7 @@ body.expanded #panel { opacity: 1; transform: none; pointer-events: auto; }
 const invoke = window.__TAURI__.core.invoke;
 const listen = window.__TAURI__.event.listen;
 const POLL_MS = 5000;
+const POLL_MS_IDLE = 30000;
 const T_MAX = 85;
 const STALE_MS = 45000;
 const MAX_CARDS = 6;
@@ -485,7 +486,10 @@ async function setExpanded(on) {
     if (S.expanded === on) return;
     S.expanded = on;
     document.body.classList.toggle('expanded', on);
+    schedulePoll();
     if (on) {
+        lastPayload = '';
+        renderStrip();
         renderPanel();
         const bar = document.getElementById('bar');
         const h = Math.max(
@@ -719,7 +723,23 @@ function positionPanel() {
         Math.max(14, Math.min(ph - 14, S.tileY - top - 5)) + 'px');
 }
 
-/* ── polling ── */
+/* ── polling ── adaptive: 5s while the panel is open (fresh detail),
+   30s collapsed (the strip only needs coarse freshness). DOM renders
+   are skipped when the payload is unchanged. ── */
+
+let pollTimer = null;
+
+function schedulePoll() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(poll, S.expanded ? POLL_MS : POLL_MS_IDLE);
+}
+
+let lastPayload = '';
+function payloadKey(data) {
+    if (!data?.up) return 'down';
+    return JSON.stringify([data.edges, data.devices, data.alerts, data.predictions]);
+}
+
 async function poll() {
     let data;
     try { data = await invoke('poll'); } catch { data = { up: false }; }
@@ -730,8 +750,16 @@ async function poll() {
         S.alerts = data.alerts || [];
         S.predictions = data.predictions || [];
     }
-    renderStrip();
-    renderPanel();
+    if (S.expanded) {
+        renderStrip();
+        renderPanel();
+    } else {
+        const key = payloadKey(data);
+        if (key !== lastPayload) {
+            lastPayload = key;
+            renderStrip();
+        }
+    }
 }
 
 /* ── drag + lock wiring ── */
@@ -791,7 +819,7 @@ async function init() {
     });
 
     await poll();
-    setInterval(poll, POLL_MS);
+    schedulePoll();
 }
 
 init();

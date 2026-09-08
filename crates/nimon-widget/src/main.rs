@@ -13,7 +13,7 @@
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use tauri::{
@@ -29,11 +29,33 @@ const EXPANDED_W: f64 = STRIP_W + PANEL_GAP + PANEL_W; // 450
 const MARGIN: f64 = 8.0;
 
 fn probe_hub(base: &str) -> bool {
-    ureq::get(&format!("{base}/health"))
+    http_agent()
+        .get(&format!("{base}/health"))
         .timeout(Duration::from_millis(800))
         .call()
         .map(|r| r.status() == 200)
         .unwrap_or(false)
+}
+
+/// Shared keep-alive HTTP agent (avoids a fresh TCP connection per poll)
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .max_idle_connections(2)
+            .build()
+    })
+}
+
+/// Passive add-on: run below normal priority so test station software wins
+#[cfg(windows)]
+fn set_below_normal_priority() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS,
+    };
+    unsafe {
+        SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    }
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -80,6 +102,13 @@ impl WidgetState {
 }
 
 fn main() {
+    // Passive add-on: keep the process polite on shared test stations.
+    // Cap default tokio runtimes (edge actix system + tauri) to 2 workers;
+    // the hub gets a dedicated 1-worker runtime below.
+    std::env::set_var("TOKIO_WORKER_THREADS", "2");
+    #[cfg(windows)]
+    set_below_normal_priority();
+
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .with_target(false)
@@ -110,7 +139,12 @@ fn main() {
         std::thread::Builder::new()
             .name("nimon-hub".into())
             .spawn(move || {
-                let rt = tokio::runtime::Runtime::new().expect("hub runtime");
+                // 1 worker: the hub is nearly idle (a few timers + rare HTTP)
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("hub runtime");
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&rt, async move {
                     let config = load_hub_config(&root, port);
@@ -220,6 +254,12 @@ fn main() {
                 .resizable(false)
                 .shadow(false)
                 .focused(false)
+                // trim webview background services we never use
+                .additional_browser_args(
+                    "--disable-component-update --disable-sync \
+                     --disable-background-networking --disable-extensions \
+                     --metrics-recording-only",
+                )
                 .inner_size(STRIP_W, 320.0)
                 .position(x as f64 / scale, y as f64 / scale)
                 .build()?;
@@ -288,8 +328,10 @@ async fn poll(app: AppHandle) -> Result<Value, String> {
 }
 
 fn poll_blocking(base: &str) -> Value {
+    let agent = http_agent();
     let get = |path: &str| -> Result<Value, String> {
-        ureq::get(&format!("{base}{path}"))
+        agent
+            .get(&format!("{base}{path}"))
             .timeout(Duration::from_secs(2))
             .call()
             .map_err(|e| e.to_string())
@@ -501,7 +543,8 @@ fn load_edge_config(root: &PathBuf, port: u16) -> nimon_edge::config::EdgeConfig
         return config;
     }
     use nimon_edge::config::{
-        ApiConfig, BufferConfig, EdgeConfig, LoggingConfig, NodeConfig, PredictionConfig,
+        ApiConfig, ApiSettings, BufferConfig, EdgeConfig, LoggingConfig, NodeConfig,
+        PredictionConfig,
     };
     EdgeConfig {
         node: NodeConfig {
@@ -510,7 +553,17 @@ fn load_edge_config(root: &PathBuf, port: u16) -> nimon_edge::config::EdgeConfig
             hub_address: format!("127.0.0.1:{port}"),
             reconnect_interval_secs: 5,
         },
-        api: ApiConfig::default(),
+        // 30s sweep: NI temperatures drift slowly and each NI-SysCfg
+        // enumeration costs real CPU on constrained test stations
+        api: ApiConfig {
+            syscfg: ApiSettings {
+                enabled: true,
+                poll_interval_secs: 30,
+            },
+            daqmx: ApiSettings::default(),
+            visa: ApiSettings::default(),
+            xnet: ApiSettings::default(),
+        },
         prediction: PredictionConfig::default(),
         buffer: BufferConfig::default(),
         logging: LoggingConfig::default(),
