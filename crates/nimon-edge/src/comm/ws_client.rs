@@ -159,9 +159,20 @@ impl WsClient {
                 *self.send_tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(send_tx);
 
                 let event_tx = self.event_tx.clone();
+                let conn_config = self.config.clone();
+                let conn_state = state.clone();
+                let conn_send_tx = self.send_tx.clone();
                 tokio::spawn(async move {
-                    Self::handle_connection(ws_stream, &mut shutdown_rx, outgoing_rx, event_tx)
-                        .await;
+                    Self::handle_connection(
+                        ws_stream,
+                        &mut shutdown_rx,
+                        outgoing_rx,
+                        event_tx,
+                        conn_config,
+                        conn_state,
+                        conn_send_tx,
+                    )
+                    .await;
                 });
 
                 self.send_buffered_messages().await;
@@ -204,6 +215,12 @@ impl WsClient {
     }
 
     /// Handle WebSocket connection
+    ///
+    /// On an unexpected drop (anything other than an explicit `shutdown`
+    /// signal from `disconnect()`), this spawns `reconnect_task` itself so
+    /// that a connection which was once established keeps retrying — the
+    /// initial-connect-failure path is not the only place reconnection can
+    /// be triggered from.
     async fn handle_connection(
         ws_stream: tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -211,10 +228,14 @@ impl WsClient {
         shutdown: &mut mpsc::UnboundedReceiver<()>,
         mut outgoing: mpsc::UnboundedReceiver<String>,
         event_tx: mpsc::UnboundedSender<WsClientEvent>,
+        config: WsClientConfig,
+        state: Arc<tokio::sync::RwLock<ConnectionState>>,
+        send_tx_shared: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
     ) {
         let (mut write, mut read) = ws_stream.split();
         let ping_interval = Duration::from_secs(30);
         let mut ping_interval_tokio = tokio::time::interval(ping_interval);
+        let mut shutdown_requested = false;
 
         loop {
             tokio::select! {
@@ -229,6 +250,7 @@ impl WsClient {
                 }
                 Some(_) = shutdown.recv() => {
                     info!("Connection shutdown requested");
+                    shutdown_requested = true;
                     break;
                 }
                 Some(text) = outgoing.recv() => {
@@ -240,8 +262,14 @@ impl WsClient {
                 Some(msg) = read.next() => {
                     match msg {
                         Ok(WsProtoMessage::Text(text)) => {
-                            if let Ok(ws_msg) = WsMessage::from_json(&text) {
-                                debug!("Received message: {:?}", ws_msg.msg_type);
+                            match WsMessage::from_json(&text) {
+                                Ok(ws_msg) => {
+                                    debug!("Received message: {:?}", ws_msg.msg_type);
+                                    event_tx.send(WsClientEvent::MessageReceived(ws_msg)).ok();
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse message from hub: {}", e);
+                                }
                             }
                         }
                         Ok(WsProtoMessage::Close(_)) => {
@@ -263,10 +291,32 @@ impl WsClient {
 
         // Notify subscribers that the connection dropped
         event_tx.send(WsClientEvent::Disconnected).ok();
+
+        if !shutdown_requested && config.auto_reconnect {
+            *state.write().await = ConnectionState::Reconnecting;
+            tokio::spawn(Self::reconnect_task(config, state, send_tx_shared, event_tx));
+        }
     }
 
     /// Reconnection task
-    async fn reconnect_task(
+    ///
+    /// Returns a boxed future rather than being declared `async fn`: this
+    /// function and `handle_connection` call each other (a dropped
+    /// connection re-spawns a reconnect, and a successful reconnect
+    /// re-spawns `handle_connection`), and the compiler cannot resolve the
+    /// auto-trait bounds of two mutually-recursive opaque `impl Future`
+    /// types. Boxing this side turns it into a concrete type and breaks
+    /// the cycle.
+    fn reconnect_task(
+        config: WsClientConfig,
+        state: Arc<tokio::sync::RwLock<ConnectionState>>,
+        send_tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
+        event_tx: mpsc::UnboundedSender<WsClientEvent>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        Box::pin(Self::reconnect_task_inner(config, state, send_tx, event_tx))
+    }
+
+    async fn reconnect_task_inner(
         config: WsClientConfig,
         state: Arc<tokio::sync::RwLock<ConnectionState>>,
         send_tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
@@ -294,12 +344,18 @@ impl WsClient {
                     // Update the shared send_tx so the actor can send messages again
                     *send_tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_send_tx);
 
+                    let conn_config = config.clone();
+                    let conn_state = state.clone();
+                    let conn_send_tx = send_tx.clone();
                     tokio::spawn(async move {
                         Self::handle_connection(
                             ws_stream,
                             &mut shutdown_rx,
                             outgoing_rx,
                             event_tx.clone(),
+                            conn_config,
+                            conn_state,
+                            conn_send_tx,
                         )
                         .await;
                     });
@@ -386,12 +442,18 @@ impl Handler<Connect> for WsClient {
                     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
                     let (send_tx, outgoing_rx) = mpsc::unbounded_channel();
 
+                    let conn_config = config_for_reconnect.clone();
+                    let conn_state = state.clone();
+                    let conn_send_tx = send_tx_shared.clone();
                     tokio::spawn(async move {
                         Self::handle_connection(
                             ws_stream,
                             &mut shutdown_rx,
                             outgoing_rx,
                             event_tx,
+                            conn_config,
+                            conn_state,
+                            conn_send_tx,
                         )
                         .await;
                     });
