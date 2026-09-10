@@ -250,17 +250,21 @@ async fn acknowledge_alert_handler(
     }
 }
 
-/// Handler for the dashboard (serves index.html)
+/// Handler for the dashboard (serves the built React app, falling back to
+/// the legacy static page during development)
 async fn dashboard_handler() -> impl axum::response::IntoResponse {
-    let index_path = PathBuf::from("static/index.html");
-    match tokio::fs::read(&index_path).await {
-        Ok(body) => axum::response::Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/html")
-            .body(body.into())
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    // prefer the compiled dashboard (web/ → single-file build)
+    for path in ["web/dist/index.html", "static/index.html"] {
+        let index_path = PathBuf::from(path);
+        if let Ok(body) = tokio::fs::read(&index_path).await {
+            return axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/html")
+                .body(body.into())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
     }
+    StatusCode::NOT_FOUND.into_response()
 }
 
 /// Handler for serving CSS files

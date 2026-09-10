@@ -6,4 +6,6 @@
 /data
 /dist
 widget-state.json
+web/node_modules
+web/dist
 .env
