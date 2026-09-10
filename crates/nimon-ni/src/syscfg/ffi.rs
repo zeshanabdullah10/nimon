@@ -34,10 +34,46 @@ pub mod properties {
     pub const FIRMWARE_REVISION: c_int = 16969728; // char *
     pub const IS_SIMULATED: c_int = 16814080; // NISysCfgBool
     pub const SLOT_NUMBER: c_int = 16822272; // int
+    pub const NUMBER_OF_SLOTS: c_int = 16826368; // int
     pub const IS_PRESENT: c_int = 16924672; // NISysCfgIsPresentType
     pub const CURRENT_TEMP: c_int = 16965632; // double
     pub const TCP_IP_ADDRESS: c_int = 16957440; // char *
     pub const MODEL_NAME_NUMBER: c_int = 17436672; // unsigned int
+    pub const NUMBER_OF_TEMP_SENSORS: c_int = 17186816; // int
+    /// GUID of the chassis/bus a module is plugged into (matches the
+    /// chassis resource's CONNECTS_TO / resource GUID)
+    pub const CONNECTS_TO_LINK_NAME: c_int = 16818176; // char *
+}
+
+/// Property IDs for GetResourceIndexedProperty (NISysCfgIndexedProperty)
+pub mod indexed_properties {
+    use std::os::raw::c_int;
+
+    pub const EXPERT_NAME: c_int = 16900096; // char *
+    pub const EXPERT_RESOURCE_NAME: c_int = 16896000; // char *
+    /// The NI MAX device name (DAQmx alias), survives user renames
+    pub const EXPERT_USER_ALIAS: c_int = 16904192; // char *
+    pub const TEMPERATURE_NAME: c_int = 17190912; // char *
+    pub const TEMPERATURE_READING: c_int = 16965632; // double
+    pub const TEMPERATURE_UPPER_CRITICAL: c_int = 17199104; // double
+}
+
+/// Property IDs for GetSystemProperty (NISysCfgSystemProperty)
+pub mod system_properties {
+    use std::os::raw::c_int;
+
+    pub const HOSTNAME: c_int = 16941063; // char *
+    pub const IP_ADDRESS: c_int = 16941064; // char *
+    pub const MAC_ADDRESS: c_int = 16941077; // char *
+    pub const PRODUCT_NAME: c_int = 16941078; // char *
+    pub const OPERATING_SYSTEM: c_int = 16941079; // char *
+    pub const OS_VERSION: c_int = 17100800; // char *
+    pub const SERIAL_NUMBER: c_int = 16941080; // char *
+    pub const INSTALLED_API_VERSION: c_int = 16941087; // char *
+    pub const MEMORY_PHYS_TOTAL: c_int = 219480064; // double (KB)
+    pub const MEMORY_PHYS_FREE: c_int = 219484160; // double (KB)
+    pub const PRIMARY_DISK_TOTAL: c_int = 219291648; // double (KB)
+    pub const PRIMARY_DISK_FREE: c_int = 219295744; // double (KB)
 }
 
 /// Opaque handle to NI-SysCfg session
@@ -92,6 +128,21 @@ pub type NISysCfgNextResource = unsafe extern "C" fn(
 /// NISysCfgGetResourceProperty
 pub type NISysCfgGetResourceProperty = unsafe extern "C" fn(
     resource_handle: *mut NiSysCfgResource,
+    property_id: c_int,
+    value: *mut c_void,
+) -> c_int;
+
+/// NISysCfgGetResourceIndexedProperty
+pub type NISysCfgGetResourceIndexedProperty = unsafe extern "C" fn(
+    resource_handle: *mut NiSysCfgResource,
+    property_id: c_int,
+    index: u32,
+    value: *mut c_void,
+) -> c_int;
+
+/// NISysCfgGetSystemProperty
+pub type NISysCfgGetSystemProperty = unsafe extern "C" fn(
+    session_handle: *mut NiSysCfgSession,
     property_id: c_int,
     value: *mut c_void,
 ) -> c_int;

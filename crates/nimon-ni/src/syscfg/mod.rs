@@ -23,4 +23,4 @@ mod safe;
 mod types;
 
 pub use safe::{NiSysCfg, SysCfgSession};
-pub use types::{DiscoveredDevice, DeviceHealth};
+pub use types::{DeviceHealth, DiscoveredDevice, SensorReading, SystemInfo};

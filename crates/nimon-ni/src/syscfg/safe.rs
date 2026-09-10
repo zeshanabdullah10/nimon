@@ -17,9 +17,7 @@ use std::sync::OnceLock;
 use super::ffi::*;
 use super::types::*;
 use crate::common::check_status;
-use crate::{NimonError, NimonResult};
-
-/// Resolved NI-SysCfg entry points (plain fn pointers, Copy)
+use crate::{NimonError, NimonResult};/// Resolved NI-SysCfg entry points (plain fn pointers, Copy)
 #[derive(Clone, Copy)]
 struct SysCfgApi {
     initialize_session: NISysCfgInitializeSession,
@@ -27,6 +25,8 @@ struct SysCfgApi {
     find_hardware: NISysCfgFindHardware,
     next_resource: NISysCfgNextResource,
     get_property: NISysCfgGetResourceProperty,
+    get_indexed_property: NISysCfgGetResourceIndexedProperty,
+    get_system_property: NISysCfgGetSystemProperty,
 }
 
 struct SysCfgLoaded {
@@ -69,7 +69,11 @@ unsafe fn load_once() -> Result<SysCfgLoaded, String> {
         std::mem::transmute(resolve(b"NISysCfgNextResource")?);
     let f_prop: NISysCfgGetResourceProperty =
         std::mem::transmute(resolve(b"NISysCfgGetResourceProperty")?);
-    drop(resolve);
+    let f_idx: NISysCfgGetResourceIndexedProperty =
+        std::mem::transmute(resolve(b"NISysCfgGetResourceIndexedProperty")?);
+    let f_sys: NISysCfgGetSystemProperty =
+        std::mem::transmute(resolve(b"NISysCfgGetSystemProperty")?);
+    let _ = resolve;
 
     Ok(SysCfgLoaded {
         _library: library,
@@ -79,6 +83,8 @@ unsafe fn load_once() -> Result<SysCfgLoaded, String> {
             find_hardware: f_find,
             next_resource: f_next,
             get_property: f_prop,
+            get_indexed_property: f_idx,
+            get_system_property: f_sys,
         },
     })
 }
@@ -201,6 +207,65 @@ impl NiSysCfg {
         } else {
             Some(value)
         }
+    }
+
+    /// Read an indexed string property (buffer convention, same as plain)
+    unsafe fn get_indexed_string_prop(
+        api: SysCfgApi,
+        resource: *mut NiSysCfgResource,
+        property_id: c_int,
+        index: u32,
+    ) -> Option<String> {
+        let mut buffer = [0 as std::os::raw::c_char; NISYSCFG_SIMPLE_STRING_LENGTH];
+        let status = (api.get_indexed_property)(
+            resource,
+            property_id,
+            index,
+            buffer.as_mut_ptr() as *mut c_void,
+        );
+        if status != 0 {
+            return None;
+        }
+        crate::common::c_str_to_string(buffer.as_ptr()).filter(|s| !s.is_empty())
+    }
+
+    /// Read an indexed double property
+    unsafe fn get_indexed_f64_prop(
+        api: SysCfgApi,
+        resource: *mut NiSysCfgResource,
+        property_id: c_int,
+        index: u32,
+    ) -> Option<f64> {
+        let mut value: f64 = 0.0;
+        let status =
+            (api.get_indexed_property)(resource, property_id, index, &mut value as *mut _ as *mut c_void);
+        if status != 0 { None } else { Some(value) }
+    }
+
+    /// Read a system string property (session-scoped, buffer convention)
+    unsafe fn get_system_string_prop(
+        api: SysCfgApi,
+        session: *mut NiSysCfgSession,
+        property_id: c_int,
+    ) -> Option<String> {
+        let mut buffer = [0 as std::os::raw::c_char; NISYSCFG_SIMPLE_STRING_LENGTH];
+        let status =
+            (api.get_system_property)(session, property_id, buffer.as_mut_ptr() as *mut c_void);
+        if status != 0 {
+            return None;
+        }
+        crate::common::c_str_to_string(buffer.as_ptr()).filter(|s| !s.is_empty())
+    }
+
+    /// Read a system double property (returned in KB per nisyscfg.h)
+    unsafe fn get_system_f64_prop(
+        api: SysCfgApi,
+        session: *mut NiSysCfgSession,
+        property_id: c_int,
+    ) -> Option<f64> {
+        let mut value: f64 = 0.0;
+        let status = (api.get_system_property)(session, property_id, &mut value as *mut _ as *mut c_void);
+        if status != 0 { None } else { Some(value) }
     }
 }
 
@@ -333,14 +398,64 @@ impl SysCfgSession {
         let is_reachable = NiSysCfg::get_int_prop(self.api, resource, properties::IS_PRESENT)
             .map(|present| present == NISYSCFG_IS_PRESENT_TYPE_PRESENT)
             .unwrap_or(false);
-        let temperature =
+        let mut temperature =
             NiSysCfg::get_f64_prop(self.api, resource, properties::CURRENT_TEMP);
+
+        // Named temperature sensors (count from the resource property,
+        // then name/reading/threshold per index)
+        let mut sensors = Vec::new();
+        let count = NiSysCfg::get_int_prop(
+            self.api,
+            resource,
+            properties::NUMBER_OF_TEMP_SENSORS,
+        )
+        .unwrap_or(0);
+        for index in 0..count.max(0) as u32 {
+            let name = NiSysCfg::get_indexed_string_prop(
+                self.api,
+                resource,
+                indexed_properties::TEMPERATURE_NAME,
+                index,
+            );
+            let reading = NiSysCfg::get_indexed_f64_prop(
+                self.api,
+                resource,
+                indexed_properties::TEMPERATURE_READING,
+                index,
+            );
+            let upper = NiSysCfg::get_indexed_f64_prop(
+                self.api,
+                resource,
+                indexed_properties::TEMPERATURE_UPPER_CRITICAL,
+                index,
+            );
+            if let (Some(name), Some(reading)) = (name, reading) {
+                sensors.push(SensorReading {
+                    name,
+                    reading,
+                    upper_critical: upper.filter(|v| v.is_finite()),
+                });
+            }
+        }
+
+        // Devices without a plain CURRENT_TEMP still get an aggregate
+        // temperature from their first sensor
+        if temperature.is_none() {
+            temperature = sensors.iter().map(|s| s.reading).fold(None::<f64>, |acc, r| {
+                Some(match acc {
+                    Some(a) if a >= r => a,
+                    _ => r,
+                })
+            });
+        }
+
         let metrics = HashMap::new();
 
         if !is_reachable {
             return DeviceHealth {
                 is_reachable: false,
                 temperature: None,
+                sensors: Vec::new(),
                 self_test_passed: None,
                 error_message: Some("Device not reachable".to_string()),
                 metrics,
@@ -350,6 +465,7 @@ impl SysCfgSession {
         DeviceHealth {
             is_reachable: true,
             temperature,
+            sensors,
             self_test_passed: None,
             error_message: None,
             metrics,
@@ -370,6 +486,28 @@ impl SysCfgSession {
         let serial_number = NiSysCfg::get_string_prop(self.api, resource, properties::SERIAL_NUMBER)
             .unwrap_or_default();
 
+        // NI MAX device name: the first expert's user alias (DAQmx name)
+        let alias = NiSysCfg::get_indexed_string_prop(
+            self.api,
+            resource,
+            indexed_properties::EXPERT_USER_ALIAS,
+            0,
+        );
+
+        let slot = NiSysCfg::get_int_prop(self.api, resource, properties::SLOT_NUMBER)
+            .filter(|s| *s >= 0);
+        let parent_link = NiSysCfg::get_string_prop(
+            self.api,
+            resource,
+            properties::CONNECTS_TO_LINK_NAME,
+        );
+        let num_slots =
+            NiSysCfg::get_int_prop(self.api, resource, properties::NUMBER_OF_SLOTS)
+                .filter(|s| *s >= 0);
+        let is_simulated = NiSysCfg::get_int_prop(self.api, resource, properties::IS_SIMULATED)
+            .map(|v| v != 0)
+            .unwrap_or(false);
+
         let ip_address =
             NiSysCfg::get_string_prop(self.api, resource, properties::TCP_IP_ADDRESS);
         let firmware_version =
@@ -382,6 +520,11 @@ impl SysCfgSession {
         Ok(DiscoveredDevice {
             product_name,
             serial_number,
+            alias,
+            slot,
+            parent_link,
+            num_slots,
+            is_simulated,
             ip_address,
             is_reachable,
             temperature,
@@ -389,6 +532,64 @@ impl SysCfgSession {
             // Not exposed by this NI-SysCfg version's resource properties
             driver_version: None,
         })
+    }
+
+    /// Station-level system information (hostname, OS, memory, disk).
+    /// Cheap: plain session property reads, no extra enumeration.
+    pub fn get_system_info(&self) -> SystemInfo {
+        unsafe {
+            SystemInfo {
+                hostname: NiSysCfg::get_system_string_prop(
+                    self.api,
+                    self.handle,
+                    system_properties::HOSTNAME,
+                ),
+                product: NiSysCfg::get_system_string_prop(
+                    self.api,
+                    self.handle,
+                    system_properties::PRODUCT_NAME,
+                ),
+                operating_system: NiSysCfg::get_system_string_prop(
+                    self.api,
+                    self.handle,
+                    system_properties::OPERATING_SYSTEM,
+                ),
+                os_version: NiSysCfg::get_system_string_prop(
+                    self.api,
+                    self.handle,
+                    system_properties::OS_VERSION,
+                ),
+                serial_number: NiSysCfg::get_system_string_prop(
+                    self.api,
+                    self.handle,
+                    system_properties::SERIAL_NUMBER,
+                ),
+                memory_total_mb: NiSysCfg::get_system_f64_prop(
+                    self.api,
+                    self.handle,
+                    system_properties::MEMORY_PHYS_TOTAL,
+                )
+                .map(|kb| kb / 1024.0),
+                memory_free_mb: NiSysCfg::get_system_f64_prop(
+                    self.api,
+                    self.handle,
+                    system_properties::MEMORY_PHYS_FREE,
+                )
+                .map(|kb| kb / 1024.0),
+                disk_total_mb: NiSysCfg::get_system_f64_prop(
+                    self.api,
+                    self.handle,
+                    system_properties::PRIMARY_DISK_TOTAL,
+                )
+                .map(|kb| kb / 1024.0),
+                disk_free_mb: NiSysCfg::get_system_f64_prop(
+                    self.api,
+                    self.handle,
+                    system_properties::PRIMARY_DISK_FREE,
+                )
+                .map(|kb| kb / 1024.0),
+            }
+        }
     }
 }
 
@@ -430,6 +631,7 @@ mod tests {
         let health = DeviceHealth {
             is_reachable: true,
             temperature: Some(42.0),
+            sensors: Vec::new(),
             self_test_passed: None,
             error_message: None,
             metrics: HashMap::new(),

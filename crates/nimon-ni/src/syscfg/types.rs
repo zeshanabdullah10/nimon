@@ -1,4 +1,4 @@
-//! Types for NI-SysCfg API
+﻿//! Types for NI-SysCfg API
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,6 +12,16 @@ pub struct DiscoveredDevice {
     pub product_name: String,
     /// Serial number
     pub serial_number: String,
+    /// NI MAX device name (DAQmx user alias, e.g. "cDAQ_9205_AI")
+    pub alias: Option<String>,
+    /// Slot number within the chassis (modules only)
+    pub slot: Option<i32>,
+    /// GUID of the parent chassis/bus (matches chassis resource GUID)
+    pub parent_link: Option<String>,
+    /// Number of slots (chassis only)
+    pub num_slots: Option<i32>,
+    /// Whether NI reports this device as simulated
+    pub is_simulated: bool,
     /// IP address (if network-connected)
     pub ip_address: Option<String>,
     /// Whether the device is reachable
@@ -30,6 +40,11 @@ impl DiscoveredDevice {
         Self {
             product_name,
             serial_number,
+            alias: None,
+            slot: None,
+            parent_link: None,
+            num_slots: None,
+            is_simulated: false,
             ip_address: None,
             is_reachable: true,
             temperature: None,
@@ -39,13 +54,39 @@ impl DiscoveredDevice {
     }
 }
 
+/// A named sensor reading (e.g. "TempSensor1: 42.5 C")
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensorReading {
+    pub name: String,
+    pub reading: f64,
+    pub upper_critical: Option<f64>,
+}
+
+/// Station-level system information (NI MAX "system" page)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SystemInfo {
+    pub hostname: Option<String>,
+    pub product: Option<String>,
+    pub operating_system: Option<String>,
+    pub os_version: Option<String>,
+    pub serial_number: Option<String>,
+    /// Physical memory in MB
+    pub memory_total_mb: Option<f64>,
+    pub memory_free_mb: Option<f64>,
+    /// Primary disk in MB
+    pub disk_total_mb: Option<f64>,
+    pub disk_free_mb: Option<f64>,
+}
+
 /// Health information for a device
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceHealth {
     /// Whether the device is reachable
     pub is_reachable: bool,
-    /// Device temperature in Celsius
+    /// Device temperature in Celsius (primary/aggregate)
     pub temperature: Option<f64>,
+    /// Named temperature sensors (per-sensor readings and thresholds)
+    pub sensors: Vec<SensorReading>,
     /// Whether self-test passed
     pub self_test_passed: Option<bool>,
     /// Error message if any
@@ -60,6 +101,7 @@ impl DeviceHealth {
         Self {
             is_reachable: false,
             temperature: None,
+            sensors: Vec::new(),
             self_test_passed: None,
             error_message: Some("Device not found or not reachable".to_string()),
             metrics: HashMap::new(),
@@ -76,6 +118,14 @@ impl DeviceHealth {
         // Populate temperature metric
         if let Some(temp) = self.temperature {
             metrics.insert("temperature".to_string(), MetricValue::Float(temp));
+        }
+
+        // Named temperature sensors as individual metrics
+        for sensor in &self.sensors {
+            metrics.insert(
+                format!("temperature[{}]", sensor.name),
+                MetricValue::Float(sensor.reading),
+            );
         }
 
         // Populate reachability metric
@@ -121,6 +171,11 @@ mod tests {
         let device = DiscoveredDevice {
             product_name: "PXIe-8880".to_string(),
             serial_number: "12345678".to_string(),
+            alias: Some("MyPXI".to_string()),
+            slot: Some(4),
+            parent_link: None,
+            num_slots: None,
+            is_simulated: false,
             ip_address: Some("192.168.1.100".to_string()),
             is_reachable: true,
             temperature: Some(45.5),
@@ -139,6 +194,7 @@ mod tests {
         let health = DeviceHealth {
             is_reachable: true,
             temperature: None,
+            sensors: Vec::new(),
             self_test_passed: None,
             error_message: None,
             metrics: HashMap::new(),
@@ -160,6 +216,7 @@ mod tests {
         let health = DeviceHealth {
             is_reachable: true,
             temperature: Some(42.0),
+            sensors: Vec::new(),
             self_test_passed: Some(true),
             error_message: None,
             metrics: HashMap::new(),
@@ -192,6 +249,7 @@ mod tests {
         let health = DeviceHealth {
             is_reachable: true,
             temperature: Some(70.0),
+            sensors: Vec::new(),
             self_test_passed: Some(true),
             error_message: None,
             metrics: HashMap::new(),
@@ -205,6 +263,7 @@ mod tests {
         let health = DeviceHealth {
             is_reachable: true,
             temperature: Some(80.0),
+            sensors: Vec::new(),
             self_test_passed: Some(true),
             error_message: None,
             metrics: HashMap::new(),
@@ -218,6 +277,7 @@ mod tests {
         let health = DeviceHealth {
             is_reachable: true,
             temperature: Some(30.0),
+            sensors: Vec::new(),
             self_test_passed: Some(false),
             error_message: None,
             metrics: HashMap::new(),
@@ -233,6 +293,7 @@ mod tests {
         let health = DeviceHealth {
             is_reachable: true,
             temperature: Some(50.0),
+            sensors: Vec::new(),
             self_test_passed: None,
             error_message: None,
             metrics: extra,
