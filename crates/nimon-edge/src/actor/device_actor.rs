@@ -53,7 +53,16 @@ impl DeviceActor {
 
     /// Convert a health report into a poll result and emit it downstream
     fn apply_health(&mut self, health: nimon_ni::syscfg::DeviceHealth) -> DevicePollResult {
-        let (status, metrics) = health.to_status_and_metrics();
+        let (status, mut metrics) = health.to_status_and_metrics();
+
+        // static identity metrics that the downstream UIs render
+        if let Some(slot) = self.device.slot {
+            metrics.insert("slot".to_string(), MetricValue::Integer(slot as i64));
+        }
+        if let Some(ref model) = self.device.model {
+            metrics.insert("product".to_string(), MetricValue::String(model.clone()));
+        }
+
         self.last_status = status;
         DevicePollResult {
             success: true,

@@ -96,7 +96,9 @@ impl DeviceManagerActor {
     /// Add a device to be monitored; returns the actor address
     fn add_device(&mut self, device: Device) -> Addr<DeviceActor> {
         let device_id = device.id.clone();
-        let product_name = device.device_name.clone();
+        // topology fingerprint uses the product name (stable across
+        // NI MAX renames); device_name may now be the user alias
+        let product = device.model.clone().unwrap_or_else(|| device.device_name.clone());
 
         let mut actor = DeviceActor::new(device, self.default_poll_interval);
         // Route status updates through the prediction actor, which forwards
@@ -112,7 +114,7 @@ impl DeviceManagerActor {
 
         self.device_actors.insert(device_id.clone(), addr.clone());
         self.device_order.push(device_id.clone());
-        self.product_order.push(product_name);
+        self.product_order.push(product);
         tracing::info!("Added device: {}", device_id);
         addr
     }
@@ -140,25 +142,27 @@ impl DeviceManagerActor {
     }
 
     /// Build a Device from a discovery result, keeping IDs stable:
-    /// `edge:serial` when present, else `edge:product#index`
+    /// prefer the NI MAX name (DAQmx alias), then serial, then product#index
     fn device_from_discovered(&self, i: usize, d: &nimon_ni::syscfg::DiscoveredDevice) -> Device {
-        let serial = if d.serial_number.is_empty() {
-            format!("{}#{}", d.product_name, i + 1)
-        } else {
-            d.serial_number.clone()
-        };
+        let alias = d.alias.clone().filter(|a| !a.is_empty());
+        let id_key = alias
+            .clone()
+            .or_else(|| {
+                if d.serial_number.is_empty() { None } else { Some(d.serial_number.clone()) }
+            })
+            .unwrap_or_else(|| format!("{}#{}", d.product_name, i + 1));
         Device {
-            id: format!("{}:{}", self.edge_id, serial),
+            id: format!("{}:{}", self.edge_id, id_key),
             edge_id: self.edge_id.clone(),
-            device_name: d.product_name.clone(),
+            device_name: alias.unwrap_or_else(|| d.product_name.clone()),
             device_type: classify_device(&d.product_name),
             model: Some(d.product_name.clone()),
-            serial_number: Some(serial),
+            serial_number: Some(id_key),
             firmware_version: d.firmware_version.clone(),
             driver_version: d.driver_version.clone(),
             ip_address: d.ip_address.clone(),
-            slot: None,
-            chassis: None,
+            slot: d.slot,
+            chassis: d.parent_link.clone(),
         }
     }
 
@@ -257,17 +261,61 @@ impl DeviceManagerActor {
         let fut = actix_rt::task::spawn_blocking(|| {
             let api = nimon_ni::syscfg::NiSysCfg::load()?;
             let session = api.create_session()?;
-            session.discover_with_health()
+            let sweep = session.discover_with_health();
+            // system info rides along: plain session reads, no enumeration
+            let system = session.get_system_info();
+            sweep.map(|items| (items, system))
         });
         ctx.spawn(fut.into_actor(self).map(|res, _act, _ctx| match res {
-            Ok(Ok(items)) => _act.apply_sweep(items),
+            Ok(Ok((items, system))) => _act.apply_sweep(items, system),
             Ok(Err(e)) => tracing::debug!("NI-SysCfg sweep failed: {e}"),
             Err(e) => tracing::debug!("sweep task failed: {e}"),
         }));
     }
 
-    /// Distribute sweep results; resync actors if the topology changed
-    fn apply_sweep(&mut self, items: Vec<(nimon_ni::syscfg::DiscoveredDevice, nimon_ni::syscfg::DeviceHealth)>) {
+    /// Distribute sweep results; resync actors if the topology changed.
+    /// Station-level system metrics attach to the host resource (the
+    /// device whose alias is the machine hostname).
+    fn apply_sweep(
+        &mut self,
+        mut items: Vec<(
+            nimon_ni::syscfg::DiscoveredDevice,
+            nimon_ni::syscfg::DeviceHealth,
+        )>,
+        system: nimon_ni::syscfg::SystemInfo,
+    ) {
+        if let Some(ref hostname) = system.hostname {
+            for (d, health) in items.iter_mut() {
+                if d.alias.as_deref() == Some(hostname.as_str()) {
+                    if let Some(v) = system.memory_total_mb {
+                        health.metrics.insert(
+                            "mem_total_mb".to_string(),
+                            nimon_core::MetricValue::Float(v),
+                        );
+                    }
+                    if let Some(v) = system.memory_free_mb {
+                        health.metrics.insert(
+                            "mem_free_mb".to_string(),
+                            nimon_core::MetricValue::Float(v),
+                        );
+                    }
+                    if let Some(v) = system.disk_total_mb {
+                        health.metrics.insert(
+                            "disk_total_mb".to_string(),
+                            nimon_core::MetricValue::Float(v),
+                        );
+                    }
+                    if let Some(v) = system.disk_free_mb {
+                        health.metrics.insert(
+                            "disk_free_mb".to_string(),
+                            nimon_core::MetricValue::Float(v),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+
         let topology_changed = items.len() != self.product_order.len()
             || items
                 .iter()

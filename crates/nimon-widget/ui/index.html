@@ -577,13 +577,19 @@ function cardHTML(d) {
     const pct = tempPct(temp);
     const cls = sevClass(pct);
     const { name, tag } = deviceTitle(d.device_id);
-    const edgeId = d.device_id.slice(0, d.device_id.indexOf(':')) || '';
-    const edge = S.edges.find((e) => e.edge_id === edgeId);
 
-    const l1 = `${name}${tag ? ' · #' + tag : ''}`;
-    const l2 = reachable
-        ? `${edge ? edge.name : edgeId} · link ok · ${relTime(d.last_seen)}`
-        : `${edge ? edge.name : edgeId} · no link`;
+    // identity metrics injected by the edge sweep
+    const slot = typeof d.metrics?.slot === 'number' ? d.metrics.slot : null;
+    const product = typeof d.metrics?.product === 'string' ? d.metrics.product : '';
+
+    const l1 = name + (tag ? ' · #' + tag : '');
+    const idParts = [];
+    if (slot !== null) idParts.push('Slot ' + slot);
+    if (product && product !== name) idParts.push(product);
+    const l2 = (idParts.length ? idParts.join(' · ') + ' · ' : '')
+        + (reachable
+            ? `link ok · ${relTime(d.last_seen)}`
+            : 'no link');
 
     const dead = !reachable || temp === null;
     const metric = dead
@@ -669,6 +675,26 @@ function renderPanel() {
     const onlinePct = S.devices.length ? Math.round((online / S.devices.length) * 100) : null;
     const fresh = S.devices.filter((d) => !isStale(d.last_seen)).length;
     const freshPct = S.devices.length ? Math.round((fresh / S.devices.length) * 100) : null;
+
+    /* station resources (system metrics attach to the host device) */
+    const sysDev = S.devices.find(
+        (d) => typeof d.metrics?.mem_total_mb === 'number');
+    const gb = (mb) => (mb / 1024).toFixed(1) + ' GB';
+    const station = sysDev
+        ? `<div class="section-label">Station</div>
+    <div class="hero">
+        <div class="left">
+            <span class="num">${gb(sysDev.metrics.mem_free_mb ?? 0)}</span>
+            <span class="word">RAM free</span>
+        </div>
+        <div class="stats">
+            ↓ ${gb(sysDev.metrics.mem_free_mb ?? 0)} / ${gb(sysDev.metrics.mem_total_mb)} free<br>
+            ↑ ${gb(sysDev.metrics.disk_free_mb ?? 0)} / ${gb(sysDev.metrics.disk_total_mb ?? 0)} disk<br>
+            ${esc(sysDev.metrics.product || '')}
+        </div>
+    </div>`
+        : '';
+
     const meters = `<div class="divider"></div>
     <div class="meters">
         <div class="meter">
@@ -695,6 +721,7 @@ function renderPanel() {
         <div class="cards">${cards || '<div class="empty-note">no populated slots</div>'}</div>
         <div class="divider"></div>
         ${hero}
+        ${station}
         ${meters}`;
 
     positionPanel();
