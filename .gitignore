@@ -9,3 +9,4 @@ widget-state.json
 web/node_modules
 web/dist
 .env
+web/tsconfig.tsbuildinfo
