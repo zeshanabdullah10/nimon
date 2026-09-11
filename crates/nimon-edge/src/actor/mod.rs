@@ -35,11 +35,11 @@ pub mod prediction_actor;
 
 pub use device_actor::DeviceActor;
 pub use device_manager::{
-    AddDevice, DeviceManagerActor, GetDeviceCount, ListDevices, PollAllDevices, PollDevice,
-    RemoveDevice,
+    AddDevice, ApplyConfig, DeviceManagerActor, GetDeviceCount, ListDevices, PollAllDevices,
+    PollDevice, RemoveDevice,
 };
 pub use hub_connector::{
-    ConnectionStateChanged, GetConnectionState, HubConnectorActor, HubConnectorConfig,
-    MessageReceived, UpdateDeviceCount,
+    AttachDeviceManager, ConnectionStateChanged, GetConnectionState, HubConnectorActor,
+    HubConnectorConfig, MessageReceived, UpdateDeviceCount,
 };
 pub use prediction_actor::PredictionActor;

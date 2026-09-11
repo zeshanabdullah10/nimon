@@ -14,10 +14,7 @@ pub unsafe fn c_str_to_string(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    CStr::from_ptr(ptr)
-        .to_str()
-        .ok()
-        .map(|s| s.to_owned())
+    CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_owned())
 }
 
 /// Convert a C string pointer to a String, returning empty string on error
@@ -110,7 +107,10 @@ mod tests {
     #[test]
     fn test_string_to_c_string_with_null() {
         let cstr = string_to_c_string("hello\0world");
-        assert!(cstr.is_none(), "Should return None for strings with embedded nulls");
+        assert!(
+            cstr.is_none(),
+            "Should return None for strings with embedded nulls"
+        );
     }
 
     #[test]
@@ -124,7 +124,13 @@ mod tests {
         let result = check_status("Test", -1);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, crate::NimonError::NiApi { api: "Test", code: -1 }));
+        assert!(matches!(
+            err,
+            crate::NimonError::NiApi {
+                api: "Test",
+                code: -1
+            }
+        ));
     }
 
     #[test]

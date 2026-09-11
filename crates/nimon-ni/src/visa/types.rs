@@ -179,10 +179,7 @@ mod tests {
 
     #[test]
     fn test_visa_health_to_status_healthy() {
-        let health = VisaHealth::healthy(
-            "Keysight,34461A,MY12345678,03.00".to_string(),
-            15.0,
-        );
+        let health = VisaHealth::healthy("Keysight,34461A,MY12345678,03.00".to_string(), 15.0);
         let (status, metrics) = health.to_status_and_metrics();
         assert_eq!(status, HealthStatus::Healthy);
         assert!(matches!(

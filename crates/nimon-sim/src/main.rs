@@ -5,10 +5,11 @@
 use anyhow::Result;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use nimon_core::actor::messages::{DeviceStatusUpdate, EdgeHeartbeat, EdgeRegister, PredictionResult};
-use nimon_core::actor::messages::PredictionType as ActorPredictionType;
+use nimon_core::actor::messages::{
+    DeviceStatusUpdate, EdgeHeartbeat, EdgeRegister, PredictionResult,
+};
 use nimon_core::protocol::WsMessage;
-use nimon_core::{HealthStatus, MetricValue};
+use nimon_core::{HealthStatus, MetricValue, PredictionType};
 use rand::Rng;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -54,15 +55,9 @@ impl EdgeSimulator {
                 let voltage_3v3 = rng.gen_range(3.1..3.5);
 
                 let mut metrics = HashMap::new();
-                metrics.insert(
-                    "temperature".to_string(),
-                    MetricValue::Float(temperature),
-                );
+                metrics.insert("temperature".to_string(), MetricValue::Float(temperature));
                 metrics.insert("voltage_5v".to_string(), MetricValue::Float(voltage_5v));
-                metrics.insert(
-                    "voltage_3v3".to_string(),
-                    MetricValue::Float(voltage_3v3),
-                );
+                metrics.insert("voltage_3v3".to_string(), MetricValue::Float(voltage_3v3));
 
                 let status = if temperature > 75.0 {
                     HealthStatus::Error
@@ -78,6 +73,7 @@ impl EdgeSimulator {
                     status,
                     metrics,
                     timestamp,
+                    is_simulated: true,
                 }
             })
             .collect()
@@ -98,9 +94,9 @@ impl EdgeSimulator {
         if rng.gen_bool(0.2) {
             let device_id = self.device_ids[rng.gen_range(0..self.device_ids.len())].clone();
             let pred_type = if rng.gen_bool(0.5) {
-                ActorPredictionType::Overheating
+                PredictionType::Overheating
             } else {
-                ActorPredictionType::ConnectionFailure
+                PredictionType::ConnectionFailure
             };
 
             Some(PredictionResult {
@@ -110,6 +106,8 @@ impl EdgeSimulator {
                 probability: rng.gen_range(0.7..0.99),
                 eta_minutes: Some(rng.gen_range(5..60)),
                 confidence: rng.gen_range(0.6..0.95),
+                reason: Some("simulated random prediction".to_string()),
+                model_version: Some("sim-random".to_string()),
                 timestamp: Utc::now(),
             })
         } else {
@@ -158,7 +156,11 @@ async fn connect_and_run(simulator: &EdgeSimulator) -> Result<()> {
     let ping_json = ping.to_json()?;
     write.send(Message::Text(ping_json.into())).await?;
 
-    tracing::info!("Registered as {} ({})", simulator.edge_name, simulator.edge_id);
+    tracing::info!(
+        "Registered as {} ({})",
+        simulator.edge_name,
+        simulator.edge_id
+    );
 
     // Main loop: send updates every 5 seconds
     loop {

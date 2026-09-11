@@ -44,6 +44,17 @@ pub enum ActionType {
     PowerCycle { delay_secs: u64 },
 }
 
+impl std::fmt::Display for ActionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActionType::Script(_) => write!(f, "script"),
+            ActionType::RestartService { .. } => write!(f, "restart_service"),
+            ActionType::EdgeCommand { .. } => write!(f, "edge_command"),
+            ActionType::PowerCycle { .. } => write!(f, "power_cycle"),
+        }
+    }
+}
+
 /// Configuration for a script-type action
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScriptAction {
@@ -159,6 +170,26 @@ impl Action {
             },
         }
     }
+
+    /// Create a new edge command action
+    pub fn edge_command(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            description: description.into(),
+            action_type: ActionType::EdgeCommand {
+                command: String::new(),
+                parameters: HashMap::new(),
+            },
+            enabled: true,
+            timeout_secs: 120,
+            retry_config: RetryConfig::default(),
+        }
+    }
 }
 
 /// Result of an action execution
@@ -180,6 +211,84 @@ pub struct ActionResult {
     pub attempt: u32,
     /// Timestamp when the action was executed
     pub executed_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Convert a rule's action reference (core type) into an executable Action.
+pub fn action_from_ref(action_ref: &nimon_core::alert::rules::ActionRef) -> Action {
+    use nimon_core::alert::rules::ActionRef;
+    match action_ref {
+        ActionRef::Script {
+            script,
+            args,
+            timeout_secs,
+        } => {
+            let mut action = Action::script(
+                format!("rule-script-{}", script),
+                "Rule script",
+                "Script action attached to an alert rule",
+                script.clone(),
+            );
+            if let ActionType::Script(ref mut cfg) = action.action_type {
+                cfg.args = args.clone();
+            }
+            if let Some(timeout) = timeout_secs {
+                action.timeout_secs = *timeout;
+            }
+            action
+        }
+        ActionRef::RestartService { service_name } => Action::restart_service(
+            format!("rule-restart-{}", service_name),
+            "Rule service restart",
+            "Service restart action attached to an alert rule",
+            service_name.clone(),
+        ),
+        ActionRef::PowerCycle { delay_secs } => {
+            let mut action = Action::power_cycle(
+                "rule-power-cycle",
+                "Rule power cycle",
+                "Power cycle action attached to an alert rule",
+            );
+            if let ActionType::PowerCycle { delay_secs: d } = &mut action.action_type {
+                *d = delay_secs.unwrap_or(0);
+            }
+            action
+        }
+        ActionRef::EdgeCommand {
+            command,
+            parameters,
+        } => {
+            let mut action = Action::edge_command(
+                format!("rule-edge-{}", command),
+                "Rule edge command",
+                "Edge command action attached to an alert rule",
+            );
+            if let ActionType::EdgeCommand {
+                command: c,
+                parameters: p,
+            } = &mut action.action_type
+            {
+                *c = command.clone();
+                *p = parameters.clone();
+            }
+            action
+        }
+        ActionRef::CustomScript { script } => {
+            let mut action = Action::edge_command(
+                format!("rule-custom-script-{}", script),
+                "Rule custom script",
+                "Allowlisted edge script attached to an alert rule",
+            );
+            if let ActionType::EdgeCommand {
+                command,
+                parameters,
+            } = &mut action.action_type
+            {
+                *command = "custom_script".to_string();
+                parameters.insert("script".to_string(), script.clone());
+            }
+            action
+        }
+    }
 }
 
 #[cfg(test)]
@@ -215,7 +324,10 @@ mod tests {
             "Restarts a system service",
             "nimon-agent",
         );
-        assert!(matches!(restart_action.action_type, ActionType::RestartService { .. }));
+        assert!(matches!(
+            restart_action.action_type,
+            ActionType::RestartService { .. }
+        ));
         if let ActionType::RestartService { ref service_name } = restart_action.action_type {
             assert_eq!(service_name, "nimon-agent");
         }
@@ -227,7 +339,10 @@ mod tests {
             "Power Cycle Device",
             "Power cycles the device hardware",
         );
-        assert!(matches!(power_action.action_type, ActionType::PowerCycle { .. }));
+        assert!(matches!(
+            power_action.action_type,
+            ActionType::PowerCycle { .. }
+        ));
         assert_eq!(power_action.timeout_secs, 120);
         assert_eq!(power_action.retry_config.max_attempts, 1);
     }
@@ -282,7 +397,8 @@ mod tests {
         if let ActionType::Script(ref mut cfg) = action.action_type {
             cfg.args.push("-c".to_string());
             cfg.args.push("print('hello')".to_string());
-            cfg.env.insert("PYTHONPATH".to_string(), "/opt/lib".to_string());
+            cfg.env
+                .insert("PYTHONPATH".to_string(), "/opt/lib".to_string());
             cfg.working_dir = Some("/tmp".to_string());
             cfg.run_as = Some("nobody".to_string());
         }

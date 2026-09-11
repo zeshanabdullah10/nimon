@@ -83,16 +83,12 @@ pub struct ViObject {
 /// Function signature for viOpenDefaultRM
 ///
 /// Opens a session to the default resource manager.
-pub type ViOpenDefaultRM = unsafe extern "C" fn(
-    sesn: *mut *mut ViSession,
-) -> c_long;
+pub type ViOpenDefaultRM = unsafe extern "C" fn(sesn: *mut *mut ViSession) -> c_long;
 
 /// Function signature for viClose
 ///
 /// Closes the specified session, object, or find list.
-pub type ViClose = unsafe extern "C" fn(
-    vi: *mut ViSession,
-) -> c_long;
+pub type ViClose = unsafe extern "C" fn(vi: *mut ViSession) -> c_long;
 
 /// Function signature for viFindRsrc
 ///
@@ -108,10 +104,7 @@ pub type ViFindRsrc = unsafe extern "C" fn(
 /// Function signature for viFindNext
 ///
 /// Returns the next resource in the find list.
-pub type ViFindNext = unsafe extern "C" fn(
-    find_list: *mut ViObject,
-    desc: *mut c_char,
-) -> c_long;
+pub type ViFindNext = unsafe extern "C" fn(find_list: *mut ViObject, desc: *mut c_char) -> c_long;
 
 /// Function signature for viOpen
 ///
@@ -147,8 +140,5 @@ pub type ViRead = unsafe extern "C" fn(
 /// Function signature for viGetAttribute
 ///
 /// Retrieves the value of an attribute for the specified session or object.
-pub type ViGetAttribute = unsafe extern "C" fn(
-    vi: *mut ViSession,
-    attr: c_int,
-    attr_state: *mut c_void,
-) -> c_long;
+pub type ViGetAttribute =
+    unsafe extern "C" fn(vi: *mut ViSession, attr: c_int, attr_state: *mut c_void) -> c_long;

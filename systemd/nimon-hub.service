@@ -8,8 +8,13 @@ Type=simple
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
+Environment=NIMON_SMTP_PASSWORD_FILE=/opt/nimon/config/smtp-password
 WorkingDirectory=/opt/nimon
 ExecStart=/opt/nimon/nimon-hub /opt/nimon/config/hub.yaml
+# SMTP credentials come from the environment (NIMON_SMTP_USER /
+# NIMON_SMTP_PASSWORD) rather than the world-readable unit file.
+#Environment=NIMON_SMTP_USER=nimon@example.com
+#Environment=NIMON_SMTP_PASSWORD=secret
 
 [Install]
 WantedBy=multi-user.target

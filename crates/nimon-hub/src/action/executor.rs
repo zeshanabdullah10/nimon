@@ -6,14 +6,23 @@
 use actix::prelude::*;
 use chrono::Utc;
 use dashmap::DashMap;
+use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command as TokioCommand;
+use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
-use super::actions::{
-    Action, ActionResult, ActionStatus, ActionType, ScriptAction,
+use nimon_core::actor::messages::{
+    ActionType as WireActionType, ExecuteAction as WireExecuteAction,
 };
+use nimon_core::db::ActionRepository;
+use nimon_core::protocol::WsMessage;
+
+use super::actions::{Action, ActionResult, ActionStatus, ActionType, ScriptAction};
+
+use crate::session::SessionStore;
 
 /// Context in which an action is being executed
 #[derive(Debug, Clone)]
@@ -62,26 +71,50 @@ impl ActionContext {
 /// Action executor actor
 ///
 /// Manages the execution of self-healing actions with retry logic,
-/// timeout handling, and tracking of running actions.
+/// timeout handling, and tracking of running actions. Edge-routed
+/// actions are dispatched over the edge WebSocket session and their
+/// results correlated by `msg_id`.
 pub struct ActionExecutor {
-    /// Currently running actions tracked by action ID
-    running_actions: DashMap<String, ActionStatus>,
+    /// Currently running actions tracked by action ID.
+    /// Shared with worker clones (`Arc`) so completion state recorded by
+    /// the handler's clone is visible to the actor.
+    running_actions: Arc<DashMap<String, ActionStatus>>,
+    /// Pending edge command results, keyed by the sent `msg_id`.
+    /// Shared with worker clones so `CompleteAction` (handled by the
+    /// actor) correlates with sends performed on a clone.
+    pending_results:
+        Arc<DashMap<String, oneshot::Sender<nimon_core::actor::messages::ActionResult>>>,
+    /// Connected edge sessions for edge-routed actions
+    sessions: Option<std::sync::Arc<SessionStore>>,
+    /// Database pool for persisting action history
+    db_pool: Option<SqlitePool>,
 }
 
 impl ActionExecutor {
     /// Create a new action executor
     pub fn new() -> Self {
         Self {
-            running_actions: DashMap::new(),
+            running_actions: Arc::new(DashMap::new()),
+            pending_results: Arc::new(DashMap::new()),
+            sessions: None,
+            db_pool: None,
         }
     }
 
+    /// Set the session store used to route actions to edges.
+    pub fn with_sessions(mut self, sessions: std::sync::Arc<SessionStore>) -> Self {
+        self.sessions = Some(sessions);
+        self
+    }
+
+    /// Set the database pool for persisting action history.
+    pub fn with_db_pool(mut self, pool: SqlitePool) -> Self {
+        self.db_pool = Some(pool);
+        self
+    }
+
     /// Execute an action with full retry logic
-    pub async fn execute_action(
-        &self,
-        action: &Action,
-        ctx: &ActionContext,
-    ) -> ActionResult {
+    pub async fn execute_action(&self, action: &Action, ctx: &ActionContext) -> ActionResult {
         if !action.enabled {
             return ActionResult {
                 action_id: action.id.clone(),
@@ -128,22 +161,19 @@ impl ActionExecutor {
                 ActionStatus::Failed | ActionStatus::Timeout => {
                     warn!(
                         "Action {} attempt {}/{} failed: {}",
-                        action.id,
-                        attempt,
-                        action.retry_config.max_attempts,
-                        result.error
+                        action.id, attempt, action.retry_config.max_attempts, result.error
                     );
                     last_result = Some(result);
 
                     if attempt < action.retry_config.max_attempts {
                         let delay_ms = (action.retry_config.delay_ms as f64
-                            * action.retry_config.backoff_multiplier.powi(attempt as i32 - 1))
+                            * action
+                                .retry_config
+                                .backoff_multiplier
+                                .powi(attempt as i32 - 1))
                             as u64;
-                        debug!(
-                            "Retrying action {} in {}ms",
-                            action.id, delay_ms
-                        );
-                        tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+                        debug!("Retrying action {} in {}ms", action.id, delay_ms);
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
                 }
                 _ => {
@@ -176,11 +206,7 @@ impl ActionExecutor {
     }
 
     /// Execute a single attempt of an action
-    async fn execute_action_internal(
-        &self,
-        action: &Action,
-        ctx: &ActionContext,
-    ) -> ActionResult {
+    async fn execute_action_internal(&self, action: &Action, ctx: &ActionContext) -> ActionResult {
         let start = Instant::now();
 
         match &action.action_type {
@@ -190,8 +216,19 @@ impl ActionExecutor {
             ActionType::RestartService { service_name } => {
                 self.execute_restart(action, ctx, service_name).await
             }
-            ActionType::EdgeCommand { .. } => self.execute_edge_command(action, ctx).await,
-            ActionType::PowerCycle { .. } => self.execute_power_cycle(action, ctx).await,
+            ActionType::EdgeCommand { .. } => {
+                self.execute_edge_routed(
+                    action,
+                    ctx,
+                    WireActionType::CustomScript,
+                    action.id.clone(),
+                )
+                .await
+            }
+            ActionType::PowerCycle { .. } => {
+                self.execute_edge_routed(action, ctx, WireActionType::PowerCycle, action.id.clone())
+                    .await
+            }
         }
         .map(|mut result| {
             result.duration_ms = start.elapsed().as_millis() as u64;
@@ -231,10 +268,7 @@ impl ActionExecutor {
             .map(|a| substitute_variables(a, &ctx.variables))
             .collect();
 
-        debug!(
-            "Running script: {} with args {:?}",
-            script, args
-        );
+        debug!("Running script: {} with args {:?}", script, args);
 
         let mut cmd = TokioCommand::new(&script);
         cmd.args(&args);
@@ -251,13 +285,10 @@ impl ActionExecutor {
         }
 
         // Execute with timeout
-        let output = tokio::time::timeout(
-            Duration::from_secs(action.timeout_secs),
-            cmd.output(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Action timed out after {}s", action.timeout_secs))?
-        .map_err(|e| anyhow::anyhow!("Failed to execute script: {}", e))?;
+        let output = tokio::time::timeout(Duration::from_secs(action.timeout_secs), cmd.output())
+            .await
+            .map_err(|_| anyhow::anyhow!("Action timed out after {}s", action.timeout_secs))?
+            .map_err(|e| anyhow::anyhow!("Failed to execute script: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -273,11 +304,7 @@ impl ActionExecutor {
             },
             exit_code: output.status.code(),
             output: stdout,
-            error: if succeeded {
-                String::new()
-            } else {
-                stderr
-            },
+            error: if succeeded { String::new() } else { stderr },
             duration_ms: 0, // Set by caller
             attempt: ctx.attempt,
             executed_at: Utc::now(),
@@ -288,11 +315,14 @@ impl ActionExecutor {
     async fn execute_restart(
         &self,
         action: &Action,
-        _ctx: &ActionContext,
+        ctx: &ActionContext,
         service_name: &str,
     ) -> std::result::Result<ActionResult, anyhow::Error> {
         // Validate service name - alphanumeric, hyphens, underscores, dots only
-        if !service_name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        if !service_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
             return Ok(ActionResult {
                 action_id: action.id.clone(),
                 status: ActionStatus::Failed,
@@ -300,7 +330,7 @@ impl ActionExecutor {
                 output: String::new(),
                 error: format!("Invalid service name: {}", service_name),
                 duration_ms: 0,
-                attempt: _ctx.attempt,
+                attempt: ctx.attempt,
                 executed_at: chrono::Utc::now(),
             });
         }
@@ -309,9 +339,7 @@ impl ActionExecutor {
         let result = {
             let stop_output = tokio::time::timeout(
                 Duration::from_secs(30),
-                TokioCommand::new("sc")
-                    .args(&["stop", service_name])
-                    .output(),
+                TokioCommand::new("sc").args(["stop", service_name]).output(),
             )
             .await
             .map_err(|_| anyhow::anyhow!("Timed out stopping service after 30s"))?
@@ -320,7 +348,7 @@ impl ActionExecutor {
             let start_output = tokio::time::timeout(
                 Duration::from_secs(30),
                 TokioCommand::new("sc")
-                    .args(&["start", service_name])
+                    .args(["start", service_name])
                     .output(),
             )
             .await
@@ -328,9 +356,9 @@ impl ActionExecutor {
             .map_err(|e| anyhow::anyhow!("Failed to start service: {}", e))?;
 
             let stdout = String::from_utf8_lossy(&stop_output.stdout).to_string()
-                + &String::from_utf8_lossy(&start_output.stdout).to_string();
+                + &*String::from_utf8_lossy(&start_output.stdout);
             let stderr = String::from_utf8_lossy(&stop_output.stderr).to_string()
-                + &String::from_utf8_lossy(&start_output.stderr).to_string();
+                + &*String::from_utf8_lossy(&start_output.stderr);
 
             let succeeded = start_output.status.success();
             (stdout, stderr, succeeded, start_output.status.code())
@@ -367,59 +395,131 @@ impl ActionExecutor {
             output: stdout,
             error: if succeeded { String::new() } else { stderr },
             duration_ms: 0, // Set by caller
-            attempt: _ctx.attempt,
+            attempt: ctx.attempt,
             executed_at: Utc::now(),
         })
     }
 
-    /// Execute an edge command action
-    ///
-    /// TODO: Implement edge node command dispatch via WebSocket
-    async fn execute_edge_command(
+    /// Route an action to the edge node owning the device and await the
+    /// correlated `action_result` (with timeout). Retries apply upstream.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_edge_routed(
         &self,
         action: &Action,
-        _ctx: &ActionContext,
+        ctx: &ActionContext,
+        wire_type: WireActionType,
+        _tag: String,
     ) -> std::result::Result<ActionResult, anyhow::Error> {
-        // TODO: Send command to edge node via WebSocket and wait for response
-        warn!(
-            "Edge command execution not yet implemented for action {}",
-            action.id
+        // Build the wire parameters from the action definition
+        let mut parameters = HashMap::new();
+        if let ActionType::EdgeCommand {
+            command,
+            parameters: p,
+        } = &action.action_type
+        {
+            parameters = p.clone();
+            parameters.insert("command".to_string(), command.clone());
+        }
+        if let ActionType::PowerCycle { delay_secs } = &action.action_type {
+            parameters.insert("delay_secs".to_string(), delay_secs.to_string());
+        }
+
+        let Some(sessions) = &self.sessions else {
+            return Ok(ActionResult {
+                action_id: action.id.clone(),
+                status: ActionStatus::Failed,
+                exit_code: None,
+                output: String::new(),
+                error: "Edge routing unavailable: no session store".to_string(),
+                duration_ms: 0,
+                attempt: ctx.attempt,
+                executed_at: Utc::now(),
+            });
+        };
+
+        let Some(session) = sessions.get(&ctx.edge_id) else {
+            return Ok(ActionResult {
+                action_id: action.id.clone(),
+                status: ActionStatus::Failed,
+                exit_code: None,
+                output: String::new(),
+                error: format!("Edge '{}' is not connected", ctx.edge_id),
+                duration_ms: 0,
+                attempt: ctx.attempt,
+                executed_at: Utc::now(),
+            });
+        };
+
+        let wire_action = WireExecuteAction {
+            action_id: action.id.clone(),
+            device_id: ctx.device_id.clone(),
+            action_type: wire_type,
+            parameters,
+        };
+        let msg = WsMessage::execute_action(wire_action);
+        let msg_id = msg.msg_id.clone();
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_results.insert(msg_id.clone(), tx);
+
+        if let Err(e) = session.send(msg) {
+            self.pending_results.remove(&msg_id);
+            return Ok(ActionResult {
+                action_id: action.id.clone(),
+                status: ActionStatus::Failed,
+                exit_code: None,
+                output: String::new(),
+                error: format!("Failed to dispatch action to edge: {}", e),
+                duration_ms: 0,
+                attempt: ctx.attempt,
+                executed_at: Utc::now(),
+            });
+        }
+
+        debug!(
+            "Action {} dispatched to edge {} (msg {})",
+            action.id, ctx.edge_id, msg_id
         );
+
+        let timeout = Duration::from_secs(action.timeout_secs.max(1));
+        let outcome = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => nimon_core::actor::messages::ActionResult {
+                action_id: action.id.clone(),
+                success: false,
+                output: None,
+                error: Some("Edge connection dropped before result".to_string()),
+                exit_code: None,
+                duration_ms: 0,
+            },
+            Err(_) => {
+                self.pending_results.remove(&msg_id);
+                nimon_core::actor::messages::ActionResult {
+                    action_id: action.id.clone(),
+                    success: false,
+                    output: None,
+                    error: Some(format!(
+                        "Timed out waiting for edge result after {}s",
+                        action.timeout_secs
+                    )),
+                    exit_code: None,
+                    duration_ms: 0,
+                }
+            }
+        };
 
         Ok(ActionResult {
             action_id: action.id.clone(),
-            status: ActionStatus::Failed,
-            exit_code: None,
-            output: String::new(),
-            error: "Edge command execution not yet implemented".to_string(),
-            duration_ms: 0,
-            attempt: _ctx.attempt,
-            executed_at: Utc::now(),
-        })
-    }
-
-    /// Execute a power cycle action
-    ///
-    /// TODO: Implement power cycling via NI-DCPower or relay control
-    async fn execute_power_cycle(
-        &self,
-        action: &Action,
-        _ctx: &ActionContext,
-    ) -> std::result::Result<ActionResult, anyhow::Error> {
-        // TODO: Implement power cycling through hardware interface
-        warn!(
-            "Power cycle execution not yet implemented for action {}",
-            action.id
-        );
-
-        Ok(ActionResult {
-            action_id: action.id.clone(),
-            status: ActionStatus::Failed,
-            exit_code: None,
-            output: String::new(),
-            error: "Power cycle execution not yet implemented".to_string(),
-            duration_ms: 0,
-            attempt: _ctx.attempt,
+            status: if outcome.success {
+                ActionStatus::Succeeded
+            } else {
+                ActionStatus::Failed
+            },
+            exit_code: outcome.exit_code,
+            output: outcome.output.unwrap_or_default(),
+            error: outcome.error.unwrap_or_default(),
+            duration_ms: 0, // Set by caller
+            attempt: ctx.attempt,
             executed_at: Utc::now(),
         })
     }
@@ -439,9 +539,8 @@ impl ActionExecutor {
 
     /// Clear completed actions from tracking
     pub fn cleanup(&self) {
-        self.running_actions.retain(|_, status| {
-            *status == ActionStatus::Running
-        });
+        self.running_actions
+            .retain(|_, status| *status == ActionStatus::Running);
     }
 }
 
@@ -454,7 +553,10 @@ impl Default for ActionExecutor {
 impl Clone for ActionExecutor {
     fn clone(&self) -> Self {
         Self {
-            running_actions: self.running_actions.clone(),
+            running_actions: Arc::clone(&self.running_actions),
+            pending_results: Arc::clone(&self.pending_results),
+            sessions: self.sessions.clone(),
+            db_pool: self.db_pool.clone(),
         }
     }
 }
@@ -481,8 +583,120 @@ impl Handler<ExecuteAction> for ActionExecutor {
     fn handle(&mut self, msg: ExecuteAction, _ctx: &mut Self::Context) -> Self::Result {
         let executor = self.clone();
         Box::pin(async move {
-            executor.execute_action(&msg.action, &msg.context).await
+            let result = executor.execute_action(&msg.action, &msg.context).await;
+            executor.persist_result(&msg.action, &msg.context, &result);
+            executor.update_alert_action(&msg.context, &msg.action, &result);
+            result
         })
+    }
+}
+
+/// An `action_result` arrived from an edge node, correlated by `msg_id`.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct CompleteAction {
+    pub msg_id: String,
+    pub result: nimon_core::actor::messages::ActionResult,
+}
+
+impl Handler<CompleteAction> for ActionExecutor {
+    type Result = ();
+
+    fn handle(&mut self, msg: CompleteAction, _ctx: &mut Self::Context) -> Self::Result {
+        if let Some((_, tx)) = self.pending_results.remove(&msg.msg_id) {
+            let _ = tx.send(msg.result);
+        } else {
+            debug!("action_result for unknown msg_id {}", msg.msg_id);
+        }
+    }
+}
+
+impl ActionExecutor {
+    /// Persist an execution outcome to `action_history` (fire-and-forget).
+    fn persist_result(&self, action: &Action, ctx: &ActionContext, result: &ActionResult) {
+        let Some(pool) = &self.db_pool else {
+            return;
+        };
+        let pool = pool.clone();
+        let alert_id_opt = if ctx.alert_id.is_empty() {
+            None
+        } else {
+            Some(ctx.alert_id.clone())
+        };
+        let output_opt = if result.output.is_empty() {
+            None
+        } else {
+            Some(result.output.clone())
+        };
+        let record = (
+            alert_id_opt,
+            ctx.device_id.clone(),
+            action.id.clone(),
+            action.action_type.to_string(),
+            result.exit_code.map(|c| c as i64),
+            output_opt,
+            result.duration_ms as i64,
+            result.status == ActionStatus::Succeeded,
+            (result.attempt as i64) - 1,
+        );
+        tokio::spawn(async move {
+            let repo = ActionRepository::new(&pool);
+            let (
+                alert_id,
+                device_id,
+                action_id,
+                action_type,
+                exit_code,
+                output,
+                duration_ms,
+                success,
+                retry_count,
+            ) = record;
+            if let Err(e) = repo
+                .insert(
+                    alert_id,
+                    &device_id,
+                    &action_id,
+                    &action_type,
+                    None,
+                    exit_code,
+                    output.as_deref(),
+                    Some(duration_ms),
+                    success,
+                    retry_count,
+                )
+                .await
+            {
+                warn!("Failed to persist action history: {}", e);
+            }
+        });
+    }
+
+    /// Record the outcome on the triggering alert (fire-and-forget).
+    fn update_alert_action(&self, ctx: &ActionContext, action: &Action, result: &ActionResult) {
+        let Some(pool) = &self.db_pool else {
+            return;
+        };
+        if ctx.alert_id.is_empty() {
+            return;
+        }
+        let pool = pool.clone();
+        let alert_id = ctx.alert_id.clone();
+        let taken = format!("{}", action.action_type);
+        let outcome = if result.status == ActionStatus::Succeeded {
+            format!(
+                "success (exit {:?}, {}ms)",
+                result.exit_code, result.duration_ms
+            )
+        } else {
+            format!("failed: {}", result.error)
+        };
+        tokio::spawn(async move {
+            let repo = nimon_core::db::AlertRepository::new(&pool);
+            if let Err(e) = repo.update_action(&alert_id, &taken, &outcome).await {
+                warn!("Failed to update alert action outcome: {}", e);
+            }
+        });
     }
 }
 
@@ -562,12 +776,7 @@ mod tests {
     #[tokio::test]
     async fn test_disabled_action() {
         let executor = ActionExecutor::new();
-        let mut action = Action::script(
-            "test-action",
-            "Test",
-            "Test action",
-            "echo hello",
-        );
+        let mut action = Action::script("test-action", "Test", "Test action", "echo hello");
         action.enabled = false;
 
         let ctx = ActionContext::new("edge-1", "dev-1", "alert-1");
@@ -587,12 +796,7 @@ mod tests {
         #[cfg(not(target_os = "windows"))]
         let script = "echo";
 
-        let mut action = Action::script(
-            "test-echo",
-            "Echo Test",
-            "Test echo command",
-            script,
-        );
+        let mut action = Action::script("test-echo", "Echo Test", "Test echo command", script);
 
         let ctx = ActionContext::new("edge-1", "dev-1", "alert-1");
 

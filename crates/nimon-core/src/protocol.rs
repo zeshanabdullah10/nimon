@@ -5,9 +5,11 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::actor::messages::{
-    DeviceAlert, DeviceStatusUpdate, EdgeHeartbeat, EdgeRegister, PredictionResult,
+    ActionResult, ConfigUpdate, DeviceAlert, DeviceStatusUpdate, EdgeHeartbeat, EdgeRegister,
+    ExecuteAction, PredictionResult,
 };
 
 /// Protocol version for compatibility
@@ -39,6 +41,7 @@ pub enum WsMessageType {
     DeviceAlert,
     Prediction,
     Heartbeat,
+    ActionResult,
 
     // Hub -> Edge messages
     ConfigUpdate,
@@ -81,6 +84,40 @@ pub struct PongMessage {
     pub pong_timestamp: DateTime<Utc>,
 }
 
+/// A generic command from the hub to an edge node
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HubCommand {
+    /// Command name (e.g. "resend_state", "reload_config")
+    pub command: String,
+    /// Command parameters
+    #[serde(default)]
+    pub parameters: HashMap<String, String>,
+}
+
+/// Check whether a peer's protocol version is compatible with ours:
+/// same major version (additive minor changes are tolerated both ways).
+pub fn is_compatible(version: &str) -> bool {
+    let ours: u64 = PROTOCOL_VERSION
+        .split('.')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0);
+    let theirs: u64 = version
+        .split('.')
+        .next()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(u64::MAX);
+    ours == theirs
+}
+
+/// Serialize a payload value infallibly. All payload types are plain
+/// data (no non-string map keys, no cycles), so serialization cannot
+/// fail; a failure would be a programming error and degrades to `Null`
+/// rather than panicking.
+fn to_payload<T: Serialize>(value: T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+}
+
 impl WsMessage {
     /// Create a new WebSocket message
     pub fn new(msg_type: WsMessageType, payload: serde_json::Value) -> Self {
@@ -93,72 +130,99 @@ impl WsMessage {
         }
     }
 
+    /// True when the sender's protocol version is compatible with ours.
+    pub fn version_compatible(&self) -> bool {
+        is_compatible(&self.version)
+    }
+
     /// Create an edge registration message
     pub fn edge_register(registration: EdgeRegister) -> Self {
-        let payload = serde_json::to_value(registration).unwrap();
-        Self::new(WsMessageType::EdgeRegister, payload)
+        Self::new(WsMessageType::EdgeRegister, to_payload(registration))
     }
 
     /// Create a device status message
     pub fn device_status(status: DeviceStatusUpdate) -> Self {
-        let payload = serde_json::to_value(status).unwrap();
-        Self::new(WsMessageType::DeviceStatus, payload)
+        Self::new(WsMessageType::DeviceStatus, to_payload(status))
     }
 
     /// Create a device alert message
     pub fn device_alert(alert: DeviceAlert) -> Self {
-        let payload = serde_json::to_value(alert).unwrap();
-        Self::new(WsMessageType::DeviceAlert, payload)
+        Self::new(WsMessageType::DeviceAlert, to_payload(alert))
     }
 
     /// Create a prediction message
     pub fn prediction(prediction: PredictionResult) -> Self {
-        let payload = serde_json::to_value(prediction).unwrap();
-        Self::new(WsMessageType::Prediction, payload)
+        Self::new(WsMessageType::Prediction, to_payload(prediction))
     }
 
     /// Create a heartbeat message
     pub fn heartbeat(heartbeat: EdgeHeartbeat) -> Self {
-        let payload = serde_json::to_value(heartbeat).unwrap();
-        Self::new(WsMessageType::Heartbeat, payload)
+        Self::new(WsMessageType::Heartbeat, to_payload(heartbeat))
+    }
+
+    /// Create an action result message (edge -> hub)
+    pub fn action_result(result: ActionResult) -> Self {
+        Self::new(WsMessageType::ActionResult, to_payload(result))
+    }
+
+    /// Create a config update message (hub -> edge)
+    pub fn config_update(update: ConfigUpdate) -> Self {
+        Self::new(WsMessageType::ConfigUpdate, to_payload(update))
+    }
+
+    /// Create an execute action message (hub -> edge)
+    pub fn execute_action(action: ExecuteAction) -> Self {
+        Self::new(WsMessageType::ExecuteAction, to_payload(action))
+    }
+
+    /// Create a hub command message (hub -> edge)
+    pub fn hub_command(command: HubCommand) -> Self {
+        Self::new(WsMessageType::HubCommand, to_payload(command))
     }
 
     /// Create an acknowledgment message
     pub fn ack(original_msg_id: String, success: bool, error: Option<String>) -> Self {
-        let payload = serde_json::to_value(AckMessage {
-            original_msg_id,
-            success,
-            error,
-        })
-        .unwrap();
-        Self::new(WsMessageType::Ack, payload)
+        Self::new(
+            WsMessageType::Ack,
+            to_payload(AckMessage {
+                original_msg_id,
+                success,
+                error,
+            }),
+        )
     }
 
     /// Create an error message
     pub fn error(code: String, message: String, details: Option<String>) -> Self {
-        let payload = serde_json::to_value(ErrorMessage {
-            code,
-            message,
-            details,
-        })
-        .unwrap();
-        Self::new(WsMessageType::Error, payload)
+        Self::new(
+            WsMessageType::Error,
+            to_payload(ErrorMessage {
+                code,
+                message,
+                details,
+            }),
+        )
     }
 
     /// Create a ping message
     pub fn ping() -> Self {
-        let payload = serde_json::to_value(PingMessage { timestamp: Utc::now() }).unwrap();
-        Self::new(WsMessageType::Ping, payload)
+        Self::new(
+            WsMessageType::Ping,
+            to_payload(PingMessage {
+                timestamp: Utc::now(),
+            }),
+        )
     }
 
     /// Create a pong message
     pub fn pong(ping_timestamp: DateTime<Utc>) -> Self {
-        let payload = serde_json::to_value(PongMessage {
-            ping_timestamp,
-            pong_timestamp: Utc::now(),
-        })
-        .unwrap();
-        Self::new(WsMessageType::Pong, payload)
+        Self::new(
+            WsMessageType::Pong,
+            to_payload(PongMessage {
+                ping_timestamp,
+                pong_timestamp: Utc::now(),
+            }),
+        )
     }
 
     /// Serialize to JSON
@@ -174,5 +238,124 @@ impl WsMessage {
     /// Extract payload as specific type
     pub fn payload<T: for<'de> Deserialize<'de>>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_value(self.payload.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::messages::ActionType;
+    use crate::Severity;
+    use chrono::TimeZone;
+
+    #[test]
+    fn test_version_compat_same_major() {
+        assert!(is_compatible("1.0"));
+        assert!(is_compatible("1.1"));
+        assert!(is_compatible("1"));
+        assert!(!is_compatible("2.0"));
+        assert!(!is_compatible("0.9"));
+        assert!(!is_compatible("garbage"));
+    }
+
+    #[test]
+    fn test_message_version_compatible() {
+        let mut msg = WsMessage::ping();
+        assert!(msg.version_compatible());
+        msg.version = "2.0".to_string();
+        assert!(!msg.version_compatible());
+    }
+
+    #[test]
+    fn test_action_result_message_roundtrip() {
+        let result = ActionResult {
+            action_id: "act-1".to_string(),
+            success: true,
+            output: Some("ok".to_string()),
+            error: None,
+            exit_code: Some(0),
+            duration_ms: 10,
+        };
+        let msg = WsMessage::action_result(result);
+        let json = msg.to_json().unwrap();
+        assert!(json.contains("\"action_result\""));
+
+        let parsed = WsMessage::from_json(&json).unwrap();
+        assert_eq!(parsed.msg_type, WsMessageType::ActionResult);
+        let payload: ActionResult = parsed.payload().unwrap();
+        assert!(payload.success);
+        assert_eq!(payload.action_id, "act-1");
+    }
+
+    #[test]
+    fn test_execute_action_message_roundtrip() {
+        let mut parameters = HashMap::new();
+        parameters.insert("script".to_string(), "power_cycle_relays.sh".to_string());
+        let action = ExecuteAction {
+            action_id: "act-2".to_string(),
+            device_id: "dev-1".to_string(),
+            action_type: ActionType::PowerCycle,
+            parameters,
+        };
+        let msg = WsMessage::execute_action(action);
+        let json = msg.to_json().unwrap();
+        assert!(json.contains("\"execute_action\""));
+
+        let parsed = WsMessage::from_json(&json).unwrap();
+        assert_eq!(parsed.msg_type, WsMessageType::ExecuteAction);
+        let payload: ExecuteAction = parsed.payload().unwrap();
+        assert_eq!(payload.action_type, ActionType::PowerCycle);
+    }
+
+    #[test]
+    fn test_config_update_message_roundtrip() {
+        let update = ConfigUpdate {
+            poll_interval_secs: Some(30),
+            thresholds: crate::actor::messages::ThresholdConfig {
+                temperature_warning: 70.0,
+                temperature_critical: 80.0,
+            },
+        };
+        let msg = WsMessage::config_update(update);
+        let parsed = WsMessage::from_json(&msg.to_json().unwrap()).unwrap();
+        let payload: ConfigUpdate = parsed.payload().unwrap();
+        assert_eq!(payload.poll_interval_secs, Some(30));
+        assert_eq!(payload.thresholds.temperature_warning, 70.0);
+    }
+
+    #[test]
+    fn test_hub_command_message_roundtrip() {
+        let mut parameters = HashMap::new();
+        parameters.insert("reason".to_string(), "resync".to_string());
+        let msg = WsMessage::hub_command(HubCommand {
+            command: "resend_state".to_string(),
+            parameters,
+        });
+        let parsed = WsMessage::from_json(&msg.to_json().unwrap()).unwrap();
+        assert_eq!(parsed.msg_type, WsMessageType::HubCommand);
+        let payload: HubCommand = parsed.payload().unwrap();
+        assert_eq!(payload.command, "resend_state");
+    }
+
+    #[test]
+    fn test_wire_format_golden_fixtures() {
+        // Golden fixture: wire strings must stay stable across refactors.
+        let ts = Utc.timestamp_opt(0, 0).unwrap();
+        let msg = WsMessage::new(WsMessageType::Ping, serde_json::Value::Null);
+        let json = msg.to_json().unwrap();
+        assert!(json.contains("\"type\":\"ping\""));
+        assert!(json.contains("\"version\":\"1.0\""));
+
+        let alert = DeviceAlert {
+            device_id: "d".to_string(),
+            edge_id: "e".to_string(),
+            severity: Severity::Critical,
+            message: "m".to_string(),
+            metric_name: None,
+            metric_value: None,
+            timestamp: ts,
+        };
+        let json = serde_json::to_string(&alert).unwrap();
+        assert!(json.contains("\"severity\":\"critical\""));
     }
 }

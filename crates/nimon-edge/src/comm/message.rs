@@ -33,6 +33,7 @@ mod tests {
             edge_id: "edge-1".to_string(),
             status: HealthStatus::Healthy,
             metrics,
+            is_simulated: false,
             timestamp: Utc::now(),
         };
 

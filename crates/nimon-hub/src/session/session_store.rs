@@ -19,11 +19,12 @@ impl SessionStore {
         }
     }
 
-    /// Add a new session
-    pub fn add(&self, session: EdgeSession) {
+    /// Add a new session. Returns the session it replaced (duplicate
+    /// edge_id registration), so the caller can close the old socket.
+    pub fn add(&self, session: EdgeSession) -> Option<EdgeSession> {
         let edge_id = session.edge_id().to_string();
         info!("Adding session for edge: {}", edge_id);
-        self.sessions.insert(edge_id, session);
+        self.sessions.insert(edge_id, session)
     }
 
     /// Remove a session
@@ -54,7 +55,10 @@ impl SessionStore {
 
     /// Get all edge IDs
     pub fn edge_ids(&self) -> Vec<String> {
-        self.sessions.iter().map(|entry| entry.key().clone()).collect()
+        self.sessions
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     /// Clear all sessions
@@ -63,8 +67,9 @@ impl SessionStore {
         self.sessions.clear();
     }
 
-    /// Remove stale sessions
-    pub async fn remove_stale(&self, timeout_secs: i64) -> usize {
+    /// Remove stale sessions. Returns the edge IDs that were removed so
+    /// callers can mark them offline in the database.
+    pub async fn remove_stale(&self, timeout_secs: i64) -> Vec<String> {
         let mut stale_edges = Vec::new();
 
         for entry in self.sessions.iter() {
@@ -74,13 +79,12 @@ impl SessionStore {
             }
         }
 
-        let count = stale_edges.len();
-        for edge_id in stale_edges {
+        for edge_id in &stale_edges {
             warn!("Removing stale session for edge: {}", edge_id);
-            self.remove(&edge_id);
+            self.remove(edge_id);
         }
 
-        count
+        stale_edges
     }
 
     /// Iterate over all sessions
@@ -110,12 +114,7 @@ mod tests {
     fn test_add_and_remove_session() {
         let store = SessionStore::new();
 
-        let session = EdgeSession::new(
-            "edge-1".to_string(),
-            "Edge Node 1".to_string(),
-            None,
-            None,
-        );
+        let session = EdgeSession::new("edge-1".to_string(), "Edge Node 1".to_string(), None, None);
 
         store.add(session);
         assert_eq!(store.len(), 1);

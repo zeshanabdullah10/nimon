@@ -1,8 +1,8 @@
 //! Repository for edge node operations
 
-use sqlx::SqlitePool;
+use crate::{EdgeNode, EdgeStatus, NimonError, NimonResult};
 use chrono::{DateTime, Utc};
-use crate::{EdgeNode, EdgeStatus, NimonResult, NimonError};
+use sqlx::SqlitePool;
 
 pub struct EdgeRepository<'a> {
     pool: &'a SqlitePool,
@@ -24,7 +24,7 @@ impl<'a> EdgeRepository<'a> {
                 ip_address = excluded.ip_address,
                 last_seen = excluded.last_seen,
                 status = excluded.status
-            "#
+            "#,
         )
         .bind(&edge.id)
         .bind(&edge.name)
@@ -39,21 +39,34 @@ impl<'a> EdgeRepository<'a> {
     }
 
     pub async fn get(&self, id: &str) -> NimonResult<EdgeNode> {
-        let row: (String, String, Option<String>, Option<String>, Option<String>, String) =
-            sqlx::query_as(
-                "SELECT id, name, hostname, ip_address, last_seen, status FROM edge_nodes WHERE id = ?"
-            )
-            .bind(id)
-            .fetch_one(self.pool)
-            .await
-            .map_err(|_| NimonError::EdgeNotFound(id.to_string()))?;
+        let row: (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT id, name, hostname, ip_address, last_seen, status FROM edge_nodes WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(self.pool)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => NimonError::EdgeNotFound(id.to_string()),
+            other => NimonError::Database(other),
+        })?;
 
         Ok(EdgeNode {
             id: row.0,
             name: row.1,
             hostname: row.2,
             ip_address: row.3,
-            last_seen: row.4.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
+            last_seen: row.4.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc))
+            }),
             status: parse_edge_status(&row.5),
         })
     }
@@ -66,26 +79,31 @@ impl<'a> EdgeRepository<'a> {
             .fetch_all(self.pool)
             .await?;
 
-        Ok(rows.into_iter().map(|row| EdgeNode {
-            id: row.0,
-            name: row.1,
-            hostname: row.2,
-            ip_address: row.3,
-            last_seen: row.4.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
-            status: parse_edge_status(&row.5),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| EdgeNode {
+                id: row.0,
+                name: row.1,
+                hostname: row.2,
+                ip_address: row.3,
+                last_seen: row.4.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc))
+                }),
+                status: parse_edge_status(&row.5),
+            })
+            .collect())
     }
 
     pub async fn update_status(&self, id: &str, status: EdgeStatus) -> NimonResult<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "UPDATE edge_nodes SET status = ?, last_seen = ? WHERE id = ?"
-        )
-        .bind(status.to_string())
-        .bind(now)
-        .bind(id)
-        .execute(self.pool)
-        .await?;
+        sqlx::query("UPDATE edge_nodes SET status = ?, last_seen = ? WHERE id = ?")
+            .bind(status.to_string())
+            .bind(now)
+            .bind(id)
+            .execute(self.pool)
+            .await?;
 
         Ok(())
     }
@@ -139,7 +157,9 @@ mod tests {
                 ip_address: None,
                 last_seen: None,
                 status: EdgeStatus::Offline,
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         }
 
         let edges = repo.list().await.unwrap();
@@ -161,7 +181,9 @@ mod tests {
         };
         repo.upsert(&edge).await.unwrap();
 
-        repo.update_status("edge-1", EdgeStatus::Online).await.unwrap();
+        repo.update_status("edge-1", EdgeStatus::Online)
+            .await
+            .unwrap();
         let fetched = repo.get("edge-1").await.unwrap();
         assert_eq!(fetched.status, EdgeStatus::Online);
         assert!(fetched.last_seen.is_some());

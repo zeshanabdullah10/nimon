@@ -53,10 +53,7 @@ impl NiVisa {
 
         unsafe {
             let library = Library::new(&dll_path).map_err(|e| {
-                NimonError::Connection(format!(
-                    "Failed to load {:?}: {}",
-                    dll_path, e
-                ))
+                NimonError::Connection(format!("Failed to load {:?}: {}", dll_path, e))
             })?;
 
             let open_default_rm = Self::get_symbol(&library, b"viOpenDefaultRM")?;
@@ -133,10 +130,7 @@ impl NiVisa {
             check_visa_status("viOpenDefaultRM", status as i32)?;
         }
 
-        Ok(VisaSession {
-            handle,
-            api: self,
-        })
+        Ok(VisaSession { handle, api: self })
     }
 
     fn close_session(&self, handle: *mut ViSession) {
@@ -191,10 +185,7 @@ impl<'a> VisaSession<'a> {
             // Iterate remaining results
             for _ in 1..return_count {
                 desc_buffer.fill(0);
-                let status = (self.api.find_next)(
-                    find_list,
-                    desc_buffer.as_mut_ptr(),
-                );
+                let status = (self.api.find_next)(find_list, desc_buffer.as_mut_ptr());
 
                 if (status as i32) < 0 {
                     break; // Error or end of list
@@ -233,7 +224,7 @@ impl<'a> VisaSession<'a> {
             let open_status = (self.api.open)(
                 self.handle,
                 rsrc_cstr.as_ptr(),
-                0, // VI_NO_LOCK
+                0,    // VI_NO_LOCK
                 2000, // 2 second timeout for open
                 &mut instr_handle,
             );
@@ -345,7 +336,9 @@ impl<'a> VisaSession<'a> {
     fn parse_interface_type(resource_name: &str) -> String {
         let prefix = resource_name.split("::").next().unwrap_or("");
         // Strip trailing digits (e.g., "TCPIP0" -> "TCPIP")
-        prefix.trim_end_matches(|c: char| c.is_ascii_digit()).to_string()
+        prefix
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            .to_string()
     }
 }
 
@@ -390,18 +383,12 @@ mod tests {
 
     #[test]
     fn test_parse_interface_type_gpib() {
-        assert_eq!(
-            VisaSession::parse_interface_type("GPIB0::1::INSTR"),
-            "GPIB"
-        );
+        assert_eq!(VisaSession::parse_interface_type("GPIB0::1::INSTR"), "GPIB");
     }
 
     #[test]
     fn test_parse_interface_type_asrl() {
-        assert_eq!(
-            VisaSession::parse_interface_type("ASRL1::INSTR"),
-            "ASRL"
-        );
+        assert_eq!(VisaSession::parse_interface_type("ASRL1::INSTR"), "ASRL");
     }
 
     #[test]
@@ -414,22 +401,13 @@ mod tests {
 
     #[test]
     fn test_parse_interface_type_pxi() {
-        assert_eq!(
-            VisaSession::parse_interface_type("PXI1::2::INSTR"),
-            "PXI"
-        );
+        assert_eq!(VisaSession::parse_interface_type("PXI1::2::INSTR"), "PXI");
     }
 
     #[test]
     fn test_parse_interface_type_unknown() {
-        assert_eq!(
-            VisaSession::parse_interface_type(""),
-            ""
-        );
-        assert_eq!(
-            VisaSession::parse_interface_type("UNKNOWN"),
-            "UNKNOWN"
-        );
+        assert_eq!(VisaSession::parse_interface_type(""), "");
+        assert_eq!(VisaSession::parse_interface_type("UNKNOWN"), "UNKNOWN");
     }
 
     #[test]
@@ -441,20 +419,17 @@ mod tests {
 
     #[test]
     fn test_visa_health_healthy() {
-        let health = VisaHealth::healthy(
-            "Keysight,34461A,MY1234,1.0".to_string(),
-            25.0,
-        );
+        let health = VisaHealth::healthy("Keysight,34461A,MY1234,1.0".to_string(), 25.0);
         assert!(health.is_reachable);
-        assert_eq!(health.idn_response, Some("Keysight,34461A,MY1234,1.0".to_string()));
+        assert_eq!(
+            health.idn_response,
+            Some("Keysight,34461A,MY1234,1.0".to_string())
+        );
     }
 
     #[test]
     fn test_visa_health_to_status_healthy() {
-        let health = VisaHealth::healthy(
-            "Keysight,34461A,MY1234,1.0".to_string(),
-            25.0,
-        );
+        let health = VisaHealth::healthy("Keysight,34461A,MY1234,1.0".to_string(), 25.0);
         let (status, metrics) = health.to_status_and_metrics();
         assert_eq!(status, HealthStatus::Healthy);
         assert!(metrics.contains_key("is_reachable"));

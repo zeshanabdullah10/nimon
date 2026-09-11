@@ -112,7 +112,7 @@ export function PredictionCard({
 
 export function RecentAlerts({
   alerts, onAck, ackPending,
-}: { alerts: Alert[]; onAck: (id: number) => void; ackPending: Set<number> }) {
+}: { alerts: Alert[]; onAck: (id: string) => void; ackPending: Set<string> }) {
   return (
     <Card className="flex min-h-0 flex-1 flex-col">
       <CardContent className="flex min-h-0 flex-1 flex-col pb-4 pt-4">
@@ -132,11 +132,11 @@ export function RecentAlerts({
                   <span className={cn('h-[9px] w-[9px] shrink-0 rounded-full', crit ? 'bg-crit' : 'bg-warn')} />
                   <span className="min-w-0 flex-1">
                     <span className="block truncate text-[13px] font-medium leading-[1.3] text-t1">
-                      {a.rule_name || 'Alert'}
+                      {a.title || a.rule_id || 'Alert'}
                     </span>
                     <span className="block truncate text-xs leading-[1.3] text-t3">{dev}</span>
                   </span>
-                  <span className="shrink-0 text-xs text-t3">{relTime(a.created_at)}</span>
+                  <span className="shrink-0 text-xs text-t3">{relTime(a.triggered_at)}</span>
                   <button
                     onClick={() => onAck(a.id)}
                     disabled={pending}

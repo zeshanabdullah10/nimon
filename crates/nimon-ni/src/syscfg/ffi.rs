@@ -14,6 +14,7 @@ pub const NISYSCFG_LOCALE_DEFAULT: c_int = 0;
 
 /// NISysCfgBool values
 pub const NISYSCFG_BOOL_FALSE: c_int = 0;
+#[allow(dead_code)] // complete FFI surface; not every value is read yet
 pub const NISYSCFG_BOOL_TRUE: c_int = 1;
 
 /// NISysCfgIsPresentType values
@@ -23,6 +24,7 @@ pub const NISYSCFG_IS_PRESENT_TYPE_PRESENT: c_int = 1;
 pub const NISYSCFG_SIMPLE_STRING_LENGTH: usize = 1024;
 
 /// Property IDs for GetResourceProperty (NISysCfgResourceProperty)
+#[allow(dead_code)] // complete FFI property surface; not every property is read yet
 pub mod properties {
     use std::os::raw::c_int;
 
@@ -46,6 +48,7 @@ pub mod properties {
 }
 
 /// Property IDs for GetResourceIndexedProperty (NISysCfgIndexedProperty)
+#[allow(dead_code)] // complete FFI property surface
 pub mod indexed_properties {
     use std::os::raw::c_int;
 
@@ -59,6 +62,7 @@ pub mod indexed_properties {
 }
 
 /// Property IDs for GetSystemProperty (NISysCfgSystemProperty)
+#[allow(dead_code)] // complete FFI property surface; not every property is read yet
 pub mod system_properties {
     use std::os::raw::c_int;
 

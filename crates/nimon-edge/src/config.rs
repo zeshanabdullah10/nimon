@@ -17,6 +17,9 @@ pub struct EdgeConfig {
     /// Prediction engine settings
     #[serde(default)]
     pub prediction: PredictionConfig,
+    /// Remediation action settings (hub-requested execution)
+    #[serde(default)]
+    pub action: ActionConfig,
     /// Data buffering settings
     #[serde(default)]
     pub buffer: BufferConfig,
@@ -28,8 +31,8 @@ pub struct EdgeConfig {
 impl EdgeConfig {
     /// Load configuration from a YAML file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path.as_ref())
-            .map_err(|e| ConfigError::Io(e.to_string()))?;
+        let content =
+            std::fs::read_to_string(path.as_ref()).map_err(|e| ConfigError::Io(e.to_string()))?;
         Self::from_yaml(&content)
     }
 
@@ -54,10 +57,14 @@ impl EdgeConfig {
             return Err(ConfigError::Validation("node.name cannot be empty".into()));
         }
         if self.node.hub_address.is_empty() {
-            return Err(ConfigError::Validation("node.hub_address cannot be empty".into()));
+            return Err(ConfigError::Validation(
+                "node.hub_address cannot be empty".into(),
+            ));
         }
         if self.node.reconnect_interval_secs == 0 {
-            return Err(ConfigError::Validation("node.reconnect_interval_secs must be > 0".into()));
+            return Err(ConfigError::Validation(
+                "node.reconnect_interval_secs must be > 0".into(),
+            ));
         }
         Ok(())
     }
@@ -148,10 +155,7 @@ fn default_prediction_enabled() -> bool {
 }
 
 fn default_models() -> Vec<String> {
-    vec![
-        "threshold".to_string(),
-        "ewma_anomaly".to_string(),
-    ]
+    vec!["threshold".to_string(), "ewma_anomaly".to_string()]
 }
 
 fn default_temp_warning() -> f64 {
@@ -169,6 +173,38 @@ impl Default for PredictionConfig {
             models: default_models(),
             temperature_warning: default_temp_warning(),
             temperature_critical: default_temp_critical(),
+        }
+    }
+}
+
+/// Remediation action execution settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionConfig {
+    /// Script names this edge is allowed to run (CustomScript actions)
+    #[serde(default)]
+    pub allowed_scripts: Vec<String>,
+    /// Directory containing allowlisted scripts
+    #[serde(default = "default_scripts_dir")]
+    pub scripts_dir: String,
+    /// Per-script timeout in seconds
+    #[serde(default = "default_script_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_scripts_dir() -> String {
+    "./scripts".to_string()
+}
+
+fn default_script_timeout() -> u64 {
+    120
+}
+
+impl Default for ActionConfig {
+    fn default() -> Self {
+        Self {
+            allowed_scripts: Vec::new(),
+            scripts_dir: default_scripts_dir(),
+            timeout_secs: default_script_timeout(),
         }
     }
 }
@@ -370,11 +406,47 @@ logging:
             },
             api: ApiConfig::default(),
             prediction: PredictionConfig::default(),
+            action: ActionConfig::default(),
             buffer: BufferConfig::default(),
             logging: LoggingConfig::default(),
         };
         let yaml = config.to_yaml().unwrap();
         assert!(yaml.contains("id: test"));
         assert!(yaml.contains("hub_address: localhost:8080"));
+    }
+
+    #[test]
+    fn test_action_config_parses() {
+        let yaml = r#"
+node:
+  id: test-edge-01
+  name: Test Edge
+  hub_address: "localhost:8080"
+
+action:
+  allowed_scripts:
+    - drain-chassis.ps1
+    - reset-relays.sh
+  scripts_dir: "/opt/nimon/scripts"
+  timeout_secs: 60
+"#;
+        let config = EdgeConfig::from_yaml(yaml).unwrap();
+        assert_eq!(config.action.allowed_scripts.len(), 2);
+        assert_eq!(config.action.scripts_dir, "/opt/nimon/scripts");
+        assert_eq!(config.action.timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_action_config_defaults() {
+        let yaml = r#"
+node:
+  id: test-edge-01
+  name: Test Edge
+  hub_address: "localhost:8080"
+"#;
+        let config = EdgeConfig::from_yaml(yaml).unwrap();
+        assert!(config.action.allowed_scripts.is_empty());
+        assert_eq!(config.action.scripts_dir, "./scripts");
+        assert_eq!(config.action.timeout_secs, 120);
     }
 }

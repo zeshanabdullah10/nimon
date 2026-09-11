@@ -82,6 +82,7 @@ impl DeviceActor {
                 status: result.status,
                 metrics: result.metrics,
                 timestamp: result.timestamp,
+                is_simulated: self.device.is_simulated,
             };
             let _ = recipient.do_send(update);
         }
@@ -114,10 +115,7 @@ impl DeviceActor {
                     }
                 }
                 Err(e) => {
-                    tracing::debug!(
-                        "NI-SysCfg session failed: {}, using simulated polling",
-                        e
-                    );
+                    tracing::debug!("NI-SysCfg session failed: {}, using simulated polling", e);
                 }
             },
             Err(_) => {
@@ -254,6 +252,7 @@ mod tests {
             ip_address: None,
             slot: None,
             chassis: None,
+            is_simulated: false,
         }
     }
 

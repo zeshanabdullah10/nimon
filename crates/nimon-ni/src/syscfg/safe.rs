@@ -1,4 +1,4 @@
-﻿//! Safe Rust wrapper for NI-SysCfg API
+//! Safe Rust wrapper for NI-SysCfg API
 //!
 //! This module provides safe, idiomatic Rust wrappers around the NI-SysCfg C API.
 //!
@@ -17,7 +17,8 @@ use std::sync::OnceLock;
 use super::ffi::*;
 use super::types::*;
 use crate::common::check_status;
-use crate::{NimonError, NimonResult};/// Resolved NI-SysCfg entry points (plain fn pointers, Copy)
+use crate::{NimonError, NimonResult};
+/// Resolved NI-SysCfg entry points (plain fn pointers, Copy)
 #[derive(Clone, Copy)]
 struct SysCfgApi {
     initialize_session: NISysCfgInitializeSession,
@@ -43,8 +44,8 @@ fn syscfg() -> &'static Result<SysCfgLoaded, String> {
 
 unsafe fn load_once() -> Result<SysCfgLoaded, String> {
     let dll_path = NiSysCfg::find_dll().map_err(|e| e.to_string())?;
-    let library = Library::new(&dll_path)
-        .map_err(|e| format!("Failed to load {dll_path:?}: {e}"))?;
+    let library =
+        Library::new(&dll_path).map_err(|e| format!("Failed to load {dll_path:?}: {e}"))?;
 
     let resolve = |name: &[u8]| -> Result<usize, String> {
         let sym: Symbol<usize> = library
@@ -61,12 +62,9 @@ unsafe fn load_once() -> Result<SysCfgLoaded, String> {
     // resolve every entry point before moving the Library
     let f_init: NISysCfgInitializeSession =
         std::mem::transmute(resolve(b"NISysCfgInitializeSession")?);
-    let f_close: NISysCfgCloseHandle =
-        std::mem::transmute(resolve(b"NISysCfgCloseHandle")?);
-    let f_find: NISysCfgFindHardware =
-        std::mem::transmute(resolve(b"NISysCfgFindHardware")?);
-    let f_next: NISysCfgNextResource =
-        std::mem::transmute(resolve(b"NISysCfgNextResource")?);
+    let f_close: NISysCfgCloseHandle = std::mem::transmute(resolve(b"NISysCfgCloseHandle")?);
+    let f_find: NISysCfgFindHardware = std::mem::transmute(resolve(b"NISysCfgFindHardware")?);
+    let f_next: NISysCfgNextResource = std::mem::transmute(resolve(b"NISysCfgNextResource")?);
     let f_prop: NISysCfgGetResourceProperty =
         std::mem::transmute(resolve(b"NISysCfgGetResourceProperty")?);
     let f_idx: NISysCfgGetResourceIndexedProperty =
@@ -150,12 +148,12 @@ impl NiSysCfg {
 
         unsafe {
             let status = (self.api.initialize_session)(
-                std::ptr::null(),                      // target: NULL => localhost
-                std::ptr::null(),                      // username: NULL => no credentials
-                std::ptr::null(),                      // password: NULL => no credentials
+                std::ptr::null(), // target: NULL => localhost
+                std::ptr::null(), // username: NULL => no credentials
+                std::ptr::null(), // password: NULL => no credentials
                 NISYSCFG_LOCALE_DEFAULT,
-                NISYSCFG_BOOL_FALSE, // TRUE here crashes NextResource on NI 26.3
-                10_000,              // connect timeout ms
+                NISYSCFG_BOOL_FALSE,  // TRUE here crashes NextResource on NI 26.3
+                10_000,               // connect timeout ms
                 std::ptr::null_mut(), // expert enum handle (optional)
                 &mut handle,
             );
@@ -237,9 +235,17 @@ impl NiSysCfg {
         index: u32,
     ) -> Option<f64> {
         let mut value: f64 = 0.0;
-        let status =
-            (api.get_indexed_property)(resource, property_id, index, &mut value as *mut _ as *mut c_void);
-        if status != 0 { None } else { Some(value) }
+        let status = (api.get_indexed_property)(
+            resource,
+            property_id,
+            index,
+            &mut value as *mut _ as *mut c_void,
+        );
+        if status != 0 {
+            None
+        } else {
+            Some(value)
+        }
     }
 
     /// Read a system string property (session-scoped, buffer convention)
@@ -264,8 +270,13 @@ impl NiSysCfg {
         property_id: c_int,
     ) -> Option<f64> {
         let mut value: f64 = 0.0;
-        let status = (api.get_system_property)(session, property_id, &mut value as *mut _ as *mut c_void);
-        if status != 0 { None } else { Some(value) }
+        let status =
+            (api.get_system_property)(session, property_id, &mut value as *mut _ as *mut c_void);
+        if status != 0 {
+            None
+        } else {
+            Some(value)
+        }
     }
 }
 
@@ -376,11 +387,24 @@ impl SysCfgSession {
 
             loop {
                 let mut resource: *mut NiSysCfgResource = std::ptr::null_mut();
-                let status =
-                    (self.api.next_resource)(self.handle, enum_handle, &mut resource);
+                let status = (self.api.next_resource)(self.handle, enum_handle, &mut resource);
 
-                if status != 0 || resource.is_null() {
-                    break; // No more resources
+                // A NULL resource handle is the only reliable
+                // end-of-enumeration signal. Treating every non-zero status
+                // as termination truncated the list whenever a benign
+                // warning status arrived mid-enumeration.
+                if resource.is_null() {
+                    break;
+                }
+                if status != 0 {
+                    // Error with a valid handle: release the enumeration
+                    // handle and any resources already collected, then
+                    // surface the failure.
+                    for collected in &resources {
+                        (self.api.close_handle)(*collected as *mut c_void);
+                    }
+                    (self.api.close_handle)(enum_handle as *mut c_void);
+                    check_status("NISysCfgNextResource", status)?;
                 }
 
                 resources.push(resource);
@@ -398,18 +422,13 @@ impl SysCfgSession {
         let is_reachable = NiSysCfg::get_int_prop(self.api, resource, properties::IS_PRESENT)
             .map(|present| present == NISYSCFG_IS_PRESENT_TYPE_PRESENT)
             .unwrap_or(false);
-        let mut temperature =
-            NiSysCfg::get_f64_prop(self.api, resource, properties::CURRENT_TEMP);
+        let mut temperature = NiSysCfg::get_f64_prop(self.api, resource, properties::CURRENT_TEMP);
 
         // Named temperature sensors (count from the resource property,
         // then name/reading/threshold per index)
         let mut sensors = Vec::new();
-        let count = NiSysCfg::get_int_prop(
-            self.api,
-            resource,
-            properties::NUMBER_OF_TEMP_SENSORS,
-        )
-        .unwrap_or(0);
+        let count = NiSysCfg::get_int_prop(self.api, resource, properties::NUMBER_OF_TEMP_SENSORS)
+            .unwrap_or(0);
         for index in 0..count.max(0) as u32 {
             let name = NiSysCfg::get_indexed_string_prop(
                 self.api,
@@ -441,12 +460,15 @@ impl SysCfgSession {
         // Devices without a plain CURRENT_TEMP still get an aggregate
         // temperature from their first sensor
         if temperature.is_none() {
-            temperature = sensors.iter().map(|s| s.reading).fold(None::<f64>, |acc, r| {
-                Some(match acc {
-                    Some(a) if a >= r => a,
-                    _ => r,
-                })
-            });
+            temperature = sensors
+                .iter()
+                .map(|s| s.reading)
+                .fold(None::<f64>, |acc, r| {
+                    Some(match acc {
+                        Some(a) if a >= r => a,
+                        _ => r,
+                    })
+                });
         }
 
         let metrics = HashMap::new();
@@ -477,14 +499,15 @@ impl SysCfgSession {
         resource: *mut NiSysCfgResource,
     ) -> NimonResult<DiscoveredDevice> {
         // Product name
-        let product_name =
-            NiSysCfg::get_string_prop(self.api, resource, properties::PRODUCT_NAME).ok_or_else(
-                || NimonError::Connection("Failed to read PRODUCT_NAME from resource".to_string()),
-            )?;
+        let product_name = NiSysCfg::get_string_prop(self.api, resource, properties::PRODUCT_NAME)
+            .ok_or_else(|| {
+                NimonError::Connection("Failed to read PRODUCT_NAME from resource".to_string())
+            })?;
 
         // Serial number (string property in current NI versions)
-        let serial_number = NiSysCfg::get_string_prop(self.api, resource, properties::SERIAL_NUMBER)
-            .unwrap_or_default();
+        let serial_number =
+            NiSysCfg::get_string_prop(self.api, resource, properties::SERIAL_NUMBER)
+                .unwrap_or_default();
 
         // NI MAX device name: the first expert's user alias (DAQmx name)
         let alias = NiSysCfg::get_indexed_string_prop(
@@ -494,22 +517,17 @@ impl SysCfgSession {
             0,
         );
 
-        let slot = NiSysCfg::get_int_prop(self.api, resource, properties::SLOT_NUMBER)
+        let slot =
+            NiSysCfg::get_int_prop(self.api, resource, properties::SLOT_NUMBER).filter(|s| *s >= 0);
+        let parent_link =
+            NiSysCfg::get_string_prop(self.api, resource, properties::CONNECTS_TO_LINK_NAME);
+        let num_slots = NiSysCfg::get_int_prop(self.api, resource, properties::NUMBER_OF_SLOTS)
             .filter(|s| *s >= 0);
-        let parent_link = NiSysCfg::get_string_prop(
-            self.api,
-            resource,
-            properties::CONNECTS_TO_LINK_NAME,
-        );
-        let num_slots =
-            NiSysCfg::get_int_prop(self.api, resource, properties::NUMBER_OF_SLOTS)
-                .filter(|s| *s >= 0);
         let is_simulated = NiSysCfg::get_int_prop(self.api, resource, properties::IS_SIMULATED)
             .map(|v| v != 0)
             .unwrap_or(false);
 
-        let ip_address =
-            NiSysCfg::get_string_prop(self.api, resource, properties::TCP_IP_ADDRESS);
+        let ip_address = NiSysCfg::get_string_prop(self.api, resource, properties::TCP_IP_ADDRESS);
         let firmware_version =
             NiSysCfg::get_string_prop(self.api, resource, properties::FIRMWARE_REVISION);
         let is_reachable = NiSysCfg::get_int_prop(self.api, resource, properties::IS_PRESENT)
@@ -600,7 +618,6 @@ impl Drop for SysCfgSession {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

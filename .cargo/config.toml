@@ -1,0 +1,6 @@
+# Workaround for MSVC linker bug (rust-lang/rust#141626, VS 17.14+ / MSVC 14.44+):
+# legacy-mangled symbols from generic-heavy crates (chumsky via lettre) exceed
+# PDB limits and link.exe aborts with `LNK1318: Unexpected PDB error; LIMIT (12)`.
+# The v0 mangler shortens symbol names and keeps PDB generation working.
+[build]
+rustflags = ["-Csymbol-mangling-version=v0"]

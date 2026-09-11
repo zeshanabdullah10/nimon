@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::{DeviceType, HealthStatus, MetricValue};
+use crate::{HealthStatus, MetricValue, PredictionType, Severity};
 
 // ============================================================================
 // Device Messages
@@ -53,6 +53,9 @@ pub struct DeviceStatusUpdate {
     pub metrics: HashMap<String, MetricValue>,
     /// Timestamp
     pub timestamp: DateTime<Utc>,
+    /// True when this update originates from a simulated device
+    #[serde(default)]
+    pub is_simulated: bool,
 }
 
 /// Device alert notification
@@ -64,7 +67,7 @@ pub struct DeviceAlert {
     /// Edge node ID
     pub edge_id: String,
     /// Alert severity
-    pub severity: AlertSeverity,
+    pub severity: Severity,
     /// Alert message
     pub message: String,
     /// Related metric (if any)
@@ -73,15 +76,6 @@ pub struct DeviceAlert {
     pub metric_value: Option<f64>,
     /// Timestamp
     pub timestamp: DateTime<Utc>,
-}
-
-/// Alert severity levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AlertSeverity {
-    Info,
-    Warning,
-    Critical,
 }
 
 // ============================================================================
@@ -117,12 +111,14 @@ pub struct EdgeHeartbeat {
 }
 
 /// Configuration update from hub
-#[derive(Debug, Clone, Message, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Message, Serialize, Deserialize)]
 #[rtype(result = "()")]
 pub struct ConfigUpdate {
-    /// Polling intervals per device type
-    pub poll_intervals: HashMap<DeviceType, u64>,
+    /// Polling interval in seconds applied to the edge sweep
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
     /// Temperature thresholds
+    #[serde(default)]
     pub thresholds: ThresholdConfig,
 }
 
@@ -158,18 +154,29 @@ pub struct ExecuteAction {
     pub parameters: HashMap<String, String>,
 }
 
-/// Types of actions that can be executed
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Types of actions that can be executed (wire + cross-actor family)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionType {
     /// Power cycle the device
     PowerCycle,
-    /// Restart NI services
+    /// Restart OS services on the edge host
     RestartServices,
-    /// Reset driver session
+    /// Reset the driver session
     ResetDriver,
-    /// Run a custom script
+    /// Run a custom script (must be allowlisted edge-side)
     CustomScript,
+}
+
+impl std::fmt::Display for ActionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActionType::PowerCycle => write!(f, "power_cycle"),
+            ActionType::RestartServices => write!(f, "restart_services"),
+            ActionType::ResetDriver => write!(f, "reset_driver"),
+            ActionType::CustomScript => write!(f, "custom_script"),
+        }
+    }
 }
 
 /// Result of an action execution
@@ -183,6 +190,8 @@ pub struct ActionResult {
     pub output: Option<String>,
     /// Error message if failed
     pub error: Option<String>,
+    /// Process exit code (when a process ran)
+    pub exit_code: Option<i32>,
     /// Duration in milliseconds
     pub duration_ms: u64,
 }
@@ -207,19 +216,14 @@ pub struct PredictionResult {
     pub eta_minutes: Option<i32>,
     /// Confidence level
     pub confidence: f64,
+    /// Human-readable reason for the prediction
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Model version identifier
+    #[serde(default)]
+    pub model_version: Option<String>,
     /// Timestamp
     pub timestamp: DateTime<Utc>,
-}
-
-/// Types of predictions
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PredictionType {
-    Overheating,
-    ConnectionFailure,
-    PowerSupplyFailure,
-    BusDegradation,
-    FirmwareIssue,
 }
 
 #[cfg(test)]
@@ -237,6 +241,7 @@ mod tests {
             status: HealthStatus::Healthy,
             metrics,
             timestamp: Utc::now(),
+            is_simulated: false,
         };
 
         let json = serde_json::to_string(&update).unwrap();
@@ -245,6 +250,15 @@ mod tests {
 
         let parsed: DeviceStatusUpdate = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.device_id, "device-1");
+        assert!(!parsed.is_simulated);
+    }
+
+    #[test]
+    fn test_status_update_without_simulated_flag_parses() {
+        // Old edges do not send is_simulated; default must be false
+        let json = r#"{"device_id":"d","edge_id":"e","status":"healthy","metrics":{},"timestamp":"2024-01-01T00:00:00Z"}"#;
+        let parsed: DeviceStatusUpdate = serde_json::from_str(json).unwrap();
+        assert!(!parsed.is_simulated);
     }
 
     #[test]
@@ -259,5 +273,21 @@ mod tests {
         let action = ActionType::PowerCycle;
         let json = serde_json::to_string(&action).unwrap();
         assert_eq!(json, "\"power_cycle\"");
+    }
+
+    #[test]
+    fn test_action_result_roundtrip() {
+        let result = ActionResult {
+            action_id: "a-1".to_string(),
+            success: true,
+            output: Some("done".to_string()),
+            error: None,
+            exit_code: Some(0),
+            duration_ms: 42,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: ActionResult = serde_json::from_str(&json).unwrap();
+        assert!(parsed.success);
+        assert_eq!(parsed.exit_code, Some(0));
     }
 }

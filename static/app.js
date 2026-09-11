@@ -284,7 +284,8 @@ class Dashboard {
         this.seenDevices.add(device.device_id);
 
         const color = temp === null ? 'var(--primary)' :
-            temp >= 75 ? 'var(--error)' :
+            // Severity bands mirror web/src/hooks/nimon.ts (crit > 80, warn >= 65)
+            temp > 80 ? 'var(--error)' :
             temp >= 65 ? 'var(--warning)' : 'var(--primary)';
         const pct = temp === null ? 0 : Math.max(0, Math.min(100, temp));
 

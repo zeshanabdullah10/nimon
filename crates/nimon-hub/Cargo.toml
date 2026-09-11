@@ -9,6 +9,7 @@ license.workspace = true
 nimon-core = { path = "../nimon-core" }
 clap = { version = "4", features = ["derive"] }
 actix = "0.13"
+actix-rt = "2"
 tokio.workspace = true
 axum = { version = "0.7", features = ["ws"] }
 tower = { version = "0.5", features = ["full"] }
@@ -33,3 +34,5 @@ windows = { version = "0.58", features = [
     "Win32_System_Services",
     "Win32_System_Threading",
 ] }
+windows-service = "0.7"
+

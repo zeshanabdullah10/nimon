@@ -43,10 +43,7 @@ impl NiDaqMx {
 
         unsafe {
             let library = Library::new(&dll_path).map_err(|e| {
-                NimonError::Connection(format!(
-                    "Failed to load {:?}: {}",
-                    dll_path, e
-                ))
+                NimonError::Connection(format!("Failed to load {:?}: {}", dll_path, e))
             })?;
 
             let get_sys_dev_names = Self::get_symbol(&library, b"DAQmxGetSysDevNames")?;
@@ -59,8 +56,7 @@ impl NiDaqMx {
             let get_dev_ai_power_supply_voltages =
                 Self::get_symbol(&library, b"DAQmxGetDevAIPowerSupplyVoltages")?;
             let reset_device = Self::get_symbol(&library, b"DAQmxResetDevice")?;
-            let get_dev_product_number =
-                Self::get_symbol(&library, b"DAQmxGetDevProductNumber")?;
+            let get_dev_product_number = Self::get_symbol(&library, b"DAQmxGetDevProductNumber")?;
 
             Ok(Self {
                 library,
@@ -132,11 +128,7 @@ impl NiDaqMx {
             match self.get_device_info(&name) {
                 Ok(device) => devices.push(device),
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to query info for DAQ device '{}': {}",
-                        name,
-                        e
-                    );
+                    tracing::warn!("Failed to query info for DAQ device '{}': {}", name, e);
                 }
             }
         }
@@ -235,9 +227,8 @@ impl NiDaqMx {
 
         // Query product number
         let mut product_number: i32 = 0;
-        let status = unsafe {
-            (self.get_dev_product_number)(dev_cstr.as_ptr(), &mut product_number)
-        };
+        let status =
+            unsafe { (self.get_dev_product_number)(dev_cstr.as_ptr(), &mut product_number) };
         if status == DAQMX_SUCCESS {
             device.product_number = product_number.to_string();
         } else {
@@ -250,9 +241,7 @@ impl NiDaqMx {
 
         // Query serial number
         let mut serial_number: u32 = 0;
-        let status = unsafe {
-            (self.get_dev_serial_num)(dev_cstr.as_ptr(), &mut serial_number)
-        };
+        let status = unsafe { (self.get_dev_serial_num)(dev_cstr.as_ptr(), &mut serial_number) };
         if status == DAQMX_SUCCESS {
             device.serial_number = serial_number.to_string();
         } else {
@@ -378,10 +367,7 @@ mod tests {
     #[test]
     fn test_parse_device_names_pxi_names() {
         let names = parse_device_names("PXI1Slot2,PXI1Slot3,PXI1Slot4");
-        assert_eq!(
-            names,
-            vec!["PXI1Slot2", "PXI1Slot3", "PXI1Slot4"]
-        );
+        assert_eq!(names, vec!["PXI1Slot2", "PXI1Slot3", "PXI1Slot4"]);
     }
 
     #[test]

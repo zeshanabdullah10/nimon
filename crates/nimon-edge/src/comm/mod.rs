@@ -6,10 +6,10 @@
 mod message;
 mod ws_client;
 
-pub use message::{
-    AckMessage, ErrorMessage, PingMessage, PongMessage, WsMessage, WsMessageType,
+pub use message::{AckMessage, ErrorMessage, PingMessage, PongMessage, WsMessage, WsMessageType};
+pub use ws_client::{
+    Connect, ConnectionState, SendWsMessage, WsClient, WsClientConfig, WsClientEvent,
 };
-pub use ws_client::{Connect, ConnectionState, SendWsMessage, WsClient, WsClientConfig, WsClientEvent};
 
 /// Re-exports of commonly used types
 pub mod prelude {

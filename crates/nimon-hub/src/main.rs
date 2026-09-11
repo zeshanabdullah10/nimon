@@ -11,10 +11,17 @@ use tracing_subscriber::FmtSubscriber;
 
 #[derive(clap::Subcommand)]
 enum Commands {
+    /// Register the hub as a Windows service (auto-start)
     Install,
+    /// Remove the Windows service registration
     Uninstall,
+    /// Start the registered Windows service
     Start,
+    /// Stop the running Windows service
     Stop,
+    /// Internal: service entry point used by the SCM (run-service)
+    #[command(hide = true)]
+    RunService,
 }
 
 #[derive(clap::Parser)]
@@ -31,47 +38,58 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .finish();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting default subscriber failed");
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     let cli = Cli::parse();
 
     match &cli.command {
         #[cfg(windows)]
         Some(Commands::Install) => {
-            let exe_path = std::env::current_exe()?.display().to_string();
-            nimon_hub::service::install_service("NIMonHub", "NIMon Hub Server", &exe_path)
+            let cmd_line = nimon_hub::service::service_exe_command_line()
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            println!("Service installed");
+            nimon_hub::service::install_service(
+                nimon_hub::service::SERVICE_NAME,
+                "NIMon Hub Server",
+                &cmd_line,
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            nimon_hub::service::write_default_config_if_missing()
+                .map_err(|e| anyhow::anyhow!("failed to write service config: {}", e))?;
+            println!("Service installed ({})", cmd_line);
             return Ok(());
         }
         #[cfg(windows)]
         Some(Commands::Uninstall) => {
-            nimon_hub::service::uninstall_service("NIMonHub")
+            nimon_hub::service::uninstall_service(nimon_hub::service::SERVICE_NAME)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             println!("Service uninstalled");
             return Ok(());
         }
         #[cfg(windows)]
         Some(Commands::Start) => {
-            nimon_hub::service::start_service("NIMonHub")
+            nimon_hub::service::start_service(nimon_hub::service::SERVICE_NAME)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             println!("Service started");
             return Ok(());
         }
         #[cfg(windows)]
         Some(Commands::Stop) => {
-            nimon_hub::service::stop_service("NIMonHub")
+            nimon_hub::service::stop_service(nimon_hub::service::SERVICE_NAME)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             println!("Service stopped");
             return Ok(());
         }
-        None => {}
+        #[cfg(windows)]
+        Some(Commands::RunService) => {
+            nimon_hub::service::run_as_service().map_err(|e| anyhow::anyhow!("{}", e))?;
+            return Ok(());
+        }
         #[cfg(not(windows))]
-        _ => {
+        Some(_) => {
             eprintln!("Service commands are only available on Windows");
             return Ok(());
         }
+        None => {}
     }
 
     let config_path = cli.config_path.as_ref();
@@ -86,7 +104,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    info!("Starting NIMon Hub Server on {}:{}", config.host, config.port);
+    info!(
+        "Starting NIMon Hub Server on {}:{}",
+        config.host, config.port
+    );
 
     // Actix 0.13 uses tokio::task::spawn_local internally, which requires a LocalSet.
     let local = tokio::task::LocalSet::new();

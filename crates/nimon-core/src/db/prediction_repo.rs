@@ -1,7 +1,7 @@
 //! Repository for prediction operations
 
-use sqlx::SqlitePool;
 use crate::NimonResult;
+use sqlx::SqlitePool;
 
 /// Database record for a prediction
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -40,8 +40,9 @@ impl<'a> PredictionRepository<'a> {
     ) -> NimonResult<i64> {
         let result = sqlx::query(
             r#"
-            INSERT INTO predictions (device_id, edge_id, prediction_type, probability, eta_minutes, model_version, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'active')
+            INSERT INTO predictions (device_id, edge_id, prediction_type, probability,
+                                     eta_minutes, model_version, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
             "#
         )
         .bind(device_id)
@@ -50,9 +51,11 @@ impl<'a> PredictionRepository<'a> {
         .bind(probability)
         .bind(eta_minutes)
         .bind(model_version)
+        // RFC3339 (not SQLite's CURRENT_TIMESTAMP) so RFC3339 cutoff
+        // comparisons in expire_stale/prune order correctly
+        .bind(chrono::Utc::now().to_rfc3339())
         .execute(self.pool)
         .await?;
-
         Ok(result.last_insert_rowid())
     }
 
@@ -70,19 +73,58 @@ impl<'a> PredictionRepository<'a> {
     /// Dismiss a prediction by setting its status to 'dismissed'.
     pub async fn dismiss(&self, prediction_id: i64) -> NimonResult<()> {
         let now = chrono::Utc::now().to_rfc3339();
-        sqlx::query(
-            "UPDATE predictions SET status = 'dismissed', resolved_at = ? WHERE id = ?"
-        )
-        .bind(&now)
-        .bind(prediction_id)
-        .execute(self.pool)
-        .await?;
+        sqlx::query("UPDATE predictions SET status = 'dismissed', resolved_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(prediction_id)
+            .execute(self.pool)
+            .await?;
 
         Ok(())
     }
 
+    /// Resolve a prediction by setting its status to 'resolved'.
+    pub async fn resolve(&self, prediction_id: i64) -> NimonResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query("UPDATE predictions SET status = 'resolved', resolved_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(prediction_id)
+            .execute(self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Expire active predictions that have not been refreshed within the
+    /// given number of minutes (models re-report while a risk persists).
+    pub async fn expire_stale(&self, stale_minutes: i64) -> NimonResult<u64> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(stale_minutes)).to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE predictions SET status = 'resolved', resolved_at = ? \
+             WHERE status = 'active' AND created_at < ?",
+        )
+        .bind(&cutoff)
+        .bind(&cutoff)
+        .execute(self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Prune predictions older than the given number of days.
+    pub async fn prune(&self, older_than_days: i64) -> NimonResult<u64> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(older_than_days)).to_rfc3339();
+        let result = sqlx::query("DELETE FROM predictions WHERE created_at < ?")
+            .bind(&cutoff)
+            .execute(self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     /// List predictions for a specific device, most recent first, up to `limit` rows.
-    pub async fn list_by_device(&self, device_id: &str, limit: i64) -> NimonResult<Vec<PredictionRecord>> {
+    pub async fn list_by_device(
+        &self,
+        device_id: &str,
+        limit: i64,
+    ) -> NimonResult<Vec<PredictionRecord>> {
         let records = sqlx::query_as::<_, PredictionRecord>(
             "SELECT id, device_id, edge_id, prediction_type, probability, eta_minutes, features, model_version, status, created_at, resolved_at FROM predictions WHERE device_id = ? ORDER BY created_at DESC LIMIT ?"
         )
@@ -99,35 +141,42 @@ impl<'a> PredictionRepository<'a> {
 mod tests {
     use super::*;
     use crate::db::create_test_db;
-    use crate::db::edge_repo::EdgeRepository;
     use crate::db::device_repo::DeviceRepository;
-    use crate::{EdgeNode, Device, DeviceType, EdgeStatus};
+    use crate::db::edge_repo::EdgeRepository;
+    use crate::{Device, DeviceType, EdgeNode, EdgeStatus};
 
     async fn setup_test_data(pool: &SqlitePool) {
         let edge_repo = EdgeRepository::new(pool);
-        edge_repo.upsert(&EdgeNode {
-            id: "edge-1".to_string(),
-            name: "Edge 1".to_string(),
-            hostname: None,
-            ip_address: None,
-            last_seen: None,
-            status: EdgeStatus::Online,
-        }).await.unwrap();
+        edge_repo
+            .upsert(&EdgeNode {
+                id: "edge-1".to_string(),
+                name: "Edge 1".to_string(),
+                hostname: None,
+                ip_address: None,
+                last_seen: None,
+                status: EdgeStatus::Online,
+            })
+            .await
+            .unwrap();
 
         let device_repo = DeviceRepository::new(pool);
-        device_repo.upsert(&Device {
-            id: "device-1".to_string(),
-            edge_id: "edge-1".to_string(),
-            device_name: "DAQ-1".to_string(),
-            device_type: DeviceType::Daq,
-            model: None,
-            serial_number: None,
-            firmware_version: None,
-            driver_version: None,
-            ip_address: None,
-            slot: None,
-            chassis: None,
-        }).await.unwrap();
+        device_repo
+            .upsert(&Device {
+                id: "device-1".to_string(),
+                edge_id: "edge-1".to_string(),
+                device_name: "DAQ-1".to_string(),
+                device_type: DeviceType::Daq,
+                model: None,
+                serial_number: None,
+                firmware_version: None,
+                driver_version: None,
+                ip_address: None,
+                slot: None,
+                chassis: None,
+                is_simulated: false,
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -136,14 +185,17 @@ mod tests {
         setup_test_data(&pool).await;
         let repo = PredictionRepository::new(&pool);
 
-        let id = repo.insert(
-            "device-1",
-            "edge-1",
-            "failure_prediction",
-            0.85,
-            Some(120),
-            Some("v1.0.0"),
-        ).await.unwrap();
+        let id = repo
+            .insert(
+                "device-1",
+                "edge-1",
+                "failure_prediction",
+                0.85,
+                Some(120),
+                Some("v1.0.0"),
+            )
+            .await
+            .unwrap();
 
         assert!(id > 0);
 
@@ -162,14 +214,10 @@ mod tests {
         setup_test_data(&pool).await;
         let repo = PredictionRepository::new(&pool);
 
-        let id = repo.insert(
-            "device-1",
-            "edge-1",
-            "maintenance_needed",
-            0.6,
-            None,
-            None,
-        ).await.unwrap();
+        let id = repo
+            .insert("device-1", "edge-1", "maintenance_needed", 0.6, None, None)
+            .await
+            .unwrap();
 
         repo.dismiss(id).await.unwrap();
 
@@ -183,8 +231,12 @@ mod tests {
         setup_test_data(&pool).await;
         let repo = PredictionRepository::new(&pool);
 
-        repo.insert("device-1", "edge-1", "type_a", 0.5, Some(30), None).await.unwrap();
-        repo.insert("device-1", "edge-1", "type_b", 0.9, Some(60), None).await.unwrap();
+        repo.insert("device-1", "edge-1", "type_a", 0.5, Some(30), None)
+            .await
+            .unwrap();
+        repo.insert("device-1", "edge-1", "type_b", 0.9, Some(60), None)
+            .await
+            .unwrap();
 
         let device_preds = repo.list_by_device("device-1", 10).await.unwrap();
         assert_eq!(device_preds.len(), 2);
@@ -198,15 +250,49 @@ mod tests {
 
         for i in 0..5 {
             repo.insert(
-                "device-1", "edge-1",
+                "device-1",
+                "edge-1",
                 &format!("pred_{}", i),
                 0.1 * (i as f64),
                 Some(i * 10),
                 None,
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
         }
 
         let limited = repo.list_by_device("device-1", 2).await.unwrap();
         assert_eq!(limited.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_expire_stale_respects_rfc3339_timestamps() {
+        let pool = create_test_db().await;
+        let repo = PredictionRepository::new(&pool);
+
+        let id = repo
+            .insert("device-1", "edge-1", "overheating", 0.9, Some(30), None)
+            .await
+            .unwrap();
+
+        // Fresh prediction must NOT be expired by a 60-minute window
+        // (regression: SQLite CURRENT_TIMESTAMP ('2026-09-11 14:11:49')
+        // string-sorts before RFC3339 ('2026-09-11T13:12:00+00:00'),
+        // making every row instantly "stale").
+        repo.expire_stale(60).await.unwrap();
+        let active = repo.list_active().await.unwrap();
+        assert_eq!(active.len(), 1, "fresh prediction must stay active");
+
+        // Backdate beyond the window; now it must expire
+        let old = (chrono::Utc::now() - chrono::Duration::minutes(120)).to_rfc3339();
+        sqlx::query("UPDATE predictions SET created_at = ? WHERE id = ?")
+            .bind(&old)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let expired = repo.expire_stale(60).await.unwrap();
+        assert_eq!(expired, 1);
+        assert!(repo.list_active().await.unwrap().is_empty());
     }
 }

@@ -1,85 +1,291 @@
 //! Windows Service support for nimon-hub
+//!
+//! `nimon-hub install` registers the executable with the SCM using the
+//! `run-service` argument; the SCM launches it as
+//! `nimon-hub.exe run-service`, which dispatches into `run_as_service`
+//! (no interactive-fallback ambiguity). The other subcommands manage the
+//! registration and lifecycle.
 
-#[cfg(windows)]
-use windows::Win32::System::Services::*;
+/// Name used for SCM registration and dispatch
+pub const SERVICE_NAME: &str = "NIMonHub";
 
-#[cfg(windows)]
-pub fn run_as_service() -> Result<(), Box<dyn std::error::Error>> {
-    Ok(())
+/// A sensible config template written next to the exe on install when
+/// no config exists yet.
+pub fn default_config_yaml() -> &'static str {
+    r#"# nimon-hub service configuration
+host: "0.0.0.0"
+port: 8080
+database_path: "data/nimon.db"
+
+alert:
+  default_cooldown_minutes: 5
+  max_firing_count: 100
+  cleanup_interval_hours: 24
+"#
 }
 
 #[cfg(windows)]
-pub fn install_service(service_name: &str, display_name: &str, exe_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        let sc_manager = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)?;
-        let exe_path_wide: Vec<u16> = exe_path.encode_utf16().chain(std::iter::once(0)).collect();
-        let service_name_wide: Vec<u16> = service_name.encode_utf16().chain(std::iter::once(0)).collect();
-        let display_name_wide: Vec<u16> = display_name.encode_utf16().chain(std::iter::once(0)).collect();
+pub use windows_impl::{
+    install_service, run_as_service, service_exe_command_line, start_service, stop_service,
+    uninstall_service, write_default_config_if_missing,
+};
 
-        let handle = CreateServiceW(
-            sc_manager,
-            windows::core::PCWSTR::from_raw(service_name_wide.as_ptr()),
-            windows::core::PCWSTR::from_raw(display_name_wide.as_ptr()),
-            SERVICE_ALL_ACCESS,
-            SERVICE_WIN32_OWN_PROCESS,
-            SERVICE_AUTO_START,
-            SERVICE_ERROR_NORMAL,
-            windows::core::PCWSTR::from_raw(exe_path_wide.as_ptr()),
-            None,
-            None,
-            None,
-            None,
-            None,
+#[cfg(windows)]
+mod windows_impl {
+    use std::path::PathBuf;
+
+    use windows::Win32::System::Services::*;
+    use windows_service::{
+        define_windows_service,
+        service::{
+            ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+            ServiceType,
+        },
+        service_control_handler::{self, ServiceControlHandlerResult},
+        service_dispatcher,
+    };
+
+    use super::{default_config_yaml, SERVICE_NAME};
+
+    pub fn install_service(
+        service_name: &str,
+        display_name: &str,
+        exe_command_line: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            let sc_manager = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)?;
+            let exe_path_wide: Vec<u16> = exe_command_line
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let service_name_wide: Vec<u16> = service_name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let display_name_wide: Vec<u16> = display_name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let handle = CreateServiceW(
+                sc_manager,
+                windows::core::PCWSTR::from_raw(service_name_wide.as_ptr()),
+                windows::core::PCWSTR::from_raw(display_name_wide.as_ptr()),
+                SERVICE_ALL_ACCESS,
+                SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_AUTO_START,
+                SERVICE_ERROR_NORMAL,
+                windows::core::PCWSTR::from_raw(exe_path_wide.as_ptr()),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+
+            CloseServiceHandle(handle)?;
+            CloseServiceHandle(sc_manager)?;
+        }
+        Ok(())
+    }
+
+    pub fn uninstall_service(service_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            let sc_manager = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)?;
+            let service_name_wide: Vec<u16> = service_name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let handle = OpenServiceW(
+                sc_manager,
+                windows::core::PCWSTR::from_raw(service_name_wide.as_ptr()),
+                0x00010000, // DELETE
+            )?;
+            DeleteService(handle)?;
+            CloseServiceHandle(handle)?;
+            CloseServiceHandle(sc_manager)?;
+        }
+        Ok(())
+    }
+
+    pub fn start_service(service_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            let sc_manager = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)?;
+            let service_name_wide: Vec<u16> = service_name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let handle = OpenServiceW(
+                sc_manager,
+                windows::core::PCWSTR::from_raw(service_name_wide.as_ptr()),
+                SERVICE_ALL_ACCESS,
+            )?;
+            StartServiceW(handle, None)?;
+            CloseServiceHandle(handle)?;
+            CloseServiceHandle(sc_manager)?;
+        }
+        Ok(())
+    }
+
+    pub fn stop_service(service_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            let sc_manager = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)?;
+            let service_name_wide: Vec<u16> = service_name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let handle = OpenServiceW(
+                sc_manager,
+                windows::core::PCWSTR::from_raw(service_name_wide.as_ptr()),
+                SERVICE_ALL_ACCESS,
+            )?;
+            let mut status = SERVICE_STATUS::default();
+            ControlService(handle, SERVICE_CONTROL_STOP, &mut status)?;
+            CloseServiceHandle(handle)?;
+            CloseServiceHandle(sc_manager)?;
+        }
+        Ok(())
+    }
+
+    /// Binary path registered with the SCM: the exe plus the internal
+    /// `run-service` argument.
+    pub fn service_exe_command_line() -> Result<String, Box<dyn std::error::Error>> {
+        let exe = std::env::current_exe()?;
+        Ok(format!("{} run-service", exe.display()))
+    }
+
+    /// Persist a config template next to the exe when none exists
+    /// (services run with CWD = System32, so the config must be located
+    /// relative to the binary).
+    pub fn write_default_config_if_missing() -> std::io::Result<()> {
+        let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(PathBuf::from))
+        else {
+            return Ok(());
+        };
+        let cfg_dir = dir.join("config");
+        let cfg_path = cfg_dir.join("hub.yaml");
+        if !cfg_path.exists() {
+            std::fs::create_dir_all(&cfg_dir)?;
+            std::fs::write(&cfg_path, default_config_yaml())?;
+        }
+        Ok(())
+    }
+
+    // ====================================================================
+    // Service entry point
+    // ====================================================================
+
+    define_windows_service!(ffi_service_main, service_main);
+
+    fn service_main(_args: Vec<std::ffi::OsString>) {
+        if let Err(e) = run_service() {
+            eprintln!("nimon-hub service failed: {}", e);
+        }
+    }
+
+    fn set_status(
+        handle: &service_control_handler::ServiceStatusHandle,
+        state: ServiceState,
+        wait_hint: Duration,
+        checkpoint: u32,
+    ) -> windows_service::Result<()> {
+        handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: if state == ServiceState::Running {
+                ServiceControlAccept::STOP
+            } else {
+                ServiceControlAccept::empty()
+            },
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint,
+            wait_hint,
+            process_id: None,
+        })
+    }
+
+    use std::time::Duration;
+
+    fn run_service() -> windows_service::Result<()> {
+        // Resolve config relative to the executable: services start with
+        // CWD set to System32.
+        let config_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(PathBuf::from))
+            .map(|dir| dir.join("config").join("hub.yaml"))
+            .unwrap_or_else(|| PathBuf::from("config/hub.yaml"));
+        let config = crate::config::HubConfig::load_or_default(&config_path)
+            .map_err(|e| windows_service::Error::Winapi(std::io::Error::other(e.to_string())))?;
+
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+        let handler = move |control: ServiceControl| -> ServiceControlHandlerResult {
+            match control {
+                ServiceControl::Stop | ServiceControl::Shutdown => {
+                    let _ = stop_tx.send(());
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        };
+
+        let status_handle = service_control_handler::register(SERVICE_NAME, handler)?;
+        set_status(
+            &status_handle,
+            ServiceState::Running,
+            Duration::from_secs(30),
+            0,
         )?;
 
-        CloseServiceHandle(handle)?;
-        CloseServiceHandle(sc_manager)?;
-    }
-    Ok(())
-}
+        // Run the hub (tokio + actix LocalSet) on a dedicated thread and
+        // wait for either completion or a stop request.
+        let worker = std::thread::spawn(move || {
+            let runtime = actix_rt::System::new();
+            runtime.block_on(async move {
+                let local = tokio::task::LocalSet::new();
+                local
+                    .run_until(async {
+                        let shutdown = async move {
+                            let _ = stop_rx.recv();
+                        };
+                        let _ = crate::run_with_shutdown(config, shutdown).await;
+                    })
+                    .await;
+            });
+        });
 
-#[cfg(windows)]
-pub fn uninstall_service(service_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        let sc_manager = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)?;
-        let service_name_wide: Vec<u16> = service_name.encode_utf16().chain(std::iter::once(0)).collect();
-        let handle = OpenServiceW(sc_manager, windows::core::PCWSTR::from_raw(service_name_wide.as_ptr()), 0x00010000)?;
-        DeleteService(handle)?;
-        CloseServiceHandle(handle)?;
-        CloseServiceHandle(sc_manager)?;
-    }
-    Ok(())
-}
+        while !worker.is_finished() {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let _ = worker.join();
 
-#[cfg(windows)]
-pub fn start_service(service_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        let sc_manager = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)?;
-        let service_name_wide: Vec<u16> = service_name.encode_utf16().chain(std::iter::once(0)).collect();
-        let handle = OpenServiceW(sc_manager, windows::core::PCWSTR::from_raw(service_name_wide.as_ptr()), SERVICE_ALL_ACCESS)?;
-        StartServiceW(handle, None)?;
-        CloseServiceHandle(handle)?;
-        CloseServiceHandle(sc_manager)?;
+        set_status(
+            &status_handle,
+            ServiceState::Stopped,
+            Duration::from_secs(1),
+            1,
+        )?;
+        Ok(())
     }
-    Ok(())
-}
 
-#[cfg(windows)]
-pub fn stop_service(service_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        let sc_manager = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)?;
-        let service_name_wide: Vec<u16> = service_name.encode_utf16().chain(std::iter::once(0)).collect();
-        let handle = OpenServiceW(sc_manager, windows::core::PCWSTR::from_raw(service_name_wide.as_ptr()), SERVICE_ALL_ACCESS)?;
-        let mut status = SERVICE_STATUS::default();
-        ControlService(handle, SERVICE_CONTROL_STOP, &mut status)?;
-        CloseServiceHandle(handle)?;
-        CloseServiceHandle(sc_manager)?;
+    /// Dispatch the process as the NIMonHub service. Blocks until the
+    /// service is stopped. Only call when the process was launched by the
+    /// SCM (the `run-service` subcommand guarantees this).
+    pub fn run_as_service() -> Result<(), Box<dyn std::error::Error>> {
+        service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+            .map_err(|e| format!("Service dispatch failed: {}", e).into())
     }
-    Ok(())
 }
 
 #[cfg(not(windows))]
-pub fn install_service(_service_name: &str, _display_name: &str, _exe_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn install_service(
+    _service_name: &str,
+    _display_name: &str,
+    _exe_command_line: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     Err("Windows service support is only available on Windows".into())
 }
 

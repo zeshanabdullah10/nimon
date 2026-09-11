@@ -18,6 +18,7 @@
 //! println!("Edge node: {} ({})", config.node.name, config.node.id);
 //! ```
 
+pub mod action;
 pub mod actor;
 pub mod comm;
 pub mod config;
@@ -32,8 +33,10 @@ pub use config::EdgeConfig;
 /// system (e.g. `actix_rt::System::new().block_on(start(cfg))`).
 pub async fn start(config: EdgeConfig) {
     use actix::prelude::*;
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::action::ActionRuntime;
     use crate::actor::{
         ConnectionStateChanged, DeviceManagerActor, HubConnectorActor, HubConnectorConfig,
     };
@@ -62,7 +65,9 @@ pub async fn start(config: EdgeConfig) {
     let ws_addr = ws_client.start();
 
     // Hub connector: registration, heartbeat, message buffering
-    let hostname = std::env::var("COMPUTERNAME").ok();
+    let hostname = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok();
     let hub_config = HubConnectorConfig {
         hub_url,
         edge_id: config.node.id.clone(),
@@ -71,6 +76,11 @@ pub async fn start(config: EdgeConfig) {
         ip_address: None,
         heartbeat_interval: Duration::from_secs(30),
         auto_connect: false,
+        action_runtime: Arc::new(ActionRuntime {
+            allowed_scripts: config.action.allowed_scripts.clone(),
+            scripts_dir: std::path::PathBuf::from(&config.action.scripts_dir),
+            timeout_secs: config.action.timeout_secs,
+        }),
     };
     let hub_addr = HubConnectorActor::new(hub_config, ws_addr.clone()).start();
 
@@ -107,8 +117,17 @@ pub async fn start(config: EdgeConfig) {
     // NI-SysCfg (falls back to simulated devices when unavailable).
     let manager = DeviceManagerActor::new(config.node.id.clone())
         .with_poll_interval(config.api.syscfg.poll_interval_secs)
-        .with_hub_connector(hub_addr);
-    manager.start();
+        .with_hub_connector(hub_addr.clone())
+        .with_count_subscriber(hub_addr.clone().recipient());
+    let manager_addr = manager.start();
+
+    // Hub pushes config updates down through the connector
+    hub_addr
+        .send(crate::actor::AttachDeviceManager {
+            manager: manager_addr.clone(),
+        })
+        .await
+        .ok();
 
     info!(
         "Edge node running - polling every {}s, hub at {}",

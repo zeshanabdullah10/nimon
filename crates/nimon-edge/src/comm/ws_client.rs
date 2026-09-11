@@ -9,10 +9,7 @@ use std::time::Duration;
 use actix::prelude::*;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::protocol::Message as WsProtoMessage,
-};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsProtoMessage};
 use tracing::{debug, error, info, warn};
 
 use super::message::WsMessage;
@@ -129,12 +126,17 @@ impl WsClient {
         drop(state);
 
         // Send through channel to connection task
-        let json = msg.to_json().map_err(|e| NimonError::Connection(e.to_string()))?;
+        let json = msg
+            .to_json()
+            .map_err(|e| NimonError::Connection(e.to_string()))?;
         let tx_guard = self.send_tx.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(ref tx) = *tx_guard {
-            tx.send(json).map_err(|e| NimonError::Connection(e.to_string()))?;
+            tx.send(json)
+                .map_err(|e| NimonError::Connection(e.to_string()))?;
         } else {
-            return Err(NimonError::Connection("No send channel available".to_string()));
+            return Err(NimonError::Connection(
+                "No send channel available".to_string(),
+            ));
         }
         Ok(())
     }
@@ -162,6 +164,7 @@ impl WsClient {
                 let conn_config = self.config.clone();
                 let conn_state = state.clone();
                 let conn_send_tx = self.send_tx.clone();
+                let conn_buffer = self.message_buffer.clone();
                 tokio::spawn(async move {
                     Self::handle_connection(
                         ws_stream,
@@ -171,6 +174,7 @@ impl WsClient {
                         conn_config,
                         conn_state,
                         conn_send_tx,
+                        conn_buffer,
                     )
                     .await;
                 });
@@ -193,6 +197,7 @@ impl WsClient {
                         state.clone(),
                         self.send_tx.clone(),
                         self.event_tx.clone(),
+                        self.message_buffer.clone(),
                     ));
                 }
 
@@ -221,6 +226,7 @@ impl WsClient {
     /// that a connection which was once established keeps retrying — the
     /// initial-connect-failure path is not the only place reconnection can
     /// be triggered from.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_connection(
         ws_stream: tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -231,10 +237,10 @@ impl WsClient {
         config: WsClientConfig,
         state: Arc<tokio::sync::RwLock<ConnectionState>>,
         send_tx_shared: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
+        message_buffer: Arc<tokio::sync::Mutex<Vec<WsMessage>>>,
     ) {
         let (mut write, mut read) = ws_stream.split();
-        let ping_interval = Duration::from_secs(30);
-        let mut ping_interval_tokio = tokio::time::interval(ping_interval);
+        let mut ping_interval_tokio = tokio::time::interval(config.ping_interval);
         let mut shutdown_requested = false;
 
         loop {
@@ -294,7 +300,13 @@ impl WsClient {
 
         if !shutdown_requested && config.auto_reconnect {
             *state.write().await = ConnectionState::Reconnecting;
-            tokio::spawn(Self::reconnect_task(config, state, send_tx_shared, event_tx));
+            tokio::spawn(Self::reconnect_task(
+                config,
+                state,
+                send_tx_shared,
+                event_tx,
+                message_buffer,
+            ));
         }
     }
 
@@ -312,8 +324,15 @@ impl WsClient {
         state: Arc<tokio::sync::RwLock<ConnectionState>>,
         send_tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
         event_tx: mpsc::UnboundedSender<WsClientEvent>,
+        message_buffer: Arc<tokio::sync::Mutex<Vec<WsMessage>>>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
-        Box::pin(Self::reconnect_task_inner(config, state, send_tx, event_tx))
+        Box::pin(Self::reconnect_task_inner(
+            config,
+            state,
+            send_tx,
+            event_tx,
+            message_buffer,
+        ))
     }
 
     async fn reconnect_task_inner(
@@ -321,6 +340,7 @@ impl WsClient {
         state: Arc<tokio::sync::RwLock<ConnectionState>>,
         send_tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>>,
         event_tx: mpsc::UnboundedSender<WsClientEvent>,
+        message_buffer: Arc<tokio::sync::Mutex<Vec<WsMessage>>>,
     ) {
         let mut attempts = 0;
 
@@ -342,11 +362,29 @@ impl WsClient {
                     let (new_send_tx, outgoing_rx) = mpsc::unbounded_channel();
 
                     // Update the shared send_tx so the actor can send messages again
-                    *send_tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_send_tx);
+                    *send_tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_send_tx.clone());
+
+                    // Drain messages buffered while offline through the new
+                    // channel so they reach the hub after reconnection
+                    {
+                        let mut buffer = message_buffer.lock().await;
+                        if !buffer.is_empty() {
+                            info!("Sending {} buffered messages", buffer.len());
+                            for msg in buffer.drain(..) {
+                                if let Ok(json) = msg.to_json() {
+                                    if new_send_tx.send(json).is_err() {
+                                        error!("Failed to send buffered message after reconnect");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     let conn_config = config.clone();
                     let conn_state = state.clone();
                     let conn_send_tx = send_tx.clone();
+                    let conn_buffer = message_buffer.clone();
                     tokio::spawn(async move {
                         Self::handle_connection(
                             ws_stream,
@@ -356,6 +394,7 @@ impl WsClient {
                             conn_config,
                             conn_state,
                             conn_send_tx,
+                            conn_buffer,
                         )
                         .await;
                     });
@@ -445,6 +484,7 @@ impl Handler<Connect> for WsClient {
                     let conn_config = config_for_reconnect.clone();
                     let conn_state = state.clone();
                     let conn_send_tx = send_tx_shared.clone();
+                    let conn_buffer = message_buffer.clone();
                     tokio::spawn(async move {
                         Self::handle_connection(
                             ws_stream,
@@ -454,6 +494,7 @@ impl Handler<Connect> for WsClient {
                             conn_config,
                             conn_state,
                             conn_send_tx,
+                            conn_buffer,
                         )
                         .await;
                     });
@@ -489,6 +530,7 @@ impl Handler<Connect> for WsClient {
                             state,
                             Arc::clone(&send_tx_shared),
                             event_tx_for_reconnect,
+                            message_buffer,
                         ));
                     }
 
@@ -529,10 +571,7 @@ impl Handler<SendWsMessage> for WsClient {
         let client = self.clone();
         let message = msg.message;
 
-        let fut = async move {
-            client.send(message).await
-        }
-        .into_actor(self);
+        let fut = async move { client.send(message).await }.into_actor(self);
 
         Box::pin(fut)
     }
@@ -565,10 +604,7 @@ mod tests {
 
     #[test]
     fn test_connection_state() {
-        assert_ne!(
-            ConnectionState::Connected,
-            ConnectionState::Disconnected
-        );
+        assert_ne!(ConnectionState::Connected, ConnectionState::Disconnected);
     }
 
     #[test]

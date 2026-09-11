@@ -1,9 +1,38 @@
 //! Alert rule evaluation logic
 
-use crate::{HealthStatus, MetricValue};
+use crate::{HealthStatus, MetricValue, Severity};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// A self-healing action attached to a rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ActionRef {
+    /// Run a script on the hub host
+    Script {
+        script: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+    /// Restart an OS service on the hub host
+    RestartService { service_name: String },
+    /// Power-cycle the device (executed on the edge)
+    PowerCycle {
+        #[serde(default)]
+        delay_secs: Option<u64>,
+    },
+    /// Send a command to the edge node attached to the device
+    EdgeCommand {
+        command: String,
+        #[serde(default)]
+        parameters: HashMap<String, String>,
+    },
+    /// Run an allowlisted script on the edge node attached to the device
+    CustomScript { script: String },
+}
 
 /// An alert rule configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,11 +41,17 @@ pub struct AlertRule {
     pub name: String,
     pub description: String,
     pub enabled: bool,
-    pub severity: crate::alert::AlertSeverity,
+    pub severity: Severity,
     pub condition: RuleCondition,
     pub cooldown_minutes: i32,
     pub notification_channels: Vec<String>,
     pub suppress_repeat: bool,
+    /// Cap on simultaneously active alerts for this rule (suppression beyond)
+    #[serde(default)]
+    pub max_firing_count: Option<i32>,
+    /// Self-healing action dispatched when the rule fires
+    #[serde(default)]
+    pub action: Option<ActionRef>,
 }
 
 /// Rule conditions for triggering alerts
@@ -128,17 +163,15 @@ impl RuleCondition {
                 prediction_type,
                 min_probability,
                 max_eta_minutes,
-            } => {
-                ctx.predictions.iter().any(|p| {
-                    p.prediction_type == *prediction_type
-                        && p.probability >= *min_probability
-                        && match (&max_eta_minutes, &p.eta_minutes) {
-                            (Some(max), Some(eta)) => eta <= max,
-                            (Some(_), None) => false,
-                            _ => true,
-                        }
-                })
-            }
+            } => ctx.predictions.iter().any(|p| {
+                p.prediction_type == *prediction_type
+                    && p.probability >= *min_probability
+                    && match (&max_eta_minutes, &p.eta_minutes) {
+                        (Some(max), Some(eta)) => eta <= max,
+                        (Some(_), None) => false,
+                        _ => true,
+                    }
+            }),
             RuleCondition::DeviceOffline {
                 max_minutes_since_poll,
             } => {
@@ -147,12 +180,13 @@ impl RuleCondition {
                 ctx.current_status == HealthStatus::Offline
                     || minutes_since_poll > *max_minutes_since_poll as i64
             }
-            RuleCondition::Composite { operator, conditions } => {
-                match operator {
-                    LogicalOp::And => conditions.iter().all(|c| c.evaluate(ctx)),
-                    LogicalOp::Or => conditions.iter().any(|c| c.evaluate(ctx)),
-                }
-            }
+            RuleCondition::Composite {
+                operator,
+                conditions,
+            } => match operator {
+                LogicalOp::And => conditions.iter().all(|c| c.evaluate(ctx)),
+                LogicalOp::Or => conditions.iter().any(|c| c.evaluate(ctx)),
+            },
         }
     }
 }
@@ -173,7 +207,7 @@ impl ComparisonOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alert::AlertSeverity;
+    use crate::Severity;
     use std::collections::HashMap;
 
     fn create_test_context() -> EvaluationContext {
@@ -200,7 +234,7 @@ mod tests {
             name: "High Temperature".to_string(),
             description: "Temperature exceeds threshold".to_string(),
             enabled: true,
-            severity: AlertSeverity::Critical,
+            severity: Severity::Critical,
             condition: RuleCondition::MetricThreshold {
                 metric_name: "temperature".to_string(),
                 operator: ComparisonOp::GreaterThan,
@@ -210,6 +244,8 @@ mod tests {
             cooldown_minutes: 5,
             notification_channels: vec![],
             suppress_repeat: false,
+            max_firing_count: None,
+            action: None,
         };
 
         let ctx = create_test_context();
@@ -223,7 +259,7 @@ mod tests {
             name: "Low CPU".to_string(),
             description: "CPU usage below threshold".to_string(),
             enabled: true,
-            severity: AlertSeverity::Info,
+            severity: Severity::Info,
             condition: RuleCondition::MetricThreshold {
                 metric_name: "cpu_usage".to_string(),
                 operator: ComparisonOp::LessThan,
@@ -233,6 +269,8 @@ mod tests {
             cooldown_minutes: 5,
             notification_channels: vec![],
             suppress_repeat: false,
+            max_firing_count: None,
+            action: None,
         };
 
         let ctx = create_test_context();
@@ -246,7 +284,7 @@ mod tests {
             name: "Status Changed".to_string(),
             description: "Device status changed".to_string(),
             enabled: true,
-            severity: AlertSeverity::Warning,
+            severity: Severity::Warning,
             condition: RuleCondition::HealthStatusChange {
                 from: Some(HealthStatus::Healthy),
                 to: HealthStatus::Error,
@@ -254,6 +292,8 @@ mod tests {
             cooldown_minutes: 5,
             notification_channels: vec![],
             suppress_repeat: false,
+            max_firing_count: None,
+            action: None,
         };
 
         let mut ctx = create_test_context();
@@ -270,7 +310,7 @@ mod tests {
             name: "Disabled Rule".to_string(),
             description: "This rule is disabled".to_string(),
             enabled: false,
-            severity: AlertSeverity::Warning,
+            severity: Severity::Warning,
             condition: RuleCondition::MetricThreshold {
                 metric_name: "temperature".to_string(),
                 operator: ComparisonOp::GreaterThan,
@@ -280,6 +320,8 @@ mod tests {
             cooldown_minutes: 5,
             notification_channels: vec![],
             suppress_repeat: false,
+            max_firing_count: None,
+            action: None,
         };
 
         let ctx = create_test_context();

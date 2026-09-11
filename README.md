@@ -181,7 +181,8 @@ alert:
 <summary><b>Alert rules</b></summary>
 
 ```yaml
-rules:
+alert:
+  rules:
   - name: "High Temperature"
     severity: "critical"            # info | warning | critical
     condition:
@@ -191,15 +192,34 @@ rules:
         comparison: "greater_than"  # gt lt eq ne ge le
     cooldown_minutes: 5
     notification_channels: ["slack-ops"]
+    action:                         # optional self-healing action
+      type: power_cycle             # script | restart_service | power_cycle | edge_command | custom_script
+      delay_secs: 5
 
   - name: "Device Offline"
     severity: "warning"
     condition:
       DeviceOffline:
         max_minutes_since_poll: 10
+
+  - name: "Hot and degrading"
+    condition:
+      Composite:
+        op: "and"                   # and | or
+        conditions:
+          - MetricThreshold:
+              metric: "temperature"
+              threshold: 60.0
+          - DeviceOffline:
+              max_minutes_since_poll: 3
 ```
 
-Condition types: `MetricThreshold`, `DeviceOffline`, `HealthStatusChange`.
+Condition types: `MetricThreshold` (flat or nested — both accepted),
+`DeviceOffline`, `HealthStatusChange`, `Prediction`, `Composite`.
+Actions run on the hub (`script`, `restart_service`) or route to the
+owning edge over the WebSocket (`power_cycle`, `edge_command`,
+`custom_script`), with retries/backoff and results recorded in
+`action_history` and on the alert.
 
 </details>
 
@@ -207,7 +227,8 @@ Condition types: `MetricThreshold`, `DeviceOffline`, `HealthStatusChange`.
 <summary><b>Notification channels</b></summary>
 
 ```yaml
-notification_channels:
+alert:
+  notification_channels:
   - channel_type: "console"
     enabled: true
   - channel_type: "slack"
@@ -216,12 +237,22 @@ notification_channels:
     webhook_url: "https://outlook.office.com/webhook/XXX"
   - channel_type: "webhook"
     webhook_url: "https://example.com/webhook"
+    headers:
+      - ["X-Token", "abc"]
   - channel_type: "email"
+    name: "ops-mail"                # rule.notification_channels refers to this
     smtp_server: "smtp.example.com"
     smtp_port: 587
+    smtp_username: "nimon@example.com"  # NIMON_SMTP_USER env overrides
+    smtp_password: "secret"             # NIMON_SMTP_PASSWORD env overrides
     from_addr: "nimon@example.com"
     to_addrs: ["ops@example.com"]
 ```
+
+A built-in console channel is always active, so alerts are never lost
+even with no channels configured. Rule routing: a rule's
+`notification_channels` selects channels by `name` (or id); rules with
+no channels notify all enabled channels.
 
 </details>
 
@@ -242,23 +273,33 @@ api:
 prediction:
   temperature_warning: 65
   temperature_critical: 75
+
+action:                       # hub-requested remediation
+  allowed_scripts: []         # CustomScript allowlist (scripts_dir)
+  scripts_dir: "./scripts"
+  timeout_secs: 120
 ```
+
+The hub pushes desired state (`poll_interval_secs`, temperature
+thresholds) to edges on registration and at runtime via
+`POST /api/v1/edges/:id/config`, overriding local YAML until restart.
 
 ## REST API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check + connected edge count |
-| `/` | GET | Web dashboard |
+| `/` | GET | Web dashboard (embedded single-file build) |
 | `/api/v1/status` | GET | Connected edges and device counts |
-| `/api/v1/edges` | GET | List edges |
-| `/api/v1/edges/:id` | GET | Edge details |
-| `/api/v1/edges/:id/devices` | GET | Live device states (names, slots, metrics) |
-| `/api/v1/alerts` | GET | Active alerts |
+| `/api/v1/edges` | GET | Live sessions + offline edges from the database |
+| `/api/v1/edges/:id` | GET | Edge details (live or last-known) |
+| `/api/v1/edges/:id/devices` | GET | Live device states; last-known when offline |
+| `/api/v1/edges/:id/config` | POST | Push desired-state config to a connected edge |
+| `/api/v1/alerts` | GET | Open (unresolved) alerts |
 | `/api/v1/alerts/history` | GET | History (`?limit=100&severity=critical`) |
-| `/api/v1/alerts/:id/acknowledge` | POST | Acknowledge an alert |
+| `/api/v1/alerts/:id/acknowledge` | POST | Acknowledge (resolve) an alert |
 | `/api/v1/predictions` | GET | Active predictions |
-| `/ws` | GET | Edge WebSocket (versioned JSON, heartbeat, ack/error) |
+| `/ws` | GET | Edge WebSocket (versioned JSON, heartbeat, ack/error, `execute_action`, `action_result`, `config_update`) |
 
 ## CLI
 
@@ -301,11 +342,16 @@ journalctl -u nimon-hub -f
 **Windows**
 
 ```bat
-nimon-hub.exe install     :: as Administrator
+nimon-hub.exe install     :: as Administrator; writes config\hub.yaml next to the exe
 nimon-hub.exe start
 nimon-hub.exe stop
 nimon-hub.exe uninstall
 ```
+
+The service registers `nimon-hub.exe run-service` with the SCM. It
+resolves its config relative to the executable (services start in
+`System32`), reports Running/Stopped transitions, and shuts down
+gracefully on `net stop`.
 
 </details>
 

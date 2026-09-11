@@ -22,8 +22,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl,
-    WebviewWindowBuilder,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder,
 };
 
 /* window geometry (logical px; converted via monitor scale) */
@@ -45,11 +44,7 @@ fn probe_hub(base: &str) -> bool {
 /// Shared keep-alive HTTP agent (avoids a fresh TCP connection per poll)
 fn http_agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .max_idle_connections(2)
-            .build()
-    })
+    AGENT.get_or_init(|| ureq::AgentBuilder::new().max_idle_connections(2).build())
 }
 
 /// Passive add-on: run below normal priority so test station software wins
@@ -122,8 +117,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let flag = |name: &str| args.iter().any(|a| a == name);
     let opt = |name: &str| {
-        args.iter().position(|a| a == name)
-            .and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
 
     let port: u16 = opt("--port").and_then(|v| v.parse().ok()).unwrap_or(9090);
@@ -144,19 +141,21 @@ fn main() {
         std::thread::Builder::new()
             .name("nimon-hub".into())
             .spawn(move || {
-                // 1 worker: the hub is nearly idle (a few timers + rare HTTP)
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .build()
-                    .expect("hub runtime");
-                let local = tokio::task::LocalSet::new();
-                local.block_on(&rt, async move {
-                    let config = load_hub_config(&root, port);
-                    tracing::info!("hub on {}:{}", config.host, config.port);
-                    if let Err(e) = nimon_hub::run(config).await {
-                        tracing::error!("hub stopped: {}", e);
-                    }
+                // Actix 0.13 actor timers/spawns require an actix System
+                // (which provides the tokio reactor + LocalSet context);
+                // a bare tokio runtime panics with "no reactor running".
+                let system = actix_rt::System::new();
+                system.block_on(async move {
+                    let local = tokio::task::LocalSet::new();
+                    local
+                        .run_until(async move {
+                            let config = load_hub_config(&root, port);
+                            tracing::info!("hub on {}:{}", config.host, config.port);
+                            if let Err(e) = nimon_hub::run(config).await {
+                                tracing::error!("hub stopped: {}", e);
+                            }
+                        })
+                        .await;
                 });
             })
             .expect("spawn hub thread");
@@ -229,8 +228,7 @@ fn main() {
 
             let strip_w = (STRIP_W * scale) as u32;
             let default_h = (320.0 * scale) as u32;
-            let default_x =
-                work.0 + work.2 as i32 - strip_w as i32 - (MARGIN * scale) as i32;
+            let default_x = work.0 + work.2 as i32 - strip_w as i32 - (MARGIN * scale) as i32;
             let default_y = work.1 + ((work.3 as i32 - default_h as i32) / 2).max(0);
 
             let (x, y) = match (saved.x, saved.y) {
@@ -246,28 +244,25 @@ fn main() {
             };
             let locked = saved.locked.unwrap_or(false);
 
-            let window = WebviewWindowBuilder::new(
-                app,
-                "main",
-                WebviewUrl::App("index.html".into()),
-            )
-                .title("NIMon Widget")
-                .decorations(false)
-                .transparent(true)
-                .always_on_top(true)
-                .skip_taskbar(true)
-                .resizable(false)
-                .shadow(false)
-                .focused(false)
-                // trim webview background services we never use
-                .additional_browser_args(
-                    "--disable-component-update --disable-sync \
+            let window =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title("NIMon Widget")
+                    .decorations(false)
+                    .transparent(true)
+                    .always_on_top(true)
+                    .skip_taskbar(true)
+                    .resizable(false)
+                    .shadow(false)
+                    .focused(false)
+                    // trim webview background services we never use
+                    .additional_browser_args(
+                        "--disable-component-update --disable-sync \
                      --disable-background-networking --disable-extensions \
                      --metrics-recording-only",
-                )
-                .inner_size(STRIP_W, 320.0)
-                .position(x as f64 / scale, y as f64 / scale)
-                .build()?;
+                    )
+                    .inner_size(STRIP_W, 320.0)
+                    .position(x as f64 / scale, y as f64 / scale)
+                    .build()?;
             let _ = window.set_size(PhysicalSize::new(strip_w, default_h));
             let _ = window.set_position(PhysicalPosition::new(x, y));
 
@@ -284,12 +279,18 @@ fn main() {
 
             /* tray: PXI-branded icon drawn in code */
             let icon = tauri::image::Image::new_owned(tray_icon_rgba(), 32, 32);
-            let open = tauri::menu::MenuItem::with_id(
-                app, "open", "Open Dashboard", true, None::<&str>)?;
+            let open =
+                tauri::menu::MenuItem::with_id(app, "open", "Open Dashboard", true, None::<&str>)?;
             let lock = tauri::menu::CheckMenuItem::with_id(
-                app, "lock", "Lock position", true, locked, None::<&str>)?;
-            let quit = tauri::menu::MenuItem::with_id(
-                app, "quit", "Quit NIMon", true, None::<&str>)?;
+                app,
+                "lock",
+                "Lock position",
+                true,
+                locked,
+                None::<&str>,
+            )?;
+            let quit =
+                tauri::menu::MenuItem::with_id(app, "quit", "Quit NIMon", true, None::<&str>)?;
             let menu = tauri::menu::Menu::with_items(app, &[&open, &lock, &quit])?;
 
             if let Some(state) = app.try_state::<WidgetState>() {
@@ -346,8 +347,7 @@ fn poll_blocking(base: &str) -> Value {
     let edges = match get("/api/v1/edges") {
         Ok(v) => v,
         Err(e) => {
-            static FAILURES: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
+            static FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = FAILURES.fetch_add(1, Ordering::Relaxed);
             if n == 0 || n % 12 == 0 {
                 eprintln!("nimon-widget: poll failed ({base}): {e}");
@@ -370,8 +370,7 @@ fn poll_blocking(base: &str) -> Value {
     }
 
     let alerts = get("/api/v1/alerts").unwrap_or_else(|_| json!({ "alerts": [] }));
-    let predictions =
-        get("/api/v1/predictions").unwrap_or_else(|_| json!({ "predictions": [] }));
+    let predictions = get("/api/v1/predictions").unwrap_or_else(|_| json!({ "predictions": [] }));
 
     json!({
         "up": true,
@@ -397,7 +396,7 @@ fn update_geometry(app: AppHandle, mode: String, height: f64) -> f64 {
     };
 
     let scale = state.scale;
-    let (wx, wy, ww, wh) = state.work;
+    let (_wx, wy, _ww, wh) = state.work; let _ = (_wx, _ww);
     let margin = (MARGIN * scale) as u32;
     let h = ((height * scale) as u32)
         .min(wh.saturating_sub(margin * 2))
@@ -430,20 +429,26 @@ fn update_geometry(app: AppHandle, mode: String, height: f64) -> f64 {
 /// (bar column = window x + EXPANDED_W - STRIP_W, top = window y).
 #[tauri::command]
 fn move_by(app: AppHandle, dx: f64, dy: f64) {
-    let Some(state) = app.try_state::<WidgetState>() else { return };
-    let Some(window) = app.get_webview_window("main") else { return };
+    let Some(state) = app.try_state::<WidgetState>() else {
+        return;
+    };
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
     if state.locked.load(Ordering::Relaxed) {
         return;
     }
 
-    let Ok(pos) = window.outer_position() else { return };
-    let Ok(size) = window.outer_size() else { return };
+    let Ok(pos) = window.outer_position() else {
+        return;
+    };
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
     let (wx, wy, ww, wh) = state.work;
 
-    let nx = (pos.x + (dx * state.scale) as i32)
-        .clamp(wx, wx + ww as i32 - size.width as i32);
-    let ny = (pos.y + (dy * state.scale) as i32)
-        .clamp(wy, wy + wh as i32 - size.height as i32);
+    let nx = (pos.x + (dx * state.scale) as i32).clamp(wx, wx + ww as i32 - size.width as i32);
+    let ny = (pos.y + (dy * state.scale) as i32).clamp(wy, wy + wh as i32 - size.height as i32);
     let _ = window.set_position(PhysicalPosition::new(nx, ny));
 
     let mut dock = state.dock.lock().unwrap();
@@ -528,30 +533,25 @@ fn resolve_root() -> PathBuf {
 fn load_hub_config(root: &PathBuf, port: u16) -> nimon_hub::config::HubConfig {
     let path = root.join("config").join("test-hub.yaml");
     let mut config = if path.exists() {
-        nimon_hub::config::HubConfig::load_or_default(&path)
-            .unwrap_or_default()
+        nimon_hub::config::HubConfig::load_or_default(&path).unwrap_or_default()
     } else {
         nimon_hub::config::HubConfig::default()
     };
     config.host = "127.0.0.1".to_string();
-    if config.port == 8080 && port != 8080 {
-        config.port = port;
-    }
+    // --port is explicit user intent; it always wins over config files
+    config.port = port;
     let db = root.join(&config.database_path);
     config.database_path = db.display().to_string();
     config
 }
 
 fn load_edge_config(root: &PathBuf, port: u16) -> nimon_edge::config::EdgeConfig {
-    let path = root.join("config").join("edge.yaml");
-    if let Ok(config) = nimon_edge::config::EdgeConfig::from_file(&path) {
-        return config;
-    }
     use nimon_edge::config::{
         ApiConfig, ApiSettings, BufferConfig, EdgeConfig, LoggingConfig, NodeConfig,
         PredictionConfig,
     };
-    EdgeConfig {
+    let path = root.join("config").join("edge.yaml");
+    let mut config = EdgeConfig::from_file(&path).unwrap_or_else(|_| EdgeConfig {
         node: NodeConfig {
             id: "edge-01".to_string(),
             name: "Local Edge 1".to_string(),
@@ -570,9 +570,20 @@ fn load_edge_config(root: &PathBuf, port: u16) -> nimon_edge::config::EdgeConfig
             xnet: ApiSettings::default(),
         },
         prediction: PredictionConfig::default(),
+        action: nimon_edge::config::ActionConfig::default(),
         buffer: BufferConfig::default(),
         logging: LoggingConfig::default(),
-    }
+    });
+    // Keep the edge pointed at the hub we actually launch (the --port
+    // override): keep the configured host, replace the port.
+    let host = config
+        .node
+        .hub_address
+        .rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    config.node.hub_address = format!("{}:{}", host, port);
+    config
 }
 
 /// 32x32 RGBA tray icon: teal rounded square with a light center dot.
@@ -589,9 +600,9 @@ fn tray_icon_rgba() -> Vec<u8> {
             let fy = y as f32;
             let cx = fx.min(S as f32 - 1.0 - fx).min(radius);
             let cy = fy.min(S as f32 - 1.0 - fy).min(radius);
-            let inside = cx == radius || cy == radius
-                || ((fx - cx.min(fx)).powi(2) + (fy - cy.min(fy)).powi(2)
-                    <= radius * radius);
+            let inside = cx == radius
+                || cy == radius
+                || ((fx - cx.min(fx)).powi(2) + (fy - cy.min(fy)).powi(2) <= radius * radius);
             if !inside {
                 continue;
             }

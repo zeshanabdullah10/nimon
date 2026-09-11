@@ -10,7 +10,7 @@ use nimon_core::{
 };
 
 use super::device_actor::{DeviceActor, HealthUpdate, StopDevice};
-use super::hub_connector::HubConnectorActor;
+use super::hub_connector::{HubConnectorActor, UpdateDeviceCount};
 use super::prediction_actor::PredictionActor;
 
 /// Attempt to classify a device product name into a DeviceType
@@ -55,6 +55,8 @@ pub struct DeviceManagerActor {
     edge_id: String,
     /// Default poll interval
     default_poll_interval: u64,
+    /// Notified whenever the managed device count changes
+    count_subscriber: Option<Recipient<UpdateDeviceCount>>,
 }
 
 impl DeviceManagerActor {
@@ -68,6 +70,7 @@ impl DeviceManagerActor {
             hub_connector: None,
             edge_id,
             default_poll_interval: 10,
+            count_subscriber: None,
         }
     }
 
@@ -75,6 +78,21 @@ impl DeviceManagerActor {
     pub fn with_poll_interval(mut self, interval_secs: u64) -> Self {
         self.default_poll_interval = interval_secs;
         self
+    }
+
+    /// Subscribe an actor to device count changes (heartbeats)
+    pub fn with_count_subscriber(mut self, recipient: Recipient<UpdateDeviceCount>) -> Self {
+        self.count_subscriber = Some(recipient);
+        self
+    }
+
+    /// Notify the subscriber of the current device count
+    fn notify_count(&self) {
+        if let Some(ref subscriber) = self.count_subscriber {
+            subscriber.do_send(UpdateDeviceCount {
+                count: self.device_actors.len(),
+            });
+        }
     }
 
     /// Set the hub connector for forwarding predictions and status updates
@@ -98,13 +116,17 @@ impl DeviceManagerActor {
         let device_id = device.id.clone();
         // topology fingerprint uses the product name (stable across
         // NI MAX renames); device_name may now be the user alias
-        let product = device.model.clone().unwrap_or_else(|| device.device_name.clone());
+        let product = device
+            .model
+            .clone()
+            .unwrap_or_else(|| device.device_name.clone());
 
         let mut actor = DeviceActor::new(device, self.default_poll_interval);
         // Route status updates through the prediction actor, which forwards
         // them (plus any predictions) to the hub connector
         if let Some(ref prediction) = self.prediction_actor {
-            actor = actor.with_status_recipient(prediction.clone().recipient::<DeviceStatusUpdate>());
+            actor =
+                actor.with_status_recipient(prediction.clone().recipient::<DeviceStatusUpdate>());
         }
         // Real SysCfg devices are driven by the shared sweep
         if self.sweep_mode {
@@ -116,6 +138,7 @@ impl DeviceManagerActor {
         self.device_order.push(device_id.clone());
         self.product_order.push(product);
         tracing::info!("Added device: {}", device_id);
+        self.notify_count();
         addr
     }
 
@@ -128,6 +151,7 @@ impl DeviceManagerActor {
         if let Some(addr) = self.device_actors.remove(device_id) {
             addr.do_send(StopDevice);
             tracing::info!("Removed device: {}", device_id);
+            self.notify_count();
         }
     }
 
@@ -139,6 +163,7 @@ impl DeviceManagerActor {
         self.device_actors.clear();
         self.device_order.clear();
         self.product_order.clear();
+        self.notify_count();
     }
 
     /// Build a Device from a discovery result, keeping IDs stable:
@@ -148,7 +173,11 @@ impl DeviceManagerActor {
         let id_key = alias
             .clone()
             .or_else(|| {
-                if d.serial_number.is_empty() { None } else { Some(d.serial_number.clone()) }
+                if d.serial_number.is_empty() {
+                    None
+                } else {
+                    Some(d.serial_number.clone())
+                }
             })
             .unwrap_or_else(|| format!("{}#{}", d.product_name, i + 1));
         Device {
@@ -163,6 +192,7 @@ impl DeviceManagerActor {
             ip_address: d.ip_address.clone(),
             slot: d.slot,
             chassis: d.parent_link.clone(),
+            is_simulated: false,
         }
     }
 
@@ -185,9 +215,7 @@ impl DeviceManagerActor {
                                 .map(|(i, d)| self.device_from_discovered(i, d))
                                 .collect();
                         }
-                        tracing::info!(
-                            "NI-SysCfg returned no devices, using simulated fallback"
-                        );
+                        tracing::info!("NI-SysCfg returned no devices, using simulated fallback");
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -227,6 +255,7 @@ impl DeviceManagerActor {
                 ip_address: None,
                 slot: None,
                 chassis: None,
+                is_simulated: true,
             },
             Device {
                 id: format!("{}:pxi-1", self.edge_id),
@@ -240,6 +269,7 @@ impl DeviceManagerActor {
                 ip_address: Some("192.168.1.100".to_string()),
                 slot: Some(1),
                 chassis: Some("PXI1".to_string()),
+                is_simulated: true,
             },
         ]
     }
@@ -294,10 +324,9 @@ impl DeviceManagerActor {
                         );
                     }
                     if let Some(v) = system.memory_free_mb {
-                        health.metrics.insert(
-                            "mem_free_mb".to_string(),
-                            nimon_core::MetricValue::Float(v),
-                        );
+                        health
+                            .metrics
+                            .insert("mem_free_mb".to_string(), nimon_core::MetricValue::Float(v));
                     }
                     if let Some(v) = system.disk_total_mb {
                         health.metrics.insert(
@@ -395,12 +424,25 @@ pub struct PollAllDevices;
 impl Handler<PollAllDevices> for DeviceManagerActor {
     type Result = ();
 
-    fn handle(&mut self, _msg: PollAllDevices, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, _msg: PollAllDevices, ctx: &mut Self::Context) -> Self::Result {
+        // NOTE: `addr.send(...)` inside a sync handler enqueues nothing —
+        // the response future is dropped before the envelope is written.
+        // Fire-and-forget polls must use `do_send`, or be awaited inside
+        // a spawned future.
         for (device_id, addr) in &self.device_actors {
-            let _ = addr.send(DevicePoll {
-                device_id: device_id.clone(),
-                force: false,
-            });
+            let device_id = device_id.clone();
+            let addr = addr.clone();
+            ctx.spawn(
+                async move {
+                    let _ = addr
+                        .send(DevicePoll {
+                            device_id,
+                            force: false,
+                        })
+                        .await;
+                }
+                .into_actor(self),
+            );
         }
     }
 }
@@ -471,6 +513,40 @@ impl Handler<GetDeviceCount> for DeviceManagerActor {
 
     fn handle(&mut self, _msg: GetDeviceCount, _ctx: &mut Self::Context) -> Self::Result {
         self.device_count()
+    }
+}
+
+/// Hub-pushed desired-state config (arrives via the hub connector).
+/// Thresholds apply to the prediction engine immediately; the poll
+/// interval takes effect on the next sweep cycle.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct ApplyConfig {
+    pub poll_interval_secs: Option<u64>,
+    pub temperature_warning: f64,
+    pub temperature_critical: f64,
+}
+
+impl Handler<ApplyConfig> for DeviceManagerActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: ApplyConfig, _ctx: &mut Self::Context) -> Self::Result {
+        tracing::info!(
+            "Applying hub config: poll={:?}, thresholds={:?}/{}C",
+            msg.poll_interval_secs,
+            msg.temperature_warning,
+            msg.temperature_critical
+        );
+
+        if let Some(secs) = msg.poll_interval_secs {
+            self.default_poll_interval = secs.max(1);
+        }
+        if let Some(ref prediction) = self.prediction_actor {
+            prediction.do_send(super::prediction_actor::UpdateThresholds {
+                warning: msg.temperature_warning,
+                critical: msg.temperature_critical,
+            });
+        }
     }
 }
 
@@ -587,6 +663,7 @@ mod tests {
             ip_address: None,
             slot: None,
             chassis: None,
+            is_simulated: false,
         };
 
         addr.send(AddDevice { device: new_device }).await.unwrap();
@@ -608,10 +685,7 @@ mod tests {
         // Remove an existing device (whatever discovery provided)
         let devices = addr.send(ListDevices).await.unwrap();
         let device_id = devices[0].clone();
-        let removed = addr
-            .send(RemoveDevice { device_id })
-            .await
-            .unwrap();
+        let removed = addr.send(RemoveDevice { device_id }).await.unwrap();
         assert!(removed);
 
         let new_count = addr.send(GetDeviceCount).await.unwrap();

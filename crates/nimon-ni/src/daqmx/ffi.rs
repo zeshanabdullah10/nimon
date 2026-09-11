@@ -28,10 +28,8 @@ pub const DAQMX_BUFFER_SIZE: usize = 4096;
 /// Function signature for DAQmxGetSysDevNames
 ///
 /// Returns a comma-separated list of DAQmx device names installed on the system.
-pub type DAQmxGetSysDevNames = unsafe extern "C" fn(
-    dev_names_buffer: *mut c_char,
-    buffer_size: c_int,
-) -> c_int;
+pub type DAQmxGetSysDevNames =
+    unsafe extern "C" fn(dev_names_buffer: *mut c_char, buffer_size: c_int) -> c_int;
 
 /// Function signature for DAQmxGetDevProductTypeName
 ///
@@ -45,26 +43,20 @@ pub type DAQmxGetDevProductTypeName = unsafe extern "C" fn(
 /// Function signature for DAQmxGetDevSerialNum
 ///
 /// Returns the serial number for a given device.
-pub type DAQmxGetDevSerialNum = unsafe extern "C" fn(
-    device_name: *const c_char,
-    serial_number: *mut u32,
-) -> c_int;
+pub type DAQmxGetDevSerialNum =
+    unsafe extern "C" fn(device_name: *const c_char, serial_number: *mut u32) -> c_int;
 
 /// Function signature for DAQmxGetDevTemperature
 ///
 /// Returns the current device temperature in degrees Celsius.
-pub type DAQmxGetDevTemperature = unsafe extern "C" fn(
-    device_name: *const c_char,
-    temperature: *mut c_double,
-) -> c_int;
+pub type DAQmxGetDevTemperature =
+    unsafe extern "C" fn(device_name: *const c_char, temperature: *mut c_double) -> c_int;
 
 /// Function signature for DAQmxGetDevSelfTestResult
 ///
 /// Returns the self-test result for a given device (0 = pass).
-pub type DAQmxGetDevSelfTestResult = unsafe extern "C" fn(
-    device_name: *const c_char,
-    self_test_result: *mut c_int,
-) -> c_int;
+pub type DAQmxGetDevSelfTestResult =
+    unsafe extern "C" fn(device_name: *const c_char, self_test_result: *mut c_int) -> c_int;
 
 /// Function signature for DAQmxGetDevAIPowerSupplyVoltages
 ///
@@ -80,14 +72,10 @@ pub type DAQmxGetDevAIPowerSupplyVoltages = unsafe extern "C" fn(
 /// Function signature for DAQmxResetDevice
 ///
 /// Resets a device to its default state.
-pub type DAQmxResetDevice = unsafe extern "C" fn(
-    device_name: *const c_char,
-) -> c_int;
+pub type DAQmxResetDevice = unsafe extern "C" fn(device_name: *const c_char) -> c_int;
 
 /// Function signature for DAQmxGetDevProductNumber
 ///
 /// Returns the product number for a given device (e.g., "6363" for PXIe-6363).
-pub type DAQmxGetDevProductNumber = unsafe extern "C" fn(
-    device_name: *const c_char,
-    product_number: *mut c_int,
-) -> c_int;
+pub type DAQmxGetDevProductNumber =
+    unsafe extern "C" fn(device_name: *const c_char, product_number: *mut c_int) -> c_int;

@@ -15,7 +15,8 @@ impl Client {
     }
 
     pub async fn health(&self) -> Result<HealthResponse> {
-        Ok(self.client
+        Ok(self
+            .client
             .get(format!("{}/health", self.base_url))
             .send()
             .await?
@@ -24,7 +25,8 @@ impl Client {
     }
 
     pub async fn edges(&self) -> Result<EdgesResponse> {
-        Ok(self.client
+        Ok(self
+            .client
             .get(format!("{}/api/v1/edges", self.base_url))
             .send()
             .await?
@@ -33,7 +35,8 @@ impl Client {
     }
 
     pub async fn edge(&self, edge_id: &str) -> Result<EdgeDetailResponse> {
-        Ok(self.client
+        Ok(self
+            .client
             .get(format!("{}/api/v1/edges/{}", self.base_url, edge_id))
             .send()
             .await?
@@ -42,7 +45,8 @@ impl Client {
     }
 
     pub async fn alerts(&self) -> Result<AlertsResponse> {
-        Ok(self.client
+        Ok(self
+            .client
             .get(format!("{}/api/v1/alerts", self.base_url))
             .send()
             .await?
@@ -51,10 +55,17 @@ impl Client {
     }
 
     pub async fn ack_alert(&self, alert_id: &str) -> Result<()> {
-        self.client
-            .post(format!("{}/api/v1/alerts/{}/acknowledge", self.base_url, alert_id))
+        let res = self
+            .client
+            .post(format!(
+                "{}/api/v1/alerts/{}/acknowledge",
+                self.base_url, alert_id
+            ))
             .send()
             .await?;
+        if !res.status().is_success() {
+            anyhow::bail!("acknowledge failed: HTTP {}", res.status());
+        }
         Ok(())
     }
 }
@@ -72,31 +83,39 @@ pub struct EdgesResponse {
     pub total: usize,
 }
 
+// Response DTOs mirror the hub API payload exactly; some fields exist for
+// deserialization completeness even where the CLI does not print them.
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct EdgeInfo {
     pub edge_id: String,
     pub name: String,
-    pub connected_at: String,
-    pub device_count: usize,
+    pub connected_at: Option<String>,
+    pub last_seen: Option<String>,
+    pub device_count: Option<usize>,
+    pub status: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct EdgeDetailResponse {
     pub edge_id: String,
     pub name: String,
-    pub hostname: String,
-    pub ip_address: String,
-    pub connected_at: String,
-    pub device_count: usize,
+    pub hostname: Option<String>,
+    pub ip_address: Option<String>,
+    pub connected_at: Option<String>,
+    pub last_seen: Option<String>,
+    pub device_count: Option<usize>,
     pub status: String,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct AlertsResponse {
     pub alerts: Vec<AlertInfo>,
     pub total: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 pub struct AlertInfo {
     pub id: String,

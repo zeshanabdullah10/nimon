@@ -9,5 +9,4 @@ pub mod server;
 pub mod service;
 pub mod session;
 
-pub use server::run;
-
+pub use server::{run, run_with_shutdown};

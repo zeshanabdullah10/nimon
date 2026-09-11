@@ -8,7 +8,9 @@ export interface Edge {
   edge_id: string
   name: string
   connected_at?: string
+  last_seen?: string
   device_count?: number
+  status?: 'online' | 'offline' | string
 }
 
 export interface Device {
@@ -16,23 +18,35 @@ export interface Device {
   status: 'healthy' | 'warning' | 'error' | 'offline' | string
   last_seen: string
   metrics: Record<string, number | boolean | string>
+  is_simulated?: boolean
 }
 
+/** Matches the hub's core `Alert` payload from /api/v1/alerts */
 export interface Alert {
-  id: number
-  rule_name: string
-  severity: 'critical' | 'warning' | string
+  id: string
+  rule_id: string
+  edge_id?: string
+  device_id: string
+  severity: 'critical' | 'warning' | 'info' | string
+  status: 'pending' | 'firing' | 'resolved' | 'suppressed' | string
+  title: string
   message: string
-  device_id?: string
-  created_at: string
+  metric_name?: string | null
+  metric_value?: number | null
+  threshold?: number | null
+  triggered_at: string
+  resolved_at?: string | null
+  fired_count?: number
 }
 
 export interface Prediction {
   id: number
   prediction_type: string
   probability: number
-  eta_minutes?: number
+  eta_minutes?: number | null
   device_id?: string
+  edge_id?: string
+  status?: string
   created_at: string
 }
 
@@ -180,7 +194,7 @@ export function useNimon() {
   }, [])
 
   const ack = useCallback(
-    async (id: number) => {
+    async (id: string) => {
       await getJSON(`/api/v1/alerts/${encodeURIComponent(id)}/acknowledge`, {
         method: 'POST',
       }).catch(() => null)

@@ -13,7 +13,7 @@ import { cn } from '@/lib/utils'
 export default function App() {
   const { data, connected, busy, refresh, ack, smoothed } = useNimon()
   const [view, setView] = useState<ViewId>('overview')
-  const [ackPending, setAckPending] = useState<Set<number>>(new Set())
+  const [ackPending, setAckPending] = useState<Set<string>>(new Set())
 
   const up = connected !== false
 
@@ -33,7 +33,7 @@ export default function App() {
   const online = data.devices.filter((d) => ['healthy', 'warning'].includes(d.status)).length
   const offline = data.devices.length - online
 
-  const onAck = async (id: number) => {
+  const onAck = async (id: string) => {
     setAckPending((s) => new Set(s).add(id))
     await ack(id)
     setAckPending((s) => { const n = new Set(s); n.delete(id); return n })
@@ -94,12 +94,12 @@ export default function App() {
                             <span className={cn('mt-[7px] h-[9px] w-[9px] shrink-0 rounded-full',
                               crit ? 'bg-crit' : 'bg-warn')} />
                             <div className="min-w-0 flex-1">
-                              <div className="text-[15px] font-medium">{a.rule_name || 'Alert'}</div>
+                              <div className="text-[15px] font-medium">{a.title || a.rule_id || 'Alert'}</div>
                               <div className="mt-1 break-words text-[13.5px] leading-relaxed text-t2">
                                 {a.message || ''}
                               </div>
                               <div className="mt-2 font-mono text-xs text-t3">
-                                {dev} · {relTime(a.created_at)}
+                                {dev} · {relTime(a.triggered_at)}
                               </div>
                             </div>
                             <button

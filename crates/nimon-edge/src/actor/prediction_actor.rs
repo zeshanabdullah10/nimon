@@ -10,8 +10,9 @@ use std::collections::{HashMap, VecDeque};
 use crate::prediction::{
     EwmaAnomalyDetector, ModelUpdate, PredictionModel, ThresholdPredictor, TrendPredictor,
 };
-use nimon_core::actor::{DeviceStatusUpdate, PredictionResult, PredictionType};
+use nimon_core::actor::{DeviceStatusUpdate, PredictionResult};
 use nimon_core::MetricValue;
+use nimon_core::PredictionType;
 
 use crate::actor::hub_connector::HubConnectorActor;
 
@@ -69,8 +70,10 @@ pub struct PredictionActor {
 impl PredictionActor {
     /// Create a new prediction actor with default configuration
     pub fn new(window_size: usize) -> Self {
-        let mut config = PredictionConfig::default();
-        config.legacy_window_size = window_size;
+        let config = PredictionConfig {
+            legacy_window_size: window_size,
+            ..PredictionConfig::default()
+        };
         Self::with_config(config)
     }
 
@@ -88,6 +91,7 @@ impl PredictionActor {
             Box::new(TrendPredictor::new(
                 config.trend_window_size,
                 config.trend_threshold_rate,
+                config.temperature_critical,
                 PredictionType::Overheating,
             )),
             Box::new(ThresholdPredictor::new(
@@ -106,30 +110,37 @@ impl PredictionActor {
         }
     }
 
-    /// Set temperature thresholds (legacy compatibility)
-    pub fn with_thresholds(mut self, warning: f64, critical: f64) -> Self {
-        self.config.temperature_warning = warning;
-        self.config.temperature_critical = critical;
-        // Remove existing predictors for temperature and rebuild with updated thresholds
-        self.models.remove("temperature");
+    /// Rebuild the temperature model group with new thresholds,
+    /// preserving EWMA state where possible (EWMA restarts warm from
+    /// its current mean; trend/threshold are stateless enough to reset).
+    fn rebuild_temperature_models(&mut self) {
+        let config = &self.config;
         let temp_models: Vec<Box<dyn PredictionModel>> = vec![
             Box::new(EwmaAnomalyDetector::new(
-                self.config.ewma_alpha,
-                self.config.ewma_threshold,
-                self.config.ewma_min_samples,
+                config.ewma_alpha,
+                config.ewma_threshold,
+                config.ewma_min_samples,
             )),
             Box::new(TrendPredictor::new(
-                self.config.trend_window_size,
-                self.config.trend_threshold_rate,
+                config.trend_window_size,
+                config.trend_threshold_rate,
+                config.temperature_critical,
                 PredictionType::Overheating,
             )),
             Box::new(ThresholdPredictor::new(
-                critical,
-                warning,
+                config.temperature_critical,
+                config.temperature_warning,
                 PredictionType::Overheating,
             )),
         ];
         self.models.insert("temperature".to_string(), temp_models);
+    }
+
+    /// Set temperature thresholds (legacy compatibility)
+    pub fn with_thresholds(mut self, warning: f64, critical: f64) -> Self {
+        self.config.temperature_warning = warning;
+        self.config.temperature_critical = critical;
+        self.rebuild_temperature_models();
         self
     }
 
@@ -166,17 +177,17 @@ impl PredictionActor {
         update: ModelUpdate,
     ) -> Option<PredictionResult> {
         match update {
-            ModelUpdate::NewPrediction(pred) | ModelUpdate::UpdatedPrediction(pred) => {
-                Some(PredictionResult {
-                    device_id: device_id.to_string(),
-                    edge_id: edge_id.to_string(),
-                    prediction_type: pred.prediction_type,
-                    probability: pred.probability,
-                    eta_minutes: pred.eta_minutes,
-                    confidence: pred.confidence,
-                    timestamp: Utc::now(),
-                })
-            }
+            ModelUpdate::NewPrediction(pred) => Some(PredictionResult {
+                device_id: device_id.to_string(),
+                edge_id: edge_id.to_string(),
+                prediction_type: pred.prediction_type,
+                probability: pred.probability,
+                eta_minutes: pred.eta_minutes,
+                confidence: pred.confidence,
+                reason: Some(pred.reason),
+                model_version: Some(pred.model_version),
+                timestamp: Utc::now(),
+            }),
             ModelUpdate::NoPrediction => None,
         }
     }
@@ -230,6 +241,11 @@ impl PredictionActor {
                 probability: probability.min(1.0),
                 eta_minutes: time_to_critical,
                 confidence: 0.7,
+                reason: Some(format!(
+                    "Temperature rising {:.2}/sample toward critical {:.1} (now {:.1})",
+                    rate, self.config.temperature_critical, temperature
+                )),
+                model_version: Some("legacy-avg-trend".to_string()),
                 timestamp: Utc::now(),
             });
         }
@@ -242,7 +258,33 @@ impl Actor for PredictionActor {
     type Context = Context<Self>;
 
     fn started(&mut self, _ctx: &mut Self::Context) {
-        tracing::info!("PredictionActor started with {} model groups", self.models.len());
+        tracing::info!(
+            "PredictionActor started with {} model groups",
+            self.models.len()
+        );
+    }
+}
+
+/// Hub-pushed threshold update (routed via the device manager)
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct UpdateThresholds {
+    pub warning: f64,
+    pub critical: f64,
+}
+
+impl Handler<UpdateThresholds> for PredictionActor {
+    type Result = ();
+
+    fn handle(&mut self, msg: UpdateThresholds, _ctx: &mut Self::Context) -> Self::Result {
+        tracing::info!(
+            "Prediction thresholds updated: warning={:.1}, critical={:.1}",
+            msg.warning,
+            msg.critical
+        );
+        self.config.temperature_warning = msg.warning;
+        self.config.temperature_critical = msg.critical;
+        self.rebuild_temperature_models();
     }
 }
 
@@ -288,10 +330,7 @@ impl Handler<DeviceStatusUpdate> for PredictionActor {
                 if let Some(prediction) =
                     self.analyze_temperature(&msg.device_id, &msg.edge_id, *temp)
                 {
-                    tracing::debug!(
-                        "Legacy prediction generated: device={:?}",
-                        prediction
-                    );
+                    tracing::debug!("Legacy prediction generated: device={:?}", prediction);
 
                     // Forward legacy prediction to hub connector
                     if let Some(ref hub) = self.hub_connector {
@@ -321,12 +360,17 @@ mod tests {
             edge_id: "edge-1".to_string(),
             status: HealthStatus::Healthy,
             metrics,
+            is_simulated: false,
             timestamp: Utc::now(),
         }
     }
 
     #[allow(dead_code)]
-    fn make_multi_metric_update(device_id: &str, temperature: f64, voltage: f64) -> DeviceStatusUpdate {
+    fn make_multi_metric_update(
+        device_id: &str,
+        temperature: f64,
+        voltage: f64,
+    ) -> DeviceStatusUpdate {
         let mut metrics = HashMap::new();
         metrics.insert("temperature".to_string(), MetricValue::Float(temperature));
         metrics.insert("voltage".to_string(), MetricValue::Float(voltage));
@@ -335,6 +379,7 @@ mod tests {
             edge_id: "edge-1".to_string(),
             status: HealthStatus::Healthy,
             metrics,
+            is_simulated: false,
             timestamp: Utc::now(),
         }
     }
@@ -377,8 +422,13 @@ mod tests {
         let updates = actor.process_update("temperature", 80.0, Utc::now());
 
         // Threshold predictor should fire immediately
-        let has_prediction = updates.iter().any(|u| matches!(u, ModelUpdate::NewPrediction(_)));
-        assert!(has_prediction, "Expected at least one prediction for critical temperature");
+        let has_prediction = updates
+            .iter()
+            .any(|u| matches!(u, ModelUpdate::NewPrediction(_)));
+        assert!(
+            has_prediction,
+            "Expected at least one prediction for critical temperature"
+        );
     }
 
     #[test]
@@ -405,7 +455,8 @@ mod tests {
             model_version: "test-v1".to_string(),
         };
 
-        let result = actor.to_prediction_result("dev-1", "edge-1", ModelUpdate::NewPrediction(pred));
+        let result =
+            actor.to_prediction_result("dev-1", "edge-1", ModelUpdate::NewPrediction(pred));
 
         assert!(result.is_some());
         let r = result.unwrap();
@@ -448,13 +499,23 @@ mod tests {
 
         // 85 should trigger warning threshold predictor
         let updates = actor.process_update("temperature", 85.0, Utc::now());
-        let has_prediction = updates.iter().any(|u| matches!(u, ModelUpdate::NewPrediction(_)));
-        assert!(has_prediction, "Expected prediction for value in warning range");
+        let has_prediction = updates
+            .iter()
+            .any(|u| matches!(u, ModelUpdate::NewPrediction(_)));
+        assert!(
+            has_prediction,
+            "Expected prediction for value in warning range"
+        );
 
         // 50 should not trigger
         let updates = actor.process_update("temperature", 50.0, Utc::now());
-        let has_prediction = updates.iter().any(|u| matches!(u, ModelUpdate::NewPrediction(_)));
-        assert!(!has_prediction, "Expected no prediction for value below warning");
+        let has_prediction = updates
+            .iter()
+            .any(|u| matches!(u, ModelUpdate::NewPrediction(_)));
+        assert!(
+            !has_prediction,
+            "Expected no prediction for value below warning"
+        );
     }
 
     #[test]
@@ -466,6 +527,7 @@ mod tests {
             edge_id: "edge-1".to_string(),
             status: HealthStatus::Healthy,
             metrics,
+            is_simulated: false,
             timestamp: Utc::now(),
         };
 
@@ -474,7 +536,12 @@ mod tests {
 
         // Process the integer metric
         let updates = actor.process_update("temperature", 80.0, msg.timestamp);
-        let has_prediction = updates.iter().any(|u| matches!(u, ModelUpdate::NewPrediction(_)));
-        assert!(has_prediction, "Integer metric value should trigger threshold predictor");
+        let has_prediction = updates
+            .iter()
+            .any(|u| matches!(u, ModelUpdate::NewPrediction(_)));
+        assert!(
+            has_prediction,
+            "Integer metric value should trigger threshold predictor"
+        );
     }
 }

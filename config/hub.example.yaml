@@ -1,0 +1,65 @@
+# nimon-hub configuration
+#
+# This file is loaded with `nimon-hub config/hub.yaml`. Without it the hub
+# starts with the defaults below. See README.md for the full rule/channel
+# reference.
+
+host: "0.0.0.0"
+port: 8080
+database_path: "data/nimon.db"
+
+alert:
+  # Cooldown between repeated firings of the same rule+device (minutes)
+  default_cooldown_minutes: 5
+  # Suppress further alerts for a rule beyond this many active alerts
+  max_firing_count: 100
+  # Retention cleanup cadence (hours)
+  cleanup_interval_hours: 24
+  # Probability at which predictions are persisted and alerted (0.0-1.0)
+  prediction_alert_threshold: 0.8
+
+  # Notification channels; a built-in console channel is always active so
+  # default deployments never lose alerts silently.
+  notification_channels: []
+  #  - channel_type: "email"
+  #    name: "ops-mail"
+  #    smtp_server: "smtp.example.com"
+  #    smtp_port: 587
+  #    smtp_username: "nimon@example.com"   # NIMON_SMTP_USER env overrides
+  #    smtp_password: "secret"              # NIMON_SMTP_PASSWORD env overrides
+  #    from_addr: "nimon@example.com"
+  #    to_addrs: ["ops@example.com"]
+  #  - channel_type: "webhook"
+  #    name: "hooks"
+  #    webhook_url: "https://hooks.example.com/nimon"
+  #    headers:
+  #      - ["X-Token", "abc"]
+
+  rules: []
+  #  - name: "High Temperature"
+  #    severity: "critical"            # info | warning | critical
+  #    condition:
+  #      MetricThreshold:
+  #        metric: "temperature"
+  #        threshold: 75.0
+  #        comparison: "greater_than"  # gt lt eq ne ge le
+  #    cooldown_minutes: 5
+  #    notification_channels: ["ops-mail"]
+  #    action:                       # optional self-healing action
+  #      type: power_cycle
+  #      delay_secs: 5
+
+# Desired-state pushed to edges when they register (and via
+# POST /api/v1/edges/{id}/config)
+edges:
+  defaults:
+    poll_interval_secs: 30
+    temperature_warning: 65
+    temperature_critical: 75
+
+# Retention / maintenance
+maintenance:
+  alert_retention_days: 30
+  metric_retention_days: 30
+  prediction_retention_days: 30
+  prediction_expiry_minutes: 60
