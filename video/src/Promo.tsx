@@ -8,6 +8,7 @@ import { C } from './theme'
 import { Intro } from './scenes/Intro'
 import { Problem } from './scenes/Problem'
 import { Pillars } from './scenes/Pillars'
+import { Widget } from './scenes/Widget'
 import { Architecture } from './scenes/Architecture'
 import { Dashboard } from './scenes/Dashboard'
 import { Predict } from './scenes/Predict'
@@ -21,6 +22,7 @@ export const SCENES: { id: string; frames: number; C: React.FC }[] = [
   { id: 'intro', frames: 150, C: Intro },
   { id: 'problem', frames: 240, C: Problem },
   { id: 'pillars', frames: 165, C: Pillars },
+  { id: 'widget', frames: 420, C: Widget },
   { id: 'architecture', frames: 330, C: Architecture },
   { id: 'dashboard', frames: 330, C: Dashboard },
   { id: 'predict', frames: 270, C: Predict },

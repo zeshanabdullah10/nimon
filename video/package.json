@@ -8,7 +8,8 @@
     "shots": "node scripts/capture.mjs",
     "render": "npm run audio && remotion render src/index.ts NimonPromo out/nimon-promo.mp4",
     "still": "remotion still src/index.ts NimonPromo out/still.png",
-    "audio": "node scripts/synth-audio.mjs"
+    "audio": "node scripts/synth-audio.mjs",
+    "shots:widget": "node scripts/capture-widget.mjs"
   },
   "dependencies": {
     "@remotion/cli": "4.0.528",

@@ -16,10 +16,10 @@ Rust · Actix · Axum · Tokio · SQLite · React + shadcn/ui · Tauri
 *Edge nodes discover NI hardware via NI-SysCfg, stream telemetry to a central hub,
 and a right-docked widget keeps the whole rack visible at a glance.*
 
-<a href="https://github.com/zeshanabdullah10/nimon/releases/download/v0.3.0/nimon-promo.mp4"><img src="public/nimon-promo-poster.jpg" alt="Watch the 86-second NIMon tour" width="860"></a>
+<a href="https://github.com/zeshanabdullah10/nimon/releases/download/v0.3.0/nimon-promo.mp4"><img src="public/nimon-promo-poster.jpg" alt="Watch the 100-second NIMon tour" width="860"></a>
 
-*86-second tour: the problem, architecture, live dashboard, prediction, alerts and self-healing
-([MP4, 20 MB](https://github.com/zeshanabdullah10/nimon/releases/download/v0.3.0/nimon-promo.mp4) · source in [`video/`](video)).*
+*100-second tour: the problem, the desktop widget, architecture, live dashboard, prediction, alerts and self-healing
+([MP4, 23 MB](https://github.com/zeshanabdullah10/nimon/releases/download/v0.3.0/nimon-promo.mp4) · source in [`video/`](video)).*
 
 </div>
 

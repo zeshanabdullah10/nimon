@@ -1,7 +1,8 @@
 import React from 'react'
 import { AbsoluteFill } from 'remotion'
 import { Intro } from './scenes/Intro'
-import { C, FONT } from './theme'
+import { C, FONT, FPS } from './theme'
+import { TOTAL_FRAMES } from './Promo'
 
 /** README thumbnail: the title scene (render frame 110) with a play button. */
 export const Poster: React.FC = () => (
@@ -35,7 +36,7 @@ export const Poster: React.FC = () => (
             <path d="M8 5v14l11-7z" fill="#07080a" />
           </svg>
         </div>
-        <span style={{ fontFamily: FONT, fontSize: 36, fontWeight: 700, color: C.t1 }}>Watch the 86-second tour</span>
+        <span style={{ fontFamily: FONT, fontSize: 36, fontWeight: 700, color: C.t1 }}>Watch the {Math.round(TOTAL_FRAMES / FPS)}-second tour</span>
       </div>
     </AbsoluteFill>
   </AbsoluteFill>

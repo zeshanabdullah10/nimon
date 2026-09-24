@@ -112,23 +112,30 @@ const env = (t, a, d) => (t < 0 ? 0 : t < a ? t / a : Math.exp(-(t - a) / d))
 // ------------------------------------------------------------------ music
 // Timeline mirrors src/Promo.tsx: scene frames with 16-frame transitions.
 const FPS = 30
-const SCENE_FRAMES = [150, 240, 165, 330, 330, 270, 270, 300, 300, 210, 180]
-const TOTAL = SCENE_FRAMES.reduce((a, b) => a + b, 0) - 16 * (SCENE_FRAMES.length - 1)
+const TRANSITION = 16
+// intro, problem, pillars, widget, architecture, dashboard, predict, alerts, heal, everywhere, builtfor, outro
+const SCENE_FRAMES = [150, 240, 165, 420, 330, 330, 270, 270, 300, 300, 210, 180]
+const TOTAL = SCENE_FRAMES.reduce((a, b) => a + b, 0) - TRANSITION * (SCENE_FRAMES.length - 1)
 const DUR = TOTAL / FPS
 const N = Math.ceil(DUR * SR)
+const START = SCENE_FRAMES.map((_, i) =>
+  SCENE_FRAMES.slice(0, i).reduce((a, f) => a + f - TRANSITION, 0) / FPS,
+)
 
 const BPM = 100
 const BEAT = 60 / BPM // 0.6 s
 const BAR = BEAT * 4 // 2.4 s
 
-// Sections (seconds)
+// Sections (seconds), snapped to bars counted from the lift
 const T_PROBLEM = 4.8
 const T_LIFT = 12.0 // "Meet NIMon": drums enter
-const T_GROOVE = 16.8 // architecture onwards: full kit
-const T_ARP = 28.8
-const T_ARP_END = 79.2
-const T_DRUMS_END = 81.6
+const snap = (t) => T_LIFT + Math.round((t - T_LIFT) / BAR) * BAR
+const T_GROOVE = snap(START[3]) // widget scene onwards: full kit
+const T_ARP = snap(START[4]) // architecture onwards: arpeggio
+const T_DRUMS_END = snap(START[11]) // outro
+const T_ARP_END = T_DRUMS_END - BAR
 const T_END = DUR
+console.log('sections', { T_GROOVE, T_ARP, T_ARP_END, T_DRUMS_END, DUR: DUR.toFixed(2) })
 
 // Chords: [pad notes], bass root (MIDI)
 const CH = {

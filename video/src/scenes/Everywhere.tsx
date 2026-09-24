@@ -79,147 +79,93 @@ const Terminal: React.FC = () => {
   )
 }
 
-const Widget: React.FC = () => {
+// Real response shape from GET /api/v1/devices (trimmed), captured from a live hub.
+const JSON_LINES: { t: string; c?: string }[] = [
+  { t: 'GET /api/v1/devices?edge_id=sim-edge-01', c: C.violet },
+  { t: '{' },
+  { t: '  "devices": [{' },
+  { t: '    "device_id": "sim-edge-01:PXI1Slot2",', c: C.info },
+  { t: '    "model": "PXIe-6368",  "slot": 2,' },
+  { t: '    "status": "error",', c: C.crit },
+  { t: '    "metrics": { "temperature": 79.96 },', c: C.warn },
+  { t: '    "live": true,  "is_simulated": true' },
+  { t: '  }, …],' },
+  { t: '  "total": 6' },
+  { t: '}' },
+]
+
+const ENDPOINTS = ['/health', '/settings', '/edges', '/devices', '/devices/:id/metrics', '/alerts', '/alerts/history', '/predictions', '/actions']
+
+const Api: React.FC = () => {
   const frame = useCurrentFrame()
-  const strip = useSpring(26)
-  const panel = useProgress(80, 26)
-  const acked = frame >= 196
-  const click = interpolate(frame, [190, 196, 204], [1, 0.9, 1], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' })
-
-  const tiles = [
-    { label: 'Station A', value: '80.0°', color: C.crit },
-    { label: 'Station B', value: '48.5°', color: C.ok },
-  ]
-  const alerts = [
-    { sev: 'CRIT', color: C.crit, title: 'Critical Temperature', where: 'PXI1Slot2 · slot 2 · 76.0 °C vs 75' },
-    { sev: 'WARN', color: C.warn, title: 'Overheating predicted', where: 'PXI1Slot2 · 91% · ETA ~2 min' },
-    { sev: 'WARN', color: C.warn, title: 'High Temperature', where: 'PXI1Slot2 · 65.8 °C vs 65' },
-  ]
-
+  const enter = useSpring(24)
   return (
-    <div
-      style={{
-        width: 740,
-        height: 640,
-        borderRadius: 22,
-        overflow: 'hidden',
-        position: 'relative',
-        border: `1.5px solid ${C.lineHi}`,
-        background: 'radial-gradient(circle at 20% 110%, #1d3a5c 0%, transparent 55%), radial-gradient(circle at 90% -10%, #3b2a5e 0%, transparent 50%), #0b0d12',
-        boxShadow: '0 30px 90px rgba(0,0,0,0.55)',
-      }}
-    >
-      <div style={{ position: 'absolute', left: 24, bottom: 20, fontFamily: MONO, fontSize: 16, color: 'rgba(255,255,255,0.35)' }}>
-        Windows desktop · beside LabVIEW
+    <Card style={{ width: 740, height: 640, overflow: 'hidden', opacity: enter, transform: `translateY(${(1 - enter) * 50}px)` }}>
+      <div style={{ height: 50, display: 'flex', alignItems: 'center', gap: 12, padding: '0 20px', borderBottom: `1px solid ${C.line}`, background: '#0c0d0e' }}>
+        <Icon name="globe" size={24} color={C.violet} />
+        <span style={{ fontFamily: MONO, fontSize: 18, color: C.t2 }}>REST API · /api/v1</span>
       </div>
-      <div style={{ position: 'absolute', left: 60, right: 60, top: 18, opacity: strip, transform: `translateY(${(1 - strip) * -40}px)` }}>
-        <div
-          style={{
-            height: 58,
-            borderRadius: 18,
-            background: 'rgba(16,17,18,0.92)',
-            border: `1.5px solid ${C.lineHi}`,
-            display: 'flex',
-            alignItems: 'center',
-            gap: 12,
-            padding: '0 14px',
-            boxShadow: '0 10px 40px rgba(0,0,0,0.5)',
-          }}
-        >
-          <span style={{ fontFamily: MONO, fontSize: 18, fontWeight: 700, color: C.crit, padding: '4px 10px', borderRadius: 10, border: `1.5px solid ${C.crit}88`, background: `${C.crit}22` }}>
-            CRIT
-          </span>
-          {tiles.map((t) => (
-            <span key={t.label} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 12px', borderRadius: 10, background: 'rgba(255,255,255,0.05)' }}>
-              <span style={{ width: 9, height: 9, borderRadius: 5, background: t.color }} />
-              <span style={{ fontFamily: FONT, fontSize: 18, color: C.t2 }}>{t.label}</span>
-              <span style={{ fontFamily: MONO, fontSize: 19, fontWeight: 700, color: t.color }}>{t.value}</span>
-            </span>
-          ))}
-          <span style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
-            <Icon name="check" size={20} color={C.ok} />
-            <Icon name="lock" size={20} color={C.t3} />
-          </span>
-        </div>
-
-        <div style={{ height: 470 * panel, overflow: 'hidden', marginTop: 10 }}>
-          <div
-            style={{
-              borderRadius: 18,
-              background: 'rgba(16,17,18,0.95)',
-              border: `1.5px solid ${C.lineHi}`,
-              padding: '18px 18px 20px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 12,
-              opacity: panel,
-            }}
-          >
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: FONT, fontSize: 19, color: C.t2 }}>
-              <span>
-                <span style={{ color: C.crit, fontWeight: 700 }}>CRIT</span> · 1 module critical
-              </span>
-              <span style={{ color: C.t3 }}>updated 2 s ago</span>
+      <div style={{ padding: '20px 26px', fontFamily: MONO, fontSize: 19, lineHeight: 1.55 }}>
+        {JSON_LINES.map((l, i) => {
+          const show = interpolate(frame, [40 + i * 4, 48 + i * 4], [0, 1], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' })
+          return (
+            <div key={i} style={{ whiteSpace: 'pre', color: l.c ?? C.t2, opacity: show }}>
+              {l.t}
             </div>
-            {alerts.map((a, i) => {
-              const isAcked = i === 0 && acked
-              return (
-                <div key={a.title} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 12px', borderRadius: 14, background: 'rgba(255,255,255,0.04)', border: `1px solid ${isAcked ? C.lineHi : 'transparent'}` }}>
-                  <span style={{ fontFamily: MONO, fontSize: 15, fontWeight: 700, color: a.color, width: 50 }}>{a.sev}</span>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontFamily: FONT, fontSize: 19, fontWeight: 600, color: C.t1 }}>{a.title}</div>
-                    <div style={{ fontFamily: FONT, fontSize: 15, color: C.t2 }}>{a.where}</div>
-                  </div>
-                  <span
-                    style={{
-                      fontFamily: FONT,
-                      fontSize: 15,
-                      padding: '6px 10px',
-                      borderRadius: 9,
-                      border: `1px solid ${C.lineHi}`,
-                      color: isAcked ? C.t3 : C.t1,
-                      transform: i === 0 ? `scale(${click})` : undefined,
-                    }}
-                  >
-                    {isAcked ? 'Acked' : 'Ack'}
-                  </span>
-                  <span style={{ fontFamily: FONT, fontSize: 15, padding: '6px 10px', borderRadius: 9, border: `1px solid ${C.lineHi}`, color: C.t1 }}>Resolve</span>
-                </div>
-              )
-            })}
-            <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
-              <span style={{ fontFamily: FONT, fontSize: 17, padding: '8px 14px', borderRadius: 10, background: `${C.info}22`, border: `1px solid ${C.info}77`, color: C.info }}>
-                Open dashboard
+          )
+        })}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 18 }}>
+          {ENDPOINTS.map((e, i) => {
+            const p = interpolate(frame, [100 + i * 5, 110 + i * 5], [0, 1], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' })
+            return (
+              <span
+                key={e}
+                style={{
+                  opacity: p,
+                  fontSize: 16,
+                  padding: '4px 10px',
+                  borderRadius: 8,
+                  border: `1px solid ${C.violet}55`,
+                  background: `${C.violet}14`,
+                  color: C.t1,
+                }}
+              >
+                {e}
               </span>
-              <span style={{ fontFamily: FONT, fontSize: 17, padding: '8px 14px', borderRadius: 10, border: `1px solid ${C.lineHi}`, color: C.t2 }}>Close</span>
-            </div>
-          </div>
+            )
+          })}
         </div>
       </div>
-    </div>
+    </Card>
   )
 }
 
 export const Everywhere: React.FC = () => (
   <AbsoluteFill>
     <Background glow={C.violet} glow2={C.info} />
-    <Typing start={18} chars={16} speed={1.6} /><Typing start={104} chars={47} speed={1.6} /><Typing start={168} chars={62} speed={1.6} /><Sfx at={34} name="tick" volume={0.35} /><Sfx at={140} name="chime" volume={0.3} /><Sfx at={213} name="chime" volume={0.35} /><Sfx at={26} name="pop" volume={0.35} /><Sfx at={80} name="pop" volume={0.3} /><Sfx at={192} name="tick" volume={0.5} />
+    <Typing start={18} chars={16} speed={1.6} />
+    <Typing start={104} chars={47} speed={1.6} />
+    <Typing start={168} chars={62} speed={1.6} />
+    <Sfx at={34} name="tick" volume={0.35} />
+    <Sfx at={140} name="chime" volume={0.3} />
+    <Sfx at={213} name="chime" volume={0.35} />
+    <Sfx at={26} name="pop" volume={0.35} />
     <div style={{ position: 'absolute', left: 100, top: 90, display: 'flex', flexDirection: 'column', gap: 18 }}>
-      <Kicker color={C.violet}>Everywhere you work</Kicker>
-      <Headline size={64}>Dashboard, desktop, terminal.</Headline>
+      <Kicker color={C.violet}>CLI &amp; REST API</Kicker>
+      <Headline size={64}>Script it. Automate it.</Headline>
     </div>
     <div style={{ position: 'absolute', left: 100, top: 290 }}>
       <Terminal />
     </div>
     <div style={{ position: 'absolute', left: 1100, top: 290 }}>
-      <Widget />
+      <Api />
     </div>
     <FadeUp delay={60} style={{ position: 'absolute', left: 100, right: 100, top: 962, display: 'flex', justifyContent: 'space-between' }}>
       <span style={{ fontFamily: FONT, fontSize: 24, color: C.t2 }}>
         <span style={{ color: C.t1, fontWeight: 600 }}>nimon-cli</span> · every API resource, --json for scripts
       </span>
       <span style={{ fontFamily: FONT, fontSize: 24, color: C.t2 }}>
-        <span style={{ color: C.t1, fontWeight: 600 }}>Desktop widget</span> · hub + edge + UI in one exe
+        <span style={{ color: C.t1, fontWeight: 600 }}>REST + WebSocket</span> · bearer-token protected writes
       </span>
     </FadeUp>
   </AbsoluteFill>
