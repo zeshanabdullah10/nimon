@@ -12,3 +12,8 @@ web/dist/*
 .env
 web/tsconfig.tsbuildinfo
 .kilo/
+
+# Remotion promo video
+video/node_modules
+video/out
+video/public/audio
