@@ -1,26 +1,47 @@
-# NIMon Edge Node Configuration
+# NIMon Edge Node Configuration (see edge.example.yaml for all keys)
 
 node:
   id: "edge-01"
   name: "Local Edge 1"
   hub_address: "localhost:9090"
   reconnect_interval_secs: 5
+  max_reconnect_interval_secs: 60
+  heartbeat_interval_secs: 30
+  ping_interval_secs: 30
 
 api:
   syscfg:
     enabled: true
     poll_interval_secs: 30
+  daqmx:
+    enabled: true
+  visa:
+    enabled: false
+    probe_idn: false
+  removal_sweeps: 3
 
 prediction:
   enabled: true
+  models:
+    - threshold
+    - ewma_anomaly
+    - trend_prediction
   temperature_warning: 65
   temperature_critical: 75
+  trend_window_minutes: 5
+
+action:
+  allowed_scripts: []
+  allowed_services: []
+  timeout_secs: 120
+  max_concurrent: 1
 
 buffer:
   enabled: true
-  max_size_mb: 100
-  persist_path: "./data/buffer.db"
+  max_messages: 1000
+  max_size_mb: 16
 
 logging:
   level: info
   file: "./logs/nimon-edge.log"
+  stdout: true

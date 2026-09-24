@@ -1,0 +1,60 @@
+# NIMon edge node - systemd unit
+#
+# Install (see README "Services"):
+#   sudo useradd --system --home-dir /var/lib/nimon-edge --shell /usr/sbin/nologin nimon
+#   sudo install -Dm755 target/release/nimon-edge /opt/nimon/bin/nimon-edge
+#   sudo install -Dm644 config/edge.example.yaml /etc/nimon/edge.yaml   # then edit node.*
+#   sudo cp systemd/nimon-edge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nimon-edge
+#
+# The working directory is /var/lib/nimon-edge (StateDirectory=), so the
+# default logging.file "./logs/nimon-edge.log" lands in
+# /var/lib/nimon-edge/logs. Set logging.file: "" to log to the journal only.
+# Put allowlisted scripts in /etc/nimon/scripts and set
+# action.scripts_dir: "/etc/nimon/scripts" (absolute).
+
+[Unit]
+Description=NIMon Edge Node - NI hardware discovery and health streaming
+Documentation=https://github.com/zeshanabdullah10/nimon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nimon
+Group=nimon
+ExecStart=/opt/nimon/bin/nimon-edge /etc/nimon/edge.yaml
+WorkingDirectory=/var/lib/nimon-edge
+StateDirectory=nimon-edge
+StateDirectoryMode=0750
+Restart=on-failure
+RestartSec=5
+# nimon-edge shuts down gracefully on Ctrl-C (SIGINT) only; SIGTERM would
+# terminate it without the shutdown path
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+Environment=RUST_LOG=info
+# NIMON_EDGE_TOKEN=... (hub WebSocket token) in a root-only file (mode 0600)
+EnvironmentFile=-/etc/nimon/edge.env
+
+# Hardening. Access to NI hardware / drivers needs the device nodes and
+# driver libraries, so PrivateDevices is NOT set. Hub-requested
+# `restart_services` actions call `systemctl restart <name>` for names in
+# action.allowed_services; that needs root (or a polkit rule for the nimon
+# user) - keep allowed_services empty when running unprivileged.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nimon-edge
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

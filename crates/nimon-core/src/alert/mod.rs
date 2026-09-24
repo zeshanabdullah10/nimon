@@ -12,7 +12,9 @@ pub use crate::types::Severity;
 
 /// Alert status lifecycle:
 /// `Pending` (duration window not yet satisfied) → `Firing` (active) →
-/// `Resolved` (cleared/acknowledged); `Suppressed` (beyond max_firing_count).
+/// `Acknowledged` (operator saw it; still active, re-notification
+/// suppressed) → `Resolved` (cleared); `Suppressed` (beyond
+/// max_firing_count).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AlertStatus {
@@ -20,16 +22,35 @@ pub enum AlertStatus {
     Firing,
     Resolved,
     Suppressed,
+    /// Still active (not resolved) but acknowledged: suppresses re-notification.
+    Acknowledged,
+}
+
+impl AlertStatus {
+    /// Every variant, in declaration order.
+    pub const ALL: [AlertStatus; 5] = [
+        AlertStatus::Pending,
+        AlertStatus::Firing,
+        AlertStatus::Resolved,
+        AlertStatus::Suppressed,
+        AlertStatus::Acknowledged,
+    ];
+
+    /// The wire/DB string form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Firing => "firing",
+            Self::Resolved => "resolved",
+            Self::Suppressed => "suppressed",
+            Self::Acknowledged => "acknowledged",
+        }
+    }
 }
 
 impl std::fmt::Display for AlertStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pending => write!(f, "pending"),
-            Self::Firing => write!(f, "firing"),
-            Self::Resolved => write!(f, "resolved"),
-            Self::Suppressed => write!(f, "suppressed"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -40,13 +61,29 @@ impl AlertStatus {
             "firing" => AlertStatus::Firing,
             "resolved" => AlertStatus::Resolved,
             "suppressed" => AlertStatus::Suppressed,
+            "acknowledged" => AlertStatus::Acknowledged,
             _ => AlertStatus::Pending,
         }
     }
 
-    /// True while the alert still requires attention.
+    /// True while the alert still requires attention (anything but `Resolved`,
+    /// including `Suppressed`).
     pub fn is_open(&self) -> bool {
         !matches!(self, AlertStatus::Resolved)
+    }
+
+    /// True for the active lifecycle states: `Pending`, `Firing`, `Acknowledged`.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            AlertStatus::Pending | AlertStatus::Firing | AlertStatus::Acknowledged
+        )
+    }
+
+    /// True when (re-)notification should be sent for this state
+    /// (`Acknowledged` and `Suppressed` alerts are silent).
+    pub fn should_notify(&self) -> bool {
+        matches!(self, AlertStatus::Pending | AlertStatus::Firing)
     }
 }
 
@@ -127,5 +164,35 @@ mod tests {
         assert!(AlertStatus::Pending.is_open());
         assert!(AlertStatus::Firing.is_open());
         assert!(!AlertStatus::Resolved.is_open());
+        assert!(AlertStatus::Acknowledged.is_open());
+    }
+
+    #[test]
+    fn test_alert_status_acknowledged() {
+        assert_eq!(
+            serde_json::to_string(&AlertStatus::Acknowledged).unwrap(),
+            "\"acknowledged\""
+        );
+        assert_eq!(AlertStatus::Acknowledged.to_string(), "acknowledged");
+        assert_eq!(
+            AlertStatus::parse("acknowledged"),
+            AlertStatus::Acknowledged
+        );
+        assert!(AlertStatus::Acknowledged.is_active());
+        assert!(!AlertStatus::Acknowledged.should_notify());
+    }
+
+    #[test]
+    fn test_alert_status_is_active_and_roundtrip() {
+        assert!(AlertStatus::Pending.is_active());
+        assert!(AlertStatus::Firing.is_active());
+        assert!(!AlertStatus::Resolved.is_active());
+        assert!(!AlertStatus::Suppressed.is_active());
+        for s in AlertStatus::ALL {
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(json, format!("\"{}\"", s));
+            assert_eq!(AlertStatus::parse(s.as_str()), s);
+            assert_eq!(serde_json::from_str::<AlertStatus>(&json).unwrap(), s);
+        }
     }
 }

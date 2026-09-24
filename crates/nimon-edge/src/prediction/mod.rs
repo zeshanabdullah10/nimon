@@ -3,8 +3,8 @@
 //! This module provides pluggable prediction models that can analyze
 //! device metrics and generate failure predictions:
 //!
-//! - [`EwmaAnomalyDetector`]: EWMA-based anomaly detection using z-scores
-//! - [`TrendPredictor`]: Linear regression trend detection
+//! - [`EwmaAnomalyDetector`]: EWMA-based detection of rising anomalies
+//! - [`TrendPredictor`]: Linear regression trend detection with ETA
 //! - [`ThresholdPredictor`]: Simple threshold-based prediction
 //!
 //! # Example
@@ -19,6 +19,6 @@
 pub mod models;
 
 pub use models::{
-    EwmaAnomalyDetector, ModelUpdate, Prediction, PredictionModel, ThresholdPredictor,
-    TrendPredictor,
+    excess_probability, EwmaAnomalyDetector, ModelKind, ModelUpdate, Prediction, PredictionModel,
+    ThresholdPredictor, TrendPredictor,
 };

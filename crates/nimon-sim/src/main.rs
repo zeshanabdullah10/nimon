@@ -1,221 +1,148 @@
 //! NIMon Edge Simulator
 //!
-//! Simulates an edge node connecting to the hub for end-to-end testing.
+//! Test harness for the hub: runs N simulated edges (one WebSocket
+//! connection each) speaking the real edge protocol, with scenarios that
+//! exercise threshold alerts, trend predictions, hysteresis, device
+//! removal, session replacement and load.
+//!
+//! ```text
+//! nimon-sim --scenario overheat --duration-secs 120
+//! nimon-sim --edges 3 --devices 8 --action-mode delay:2000 --seed 42
+//! NIMON_EDGE_TOKEN=secret nimon-sim --url ws://hub:9090/ws
+//! ```
 
-use anyhow::Result;
-use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
-use nimon_core::actor::messages::{
-    DeviceStatusUpdate, EdgeHeartbeat, EdgeRegister, PredictionResult,
-};
-use nimon_core::protocol::WsMessage;
-use nimon_core::{HealthStatus, MetricValue, PredictionType};
-use rand::Rng;
-use std::collections::HashMap;
+mod actions;
+mod cli;
+mod edge;
+mod model;
+mod stats;
+
+use clap::Parser;
+use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::sleep;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::sync::watch;
+use tokio::time::Instant;
+use tracing::{error, info, warn};
 
-struct EdgeSimulator {
-    edge_id: String,
-    edge_name: String,
-    device_ids: Vec<String>,
-}
+use cli::{Args, Scenario};
+use edge::{RunState, Shared};
+use stats::Stats;
 
-impl EdgeSimulator {
-    fn new(edge_id: &str, name: &str, device_count: usize) -> Self {
-        let device_ids = (0..device_count)
-            .map(|i| format!("{}-device-{}", edge_id, i))
-            .collect();
-        Self {
-            edge_id: edge_id.to_string(),
-            edge_name: name.to_string(),
-            device_ids,
-        }
-    }
-
-    fn generate_register(&self) -> EdgeRegister {
-        EdgeRegister {
-            edge_id: self.edge_id.clone(),
-            name: self.edge_name.clone(),
-            hostname: Some("simulated-edge".to_string()),
-            ip_address: Some("127.0.0.1".to_string()),
-        }
-    }
-
-    fn generate_device_status(&self) -> Vec<DeviceStatusUpdate> {
-        let mut rng = rand::thread_rng();
-        let timestamp = Utc::now();
-
-        self.device_ids
-            .iter()
-            .map(|device_id| {
-                let temperature = rng.gen_range(35.0..85.0);
-                let voltage_5v = rng.gen_range(4.8..5.2);
-                let voltage_3v3 = rng.gen_range(3.1..3.5);
-
-                let mut metrics = HashMap::new();
-                metrics.insert("temperature".to_string(), MetricValue::Float(temperature));
-                metrics.insert("voltage_5v".to_string(), MetricValue::Float(voltage_5v));
-                metrics.insert("voltage_3v3".to_string(), MetricValue::Float(voltage_3v3));
-
-                let status = if temperature > 75.0 {
-                    HealthStatus::Error
-                } else if temperature > 65.0 {
-                    HealthStatus::Warning
-                } else {
-                    HealthStatus::Healthy
-                };
-
-                DeviceStatusUpdate {
-                    edge_id: self.edge_id.clone(),
-                    device_id: device_id.clone(),
-                    status,
-                    metrics,
-                    timestamp,
-                    is_simulated: true,
-                }
-            })
-            .collect()
-    }
-
-    fn generate_heartbeat(&self) -> EdgeHeartbeat {
-        EdgeHeartbeat {
-            edge_id: self.edge_id.clone(),
-            timestamp: Utc::now(),
-            device_count: self.device_ids.len(),
-            status: "connected".to_string(),
-        }
-    }
-
-    fn maybe_generate_prediction(&self) -> Option<PredictionResult> {
-        let mut rng = rand::thread_rng();
-        // 20% chance of prediction
-        if rng.gen_bool(0.2) {
-            let device_id = self.device_ids[rng.gen_range(0..self.device_ids.len())].clone();
-            let pred_type = if rng.gen_bool(0.5) {
-                PredictionType::Overheating
-            } else {
-                PredictionType::ConnectionFailure
-            };
-
-            Some(PredictionResult {
-                edge_id: self.edge_id.clone(),
-                device_id,
-                prediction_type: pred_type,
-                probability: rng.gen_range(0.7..0.99),
-                eta_minutes: Some(rng.gen_range(5..60)),
-                confidence: rng.gen_range(0.6..0.95),
-                reason: Some("simulated random prediction".to_string()),
-                model_version: Some("sim-random".to_string()),
-                timestamp: Utc::now(),
-            })
-        } else {
-            None
-        }
-    }
-}
+/// Exit code for fatal protocol/auth errors
+const EXIT_FATAL: u8 = 2;
+/// Exit code for invalid command-line options
+const EXIT_USAGE: u8 = 64;
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize tracing
+async fn main() -> ExitCode {
+    let args = Args::parse();
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(if args.verbose {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::INFO
+        })
+        .with_target(false)
         .init();
 
-    tracing::info!("Starting NIMon Edge Simulator");
-
-    let simulator = EdgeSimulator::new("sim-edge-01", "Simulated Edge 1", 3);
-
-    loop {
-        tracing::info!("Connecting to hub at ws://localhost:9090/ws...");
-        match connect_and_run(&simulator).await {
-            Ok(_) => tracing::info!("Disconnected normally"),
-            Err(e) => tracing::error!("Connection error: {}", e),
+    let cfg = match args.resolve(rand::random()) {
+        Ok(cfg) => Arc::new(cfg),
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(EXIT_USAGE);
         }
-        tracing::info!("Reconnecting in 5 seconds...");
-        sleep(Duration::from_secs(5)).await;
+    };
+    info!(
+        url = %cfg.url,
+        scenario = %cfg.scenario,
+        edges = cfg.edges,
+        devices = cfg.devices,
+        interval = ?cfg.interval,
+        seed = cfg.seed,
+        action_mode = %cfg.action_mode,
+        auth = cfg.token.is_some(),
+        "nimon-sim starting (re-run with --seed {} to reproduce)",
+        cfg.seed
+    );
+
+    let stats = Arc::new(Stats::default());
+    let (run_tx, mut run_rx) = watch::channel(RunState::Running);
+    let shared = Shared {
+        cfg: cfg.clone(),
+        stats: stats.clone(),
+        run: Arc::new(run_tx),
+    };
+    let started = Instant::now();
+
+    let handles: Vec<_> = (0..cfg.edges)
+        .map(|i| tokio::spawn(edge::run_edge(i, shared.clone())))
+        .collect();
+    let reporter = (cfg.scenario == Scenario::Burst)
+        .then(|| tokio::spawn(throughput_reporter(stats.clone(), cfg.edges)));
+
+    let why = tokio::select! {
+        _ = async {
+            match cfg.duration {
+                Some(d) => tokio::time::sleep(d).await,
+                None => std::future::pending().await,
+            }
+        } => "duration elapsed",
+        _ = tokio::signal::ctrl_c() => "interrupted",
+        _ = run_rx.wait_for(|s| matches!(s, RunState::Fatal(_))) => "fatal error",
+    };
+    info!("stopping: {why}");
+    shared.run.send_if_modified(|s| {
+        if *s == RunState::Running {
+            *s = RunState::Stopping;
+            true
+        } else {
+            false
+        }
+    });
+    if let Some(r) = reporter {
+        r.abort();
+    }
+    // let edges send close frames, but never hang on exit
+    if tokio::time::timeout(
+        Duration::from_secs(5),
+        futures_util::future::join_all(handles),
+    )
+    .await
+    .is_err()
+    {
+        warn!("some edges did not stop within 5s");
+    }
+
+    let fatal = match &*shared.run.borrow() {
+        RunState::Fatal(reason) => Some(reason.clone()),
+        _ => None,
+    };
+    println!("{}", stats.summary(started.elapsed(), fatal.as_deref()));
+    match fatal {
+        Some(reason) => {
+            error!("{reason}");
+            ExitCode::from(EXIT_FATAL)
+        }
+        None => ExitCode::SUCCESS,
     }
 }
 
-async fn connect_and_run(simulator: &EdgeSimulator) -> Result<()> {
-    let url = "ws://localhost:9090/ws";
-    let (ws_stream, _) = connect_async(url).await?;
-    tracing::info!("Connected to hub");
-
-    let (mut write, mut read) = ws_stream.split();
-
-    // Send registration using nimon-core protocol
-    let register = simulator.generate_register();
-    let msg = WsMessage::edge_register(register);
-    let json = msg.to_json()?;
-    write.send(Message::Text(json.into())).await?;
-
-    // Send ping immediately
-    let ping = WsMessage::ping();
-    let ping_json = ping.to_json()?;
-    write.send(Message::Text(ping_json.into())).await?;
-
-    tracing::info!(
-        "Registered as {} ({})",
-        simulator.edge_name,
-        simulator.edge_id
-    );
-
-    // Main loop: send updates every 5 seconds
+/// Burst scenario: log send/receive rates every few seconds.
+async fn throughput_reporter(stats: Arc<Stats>, edges: usize) {
+    const EVERY: Duration = Duration::from_secs(5);
+    let mut last = (stats.total_sent(), stats.total_received(), Instant::now());
     loop {
-        // Send device status updates
-        for status in simulator.generate_device_status() {
-            let msg = WsMessage::device_status(status);
-            let json = msg.to_json()?;
-            write.send(Message::Text(json.into())).await?;
-            tracing::debug!("Sent status for device");
-        }
-
-        // Occasionally send predictions
-        if let Some(pred) = simulator.maybe_generate_prediction() {
-            let msg = WsMessage::prediction(pred);
-            let json = msg.to_json()?;
-            write.send(Message::Text(json.into())).await?;
-            tracing::info!("Sent prediction");
-        }
-
-        // Send heartbeat
-        let heartbeat = simulator.generate_heartbeat();
-        let msg = WsMessage::heartbeat(heartbeat);
-        let json = msg.to_json()?;
-        write.send(Message::Text(json.into())).await?;
-
-        tracing::debug!("Heartbeat sent");
-
-        // Wait 5 seconds before next update
-        sleep(Duration::from_secs(5)).await;
-
-        // Check for incoming messages
-        tokio::select! {
-            msg = read.next() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        tracing::debug!("Received: {}", text);
-                    }
-                    Some(Ok(Message::Close(_))) => {
-                        tracing::info!("Hub closed connection");
-                        break;
-                    }
-                    Some(Err(e)) => {
-                        tracing::warn!("WebSocket error: {}", e);
-                        break;
-                    }
-                    None => {
-                        tracing::info!("Stream ended");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            _ = sleep(Duration::from_secs(1)) => {}
-        }
+        tokio::time::sleep(EVERY).await;
+        let now = (stats.total_sent(), stats.total_received(), Instant::now());
+        let secs = (now.2 - last.2).as_secs_f64().max(0.001);
+        info!(
+            "throughput: {:.0} msg/s sent, {:.0} msg/s received, {}/{} edges connected",
+            (now.0 - last.0) as f64 / secs,
+            (now.1 - last.1) as f64 / secs,
+            stats::get(&stats.connected),
+            edges
+        );
+        last = now;
     }
-
-    Ok(())
 }

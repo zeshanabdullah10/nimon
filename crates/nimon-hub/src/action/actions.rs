@@ -213,6 +213,56 @@ pub struct ActionResult {
     pub executed_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Executable actions attached to a configured rule.
+#[derive(Debug, Clone)]
+pub struct RuleActionSpec {
+    /// Primary action, dispatched when the rule fires
+    pub action: Action,
+    /// Fallback executed when the primary action still fails after retries
+    pub on_failure: Option<Action>,
+}
+
+/// Map a hub `EdgeCommand` onto the wire action family the edge
+/// understands:
+/// - `power_cycle` / `reset_driver` map to the matching edge action
+/// - `restart_services` maps to `RestartServices`; the edge reads the
+///   comma-separated service list from parameter `services` (also filled
+///   from `service_name`/`service` when only those are given)
+/// - `custom_script` runs the allowlisted script named in parameter `script`
+/// - anything else runs as an allowlisted edge script named `command`
+pub fn map_edge_command(
+    command: &str,
+    parameters: &HashMap<String, String>,
+) -> (
+    nimon_core::actor::messages::ActionType,
+    HashMap<String, String>,
+) {
+    use nimon_core::actor::messages::ActionType as Wire;
+    let mut params = parameters.clone();
+    let wire = match command {
+        "power_cycle" => Wire::PowerCycle,
+        "reset_driver" => Wire::ResetDriver,
+        "restart_services" => {
+            if !params.contains_key("services") {
+                if let Some(name) = params
+                    .get("service_name")
+                    .or_else(|| params.get("service"))
+                    .cloned()
+                {
+                    params.insert("services".to_string(), name);
+                }
+            }
+            Wire::RestartServices
+        }
+        "custom_script" => Wire::CustomScript,
+        other => {
+            params.insert("script".to_string(), other.to_string());
+            Wire::CustomScript
+        }
+    };
+    (wire, params)
+}
+
 /// Convert a rule's action reference (core type) into an executable Action.
 pub fn action_from_ref(action_ref: &nimon_core::alert::rules::ActionRef) -> Action {
     use nimon_core::alert::rules::ActionRef;
@@ -345,6 +395,33 @@ mod tests {
         ));
         assert_eq!(power_action.timeout_secs, 120);
         assert_eq!(power_action.retry_config.max_attempts, 1);
+    }
+
+    #[test]
+    fn test_edge_command_mapping() {
+        use nimon_core::actor::messages::ActionType as Wire;
+        let empty = HashMap::new();
+        assert_eq!(map_edge_command("power_cycle", &empty).0, Wire::PowerCycle);
+        assert_eq!(
+            map_edge_command("reset_driver", &empty).0,
+            Wire::ResetDriver
+        );
+
+        let mut params = HashMap::new();
+        params.insert("service_name".to_string(), "NiSvc".to_string());
+        let (wire, p) = map_edge_command("restart_services", &params);
+        assert_eq!(wire, Wire::RestartServices);
+        assert_eq!(p.get("services").unwrap(), "NiSvc");
+
+        let mut params = HashMap::new();
+        params.insert("script".to_string(), "fix.ps1".to_string());
+        let (wire, p) = map_edge_command("custom_script", &params);
+        assert_eq!(wire, Wire::CustomScript);
+        assert_eq!(p.get("script").unwrap(), "fix.ps1");
+
+        let (wire, p) = map_edge_command("resend_state.ps1", &empty);
+        assert_eq!(wire, Wire::CustomScript);
+        assert_eq!(p.get("script").unwrap(), "resend_state.ps1");
     }
 
     #[test]

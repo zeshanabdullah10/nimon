@@ -14,14 +14,24 @@ pub const SERVICE_NAME: &str = "NIMonHub";
 pub fn default_config_yaml() -> &'static str {
     r#"# nimon-hub service configuration
 host: "0.0.0.0"
-port: 8080
-database_path: "data/nimon.db"
+port: 9090
+# Relative paths are resolved against this file's directory
+database_path: "../data/nimon.db"
 
 alert:
   default_cooldown_minutes: 5
   max_firing_count: 100
   cleanup_interval_hours: 24
 "#
+}
+
+/// SCM ImagePath for `exe`: the executable path is always quoted so a
+/// path with spaces (`C:\Program Files\...`) cannot be hijacked by a
+/// binary planted at a prefix such as `C:\Program.exe` (CWE-428).
+pub fn service_command_line_for(exe: &std::path::Path) -> String {
+    let path = exe.display().to_string();
+    let path = path.trim_matches('"');
+    format!("\"{}\" run-service", path)
 }
 
 #[cfg(windows)]
@@ -151,7 +161,7 @@ mod windows_impl {
     /// `run-service` argument.
     pub fn service_exe_command_line() -> Result<String, Box<dyn std::error::Error>> {
         let exe = std::env::current_exe()?;
-        Ok(format!("{} run-service", exe.display()))
+        Ok(super::service_command_line_for(&exe))
     }
 
     /// Persist a config template next to the exe when none exists
@@ -181,13 +191,14 @@ mod windows_impl {
 
     fn service_main(_args: Vec<std::ffi::OsString>) {
         if let Err(e) = run_service() {
-            eprintln!("nimon-hub service failed: {}", e);
+            tracing::error!("nimon-hub service failed: {}", e);
         }
     }
 
     fn set_status(
         handle: &service_control_handler::ServiceStatusHandle,
         state: ServiceState,
+        exit_code: ServiceExitCode,
         wait_hint: Duration,
         checkpoint: u32,
     ) -> windows_service::Result<()> {
@@ -195,11 +206,11 @@ mod windows_impl {
             service_type: ServiceType::OWN_PROCESS,
             current_state: state,
             controls_accepted: if state == ServiceState::Running {
-                ServiceControlAccept::STOP
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
             } else {
                 ServiceControlAccept::empty()
             },
-            exit_code: ServiceExitCode::Win32(0),
+            exit_code,
             checkpoint,
             wait_hint,
             process_id: None,
@@ -208,23 +219,46 @@ mod windows_impl {
 
     use std::time::Duration;
 
-    fn run_service() -> windows_service::Result<()> {
-        // Resolve config relative to the executable: services start with
-        // CWD set to System32.
-        let config_path = std::env::current_exe()
+    /// Directory of the running executable.
+    fn exe_dir() -> Option<PathBuf> {
+        std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(PathBuf::from))
-            .map(|dir| dir.join("config").join("hub.yaml"))
-            .unwrap_or_else(|| PathBuf::from("config/hub.yaml"));
-        let config = crate::config::HubConfig::load_or_default(&config_path)
-            .map_err(|e| windows_service::Error::Winapi(std::io::Error::other(e.to_string())))?;
+    }
 
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    /// Load the service config: `<exe dir>/config/hub.yaml`, with relative
+    /// paths resolved against the config file's directory.
+    fn load_service_config() -> anyhow::Result<crate::config::HubConfig> {
+        let dir = exe_dir().ok_or_else(|| anyhow::anyhow!("cannot locate the executable"))?;
+        let config_dir = dir.join("config");
+        let config_path = config_dir.join("hub.yaml");
+        let mut config = crate::config::HubConfig::load_or_default(&config_path)
+            .map_err(|e| anyhow::anyhow!("invalid config {}: {}", config_path.display(), e))?;
+        config.resolve_relative_paths(&config_dir);
+        tracing::info!(
+            "Service config {} (database {})",
+            config_path.display(),
+            config.database_path
+        );
+        Ok(config)
+    }
+
+    fn run_service() -> windows_service::Result<()> {
+        // The SCM starts services with CWD = System32: work next to the exe
+        if let Some(dir) = exe_dir() {
+            if let Err(e) = std::env::set_current_dir(&dir) {
+                tracing::warn!("Cannot change directory to {}: {}", dir.display(), e);
+            }
+        }
+
+        // Stop requests: a watch channel (non-blocking, never lost) — the
+        // shutdown future must not block the single-threaded actix runtime.
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
 
         let handler = move |control: ServiceControl| -> ServiceControlHandlerResult {
             match control {
                 ServiceControl::Stop | ServiceControl::Shutdown => {
-                    let _ = stop_tx.send(());
+                    let _ = stop_tx.send(true);
                     ServiceControlHandlerResult::NoError
                 }
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -235,38 +269,73 @@ mod windows_impl {
         let status_handle = service_control_handler::register(SERVICE_NAME, handler)?;
         set_status(
             &status_handle,
-            ServiceState::Running,
+            ServiceState::StartPending,
+            ServiceExitCode::Win32(0),
             Duration::from_secs(30),
+            1,
+        )?;
+
+        let config = match load_service_config() {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::error!("nimon-hub service cannot start: {}", e);
+                set_status(
+                    &status_handle,
+                    ServiceState::Stopped,
+                    ServiceExitCode::ServiceSpecific(1),
+                    Duration::from_secs(1),
+                    0,
+                )?;
+                return Ok(());
+            }
+        };
+
+        set_status(
+            &status_handle,
+            ServiceState::Running,
+            ServiceExitCode::Win32(0),
+            Duration::from_secs(0),
             0,
         )?;
 
-        // Run the hub (tokio + actix LocalSet) on a dedicated thread and
-        // wait for either completion or a stop request.
-        let worker = std::thread::spawn(move || {
+        // Run the hub (actix system + LocalSet) on a dedicated thread.
+        let worker = std::thread::spawn(move || -> anyhow::Result<()> {
             let runtime = actix_rt::System::new();
             runtime.block_on(async move {
                 let local = tokio::task::LocalSet::new();
                 local
-                    .run_until(async {
+                    .run_until(async move {
                         let shutdown = async move {
-                            let _ = stop_rx.recv();
+                            let _ = stop_rx.wait_for(|stop| *stop).await;
+                            tracing::info!("Service stop requested");
                         };
-                        let _ = crate::run_with_shutdown(config, shutdown).await;
+                        crate::run_with_shutdown(config, shutdown).await
                     })
-                    .await;
-            });
+                    .await
+            })
         });
 
-        while !worker.is_finished() {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        let _ = worker.join();
+        let outcome = match worker.join() {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("hub worker thread panicked")),
+        };
 
+        let exit_code = match &outcome {
+            Ok(()) => {
+                tracing::info!("nimon-hub service stopped");
+                ServiceExitCode::Win32(0)
+            }
+            Err(e) => {
+                tracing::error!("nimon-hub service stopped with an error: {}", e);
+                ServiceExitCode::ServiceSpecific(1)
+            }
+        };
         set_status(
             &status_handle,
             ServiceState::Stopped,
+            exit_code,
             Duration::from_secs(1),
-            1,
+            0,
         )?;
         Ok(())
     }
@@ -302,4 +371,24 @@ pub fn start_service(_service_name: &str) -> Result<(), Box<dyn std::error::Erro
 #[cfg(not(windows))]
 pub fn stop_service(_service_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     Err("Windows service support is only available on Windows".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_service_image_path_is_quoted() {
+        let exe = std::path::Path::new(r"C:\Program Files\NIMon Hub\nimon-hub.exe");
+        assert_eq!(
+            service_command_line_for(exe),
+            r#""C:\Program Files\NIMon Hub\nimon-hub.exe" run-service"#
+        );
+        // No double quoting
+        let quoted = std::path::Path::new(r#""C:\nimon\nimon-hub.exe""#);
+        assert_eq!(
+            service_command_line_for(quoted),
+            r#""C:\nimon\nimon-hub.exe" run-service"#
+        );
+    }
 }

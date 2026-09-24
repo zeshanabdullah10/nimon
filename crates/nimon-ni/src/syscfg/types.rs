@@ -1,4 +1,4 @@
-﻿//! Types for NI-SysCfg API
+//! Types for NI-SysCfg API
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -30,8 +30,16 @@ pub struct DiscoveredDevice {
     pub temperature: Option<f64>,
     /// Firmware version
     pub firmware_version: Option<String>,
-    /// Driver version
+    /// Driver version. Always `None` from NI-SysCfg: nisyscfg.h has no
+    /// per-resource driver version property (only HasDriver yes/no).
     pub driver_version: Option<String>,
+    /// NI-SysCfg IsChassis: true for chassis (PXI/cDAQ/cRIO backplanes),
+    /// false for modules/devices
+    #[serde(default)]
+    pub is_chassis: bool,
+    /// First expert's resource name (e.g. the DAQmx/VISA resource name)
+    #[serde(default)]
+    pub resource_name: Option<String>,
 }
 
 impl DiscoveredDevice {
@@ -50,6 +58,8 @@ impl DiscoveredDevice {
             temperature: None,
             firmware_version: None,
             driver_version: None,
+            is_chassis: false,
+            resource_name: None,
         }
     }
 }
@@ -112,16 +122,21 @@ impl DeviceHealth {
     ///
     /// This is the primary interface for consumers that need to turn raw health
     /// data into a status and metrics map for DeviceStatusUpdate messages.
+    ///
+    /// Non-finite readings (NaN/Inf) are dropped: serde_json encodes them
+    /// as `null`, which makes the hub reject the whole status message.
     pub fn to_status_and_metrics(self) -> (HealthStatus, HashMap<String, MetricValue>) {
         let mut metrics = self.metrics;
+        metrics.retain(|_, v| !matches!(v, MetricValue::Float(f) if !f.is_finite()));
+        let temperature = self.temperature.filter(|t| t.is_finite());
 
         // Populate temperature metric
-        if let Some(temp) = self.temperature {
+        if let Some(temp) = temperature {
             metrics.insert("temperature".to_string(), MetricValue::Float(temp));
         }
 
         // Named temperature sensors as individual metrics
-        for sensor in &self.sensors {
+        for sensor in self.sensors.iter().filter(|s| s.reading.is_finite()) {
             metrics.insert(
                 format!("temperature[{}]", sensor.name),
                 MetricValue::Float(sensor.reading),
@@ -146,7 +161,7 @@ impl DeviceHealth {
             HealthStatus::Error
         } else if let Some(false) = self.self_test_passed {
             HealthStatus::Error
-        } else if let Some(temp) = self.temperature {
+        } else if let Some(temp) = temperature {
             if temp > 75.0 {
                 HealthStatus::Error
             } else if temp > 65.0 {
@@ -181,12 +196,60 @@ mod tests {
             temperature: Some(45.5),
             firmware_version: Some("1.2.3".to_string()),
             driver_version: Some("23.0.0".to_string()),
+            is_chassis: false,
+            resource_name: Some("PXI1Slot4".to_string()),
         };
 
         let json = serde_json::to_string(&device).unwrap();
         let parsed: DiscoveredDevice = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.product_name, device.product_name);
         assert_eq!(parsed.temperature, device.temperature);
+        assert_eq!(parsed.resource_name, device.resource_name);
+    }
+
+    #[test]
+    fn test_discovered_device_deserializes_without_new_fields() {
+        let json = r#"{"product_name":"cDAQ-9178","serial_number":"1","alias":null,
+            "slot":null,"parent_link":null,"num_slots":8,"is_simulated":false,
+            "ip_address":null,"is_reachable":true,"temperature":null,
+            "firmware_version":null,"driver_version":null}"#;
+        let parsed: DiscoveredDevice = serde_json::from_str(json).unwrap();
+        assert!(!parsed.is_chassis);
+        assert!(parsed.resource_name.is_none());
+    }
+
+    #[test]
+    fn test_non_finite_readings_are_dropped_from_metrics() {
+        let mut extra = HashMap::new();
+        extra.insert("bogus".to_string(), MetricValue::Float(f64::INFINITY));
+        let health = DeviceHealth {
+            is_reachable: true,
+            temperature: Some(f64::NAN),
+            sensors: vec![
+                SensorReading {
+                    name: "CPU".into(),
+                    reading: f64::NAN,
+                    upper_critical: None,
+                },
+                SensorReading {
+                    name: "Board".into(),
+                    reading: 40.0,
+                    upper_critical: None,
+                },
+            ],
+            self_test_passed: None,
+            error_message: None,
+            metrics: extra,
+        };
+        let (status, metrics) = health.to_status_and_metrics();
+        assert_eq!(status, HealthStatus::Healthy);
+        assert!(!metrics.contains_key("temperature"));
+        assert!(!metrics.contains_key("temperature[CPU]"));
+        assert!(!metrics.contains_key("bogus"));
+        assert!(metrics.contains_key("temperature[Board]"));
+        // the whole map must serialise without nulls
+        let json = serde_json::to_string(&metrics).unwrap();
+        assert!(!json.contains("null"));
     }
 
     #[test]
@@ -229,7 +292,7 @@ mod tests {
         ));
         assert!(matches!(
             metrics.get("is_reachable"),
-            Some(MetricValue::Boolean(v)) if *v == true
+            Some(MetricValue::Boolean(true))
         ));
     }
 
@@ -240,7 +303,7 @@ mod tests {
         assert_eq!(status, HealthStatus::Offline);
         assert!(matches!(
             metrics.get("is_reachable"),
-            Some(MetricValue::Boolean(v)) if *v == false
+            Some(MetricValue::Boolean(false))
         ));
     }
 

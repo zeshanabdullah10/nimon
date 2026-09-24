@@ -1,6 +1,6 @@
 //! Repository for prediction operations
 
-use crate::NimonResult;
+use crate::{NimonResult, PredictionStatus};
 use sqlx::SqlitePool;
 
 /// Database record for a prediction
@@ -17,6 +17,13 @@ pub struct PredictionRecord {
     pub status: String,
     pub created_at: String,
     pub resolved_at: Option<String>,
+}
+
+impl PredictionRecord {
+    /// Parsed status (`None` for an unknown stored value).
+    pub fn status(&self) -> Option<PredictionStatus> {
+        PredictionStatus::parse(&self.status).ok()
+    }
 }
 
 pub struct PredictionRepository<'a> {
@@ -43,7 +50,7 @@ impl<'a> PredictionRepository<'a> {
             INSERT INTO predictions (device_id, edge_id, prediction_type, probability,
                                      eta_minutes, model_version, status, created_at)
             VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
-            "#
+            "#,
         )
         .bind(device_id)
         .bind(edge_id)
@@ -96,13 +103,17 @@ impl<'a> PredictionRepository<'a> {
 
     /// Expire active predictions that have not been refreshed within the
     /// given number of minutes (models re-report while a risk persists).
+    /// `resolved_at` is the time of expiry (now), not the cutoff.
     pub async fn expire_stale(&self, stale_minutes: i64) -> NimonResult<u64> {
-        let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(stale_minutes)).to_rfc3339();
+        let now = chrono::Utc::now();
+        let cutoff = (now - chrono::Duration::minutes(stale_minutes)).to_rfc3339();
         let result = sqlx::query(
-            "UPDATE predictions SET status = 'resolved', resolved_at = ? \
-             WHERE status = 'active' AND created_at < ?",
+            "UPDATE predictions SET status = ?, resolved_at = ? \
+             WHERE status = ? AND created_at < ?",
         )
-        .bind(&cutoff)
+        .bind(PredictionStatus::Resolved.as_str())
+        .bind(now.to_rfc3339())
+        .bind(PredictionStatus::Active.as_str())
         .bind(&cutoff)
         .execute(self.pool)
         .await?;
@@ -291,8 +302,17 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let before = chrono::Utc::now();
         let expired = repo.expire_stale(60).await.unwrap();
         assert_eq!(expired, 1);
         assert!(repo.list_active().await.unwrap().is_empty());
+
+        // resolved_at is the expiry time (now), not the cutoff
+        let rec = &repo.list_by_device("device-1", 1).await.unwrap()[0];
+        assert_eq!(rec.status(), Some(PredictionStatus::Resolved));
+        let resolved_at = chrono::DateTime::parse_from_rfc3339(rec.resolved_at.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(resolved_at >= before - chrono::Duration::seconds(1));
     }
 }

@@ -1,45 +1,35 @@
 //! Actor infrastructure for the edge node
 //!
-//! This module provides the actor-based device monitoring system:
-//!
-//! - [`DeviceManagerActor`] - Manages all device actors and discovery
-//! - [`DeviceActor`] - Monitors a single NI device
-//! - [`PredictionActor`] - Analyzes device metrics and generates predictions
-//! - [`HubConnectorActor`] - Bridges device actors to hub communication
+//! - [`DeviceManagerActor`] - owns all devices; one timer drives the shared
+//!   NI-SysCfg sweep (blocking pool), VISA discovery and simulation
+//! - [`PredictionActor`] - per-(device, metric) prediction models
+//! - [`HubConnectorActor`] - registration, heartbeats, offline buffer,
+//!   hub commands/actions; owns the WebSocket client
 //!
 //! # Architecture
 //!
 //! ```text
-//! DeviceManagerActor
-//!     |
-//!     +-- DeviceActor (per device)
-//!     |       |
-//!     |       +-- Periodic polling
-//!     |       +-- DeviceStatusUpdate emissions
-//!     |
-//!     +-- PredictionActor
-//!     |       |
-//!     |       +-- Receives DeviceStatusUpdate
-//!     |       +-- Generates PredictionResult
-//!     |
-//!     +-- HubConnectorActor
-//!             |
-//!             +-- Receives DeviceStatusUpdate, DeviceAlert, PredictionResult
-//!             +-- Forwards to hub via WebSocket
+//! DeviceManagerActor --(DeviceStatusUpdate, DeviceRemoved)--> PredictionActor
+//!        |                                                        |
+//!        | DeviceAlert, UpdateDeviceCount       PredictionResult, status, removals
+//!        v                                                        v
+//!   HubConnectorActor <-------------------------------------------+
+//!        |  single offline buffer, register-then-flush
+//!        v
+//!   WsClient (one supervisor task: connect / backoff / ping)  <-->  hub
 //! ```
 
-pub mod device_actor;
 pub mod device_manager;
 pub mod hub_connector;
 pub mod prediction_actor;
 
-pub use device_actor::DeviceActor;
 pub use device_manager::{
-    AddDevice, ApplyConfig, DeviceManagerActor, GetDeviceCount, ListDevices, PollAllDevices,
-    PollDevice, RemoveDevice,
+    AddDevice, ApplyConfig, DeviceManagerActor, DeviceManagerSettings, GetDeviceCount,
+    GetManagerSnapshot, ListDevices, ManagerSnapshot, PollAllDevices, RemoveDevice, ResendState,
+    StopDeviceManager,
 };
 pub use hub_connector::{
-    AttachDeviceManager, ConnectionStateChanged, GetConnectionState, HubConnectorActor,
-    HubConnectorConfig, MessageReceived, UpdateDeviceCount,
+    AttachDeviceManager, Connect, Disconnect, GetBufferedCount, GetConnectionState,
+    HubConnectorActor, HubConnectorConfig, UpdateDeviceCount,
 };
-pub use prediction_actor::PredictionActor;
+pub use prediction_actor::{PredictionActor, PredictionSettings, UpdateThresholds};

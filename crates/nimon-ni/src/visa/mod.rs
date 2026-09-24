@@ -22,5 +22,5 @@ mod ffi;
 mod safe;
 mod types;
 
-pub use safe::{NiVisa, VisaSession};
+pub use safe::{NiVisa, VisaSession, DEFAULT_IO_TIMEOUT_MS};
 pub use types::{VisaHealth, VisaInstrument};

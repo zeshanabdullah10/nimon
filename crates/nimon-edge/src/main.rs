@@ -4,7 +4,8 @@
 //! prediction models, and streams everything to the central hub over WebSocket.
 //!
 //! Usage: nimon-edge [path/to/edge.yaml]
-//! Defaults to config/edge.yaml when no path is given.
+//! Defaults to config/edge.yaml when no path is given. Ctrl-C shuts down
+//! gracefully.
 
 use nimon_edge::config::EdgeConfig;
 
@@ -21,15 +22,14 @@ fn main() {
         }
     };
 
-    let log_level = match config.logging.level.to_lowercase().as_str() {
-        "trace" => tracing::Level::TRACE,
-        "debug" => tracing::Level::DEBUG,
-        "warn" => tracing::Level::WARN,
-        "error" => tracing::Level::ERROR,
-        _ => tracing::Level::INFO,
-    };
-    tracing_subscriber::fmt().with_max_level(log_level).init();
+    // keep the guard alive: dropping it flushes the file writer
+    let _log_guard = nimon_edge::logging::init(&config.logging);
 
     let runtime = actix_rt::System::new();
-    runtime.block_on(nimon_edge::start(config));
+    runtime.block_on(nimon_edge::start_with_shutdown(config, async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("Ctrl-C handler unavailable ({e}); running until killed");
+            std::future::pending::<()>().await;
+        }
+    }));
 }

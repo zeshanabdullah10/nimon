@@ -1,306 +1,322 @@
 //! Safe Rust wrapper for NI-DAQmx API
 //!
-//! This module provides safe, idiomatic Rust wrappers around the NI-DAQmx C API.
-//! Unlike VISA, DAQmx does not require session handles for attribute-query
-//! functions -- just pass device name strings directly.
+//! Only the entry points needed for core operation are required
+//! (`DAQmxGetSysDevNames`, `DAQmxResetDevice`); everything else is
+//! optional so an older/trimmed driver degrades gracefully instead of
+//! failing `load()` as a whole. The library is cached process-wide with
+//! the same retry-after-60 s policy as NI-SysCfg.
+//!
+//! All calls block on the driver (a reset can take seconds); async callers
+//! should use `spawn_blocking`. [`NiDaqMx`] is `Copy + Send + Sync`.
 
-use libloading::os::windows::{Library, Symbol};
-use std::path::Path;
+use libloading::Library;
+use std::os::raw::c_char;
 
 use super::ffi::*;
 use super::types::*;
-use crate::common::{c_str_to_string, check_status, string_to_c_string};
+use crate::common::{
+    c_buf_to_string, check_status, library_candidates, load_first_library, optional_symbol,
+    required_symbol, string_to_c_string, LibCache, LOAD_RETRY_INTERVAL,
+};
 use crate::{NimonError, NimonResult};
+
+#[derive(Clone, Copy)]
+struct DaqmxApi {
+    // required
+    get_sys_dev_names: DAQmxGetSysDevNames,
+    reset_device: DAQmxResetDevice,
+    // optional
+    self_test_device: Option<DAQmxSelfTestDevice>,
+    get_dev_product_type: Option<DAQmxGetDevProductType>,
+    get_dev_product_num: Option<DAQmxGetDevProductNum>,
+    get_dev_serial_num: Option<DAQmxGetDevSerialNum>,
+    get_dev_is_simulated: Option<DAQmxGetDevIsSimulated>,
+    get_cal_dev_temp: Option<DAQmxGetCalDevTemp>,
+    get_extended_error_info: Option<DAQmxGetExtendedErrorInfo>,
+}
+
+struct DaqmxLoaded {
+    _library: Library,
+    api: DaqmxApi,
+}
+
+static DAQMX: LibCache<DaqmxLoaded> = LibCache::new(LOAD_RETRY_INTERVAL);
+
+fn daqmx() -> Result<&'static DaqmxLoaded, String> {
+    DAQMX.get_or_load(|| unsafe { load_once() })
+}
+
+unsafe fn load_once() -> Result<DaqmxLoaded, String> {
+    let candidates = library_candidates(
+        "nicaiu.dll",
+        &[],
+        &[
+            "libnidaqmx.so",
+            "libnidaqmx.so.1",
+            "/usr/local/natinst/lib/libnidaqmx.so",
+        ],
+    );
+    let library = load_first_library("NI-DAQmx (nicaiu)", &candidates)?;
+    let api = DaqmxApi {
+        get_sys_dev_names: required_symbol(&library, "DAQmxGetSysDevNames")?,
+        reset_device: required_symbol(&library, "DAQmxResetDevice")?,
+        self_test_device: optional_symbol(&library, "DAQmxSelfTestDevice"),
+        get_dev_product_type: optional_symbol(&library, "DAQmxGetDevProductType"),
+        get_dev_product_num: optional_symbol(&library, "DAQmxGetDevProductNum"),
+        get_dev_serial_num: optional_symbol(&library, "DAQmxGetDevSerialNum"),
+        get_dev_is_simulated: optional_symbol(&library, "DAQmxGetDevIsSimulated"),
+        get_cal_dev_temp: optional_symbol(&library, "DAQmxGetCalDevTemp"),
+        get_extended_error_info: optional_symbol(&library, "DAQmxGetExtendedErrorInfo"),
+    };
+    Ok(DaqmxLoaded {
+        _library: library,
+        api,
+    })
+}
+
+/// Whether a DAQmx error only means "property not supported here"
+fn is_unsupported(status: i32) -> bool {
+    matches!(
+        status,
+        errors::ATTR_NOT_SUPPORTED
+            | errors::ATTRIBUTE_NOT_SUPPORTED_IN_TASK_CONTEXT
+            | errors::ATTR_NOT_SUPPORTED_ON_ACCESSORY
+            | errors::ATTR_NOT_SUPPORTED_USE_PHYSICAL_CHANNEL_PROPERTY
+    )
+}
+
+/// Read a DAQmx string using the `(NULL, 0)` size-query convention.
+/// `call(buf, size)` must invoke the DAQmx getter.
+fn read_daqmx_string(
+    api_name: &'static str,
+    mut call: impl FnMut(*mut c_char, u32) -> i32,
+) -> NimonResult<String> {
+    let needed = call(std::ptr::null_mut(), 0);
+    if needed < 0 {
+        return Err(NimonError::NiApi {
+            api: api_name,
+            code: needed,
+        });
+    }
+    if needed == 0 {
+        return Ok(String::new());
+    }
+    // +1 guards against drivers that exclude the terminator
+    let size = (needed as usize).saturating_add(1).min(DAQMX_MAX_STRING);
+    let mut buffer = vec![0 as c_char; size];
+    let status = call(buffer.as_mut_ptr(), size as u32);
+    check_status(api_name, status)?;
+    Ok(c_buf_to_string(&buffer))
+}
 
 /// NI-DAQmx API wrapper
 ///
-/// This struct holds the loaded DLL and function pointers for the NI-DAQmx API.
-/// It provides a safe interface for discovering DAQ devices and querying
-/// their health information.
+/// Cheap to obtain and `Copy`: the library and entry points are cached
+/// process-wide.
+#[derive(Clone, Copy)]
 pub struct NiDaqMx {
-    #[allow(dead_code)]
-    library: Library,
-    get_sys_dev_names: Symbol<DAQmxGetSysDevNames>,
-    get_dev_product_type_name: Symbol<DAQmxGetDevProductTypeName>,
-    get_dev_serial_num: Symbol<DAQmxGetDevSerialNum>,
-    get_dev_temperature: Symbol<DAQmxGetDevTemperature>,
-    get_dev_self_test_result: Symbol<DAQmxGetDevSelfTestResult>,
-    get_dev_ai_power_supply_voltages: Symbol<DAQmxGetDevAIPowerSupplyVoltages>,
-    reset_device: Symbol<DAQmxResetDevice>,
-    get_dev_product_number: Symbol<DAQmxGetDevProductNumber>,
+    api: DaqmxApi,
 }
 
 impl NiDaqMx {
-    /// Load the NI-DAQmx DLL and initialize function pointers
+    /// Load NI-DAQmx (cached after the first successful call; failures are
+    /// retried after 60 s)
     ///
     /// # Errors
-    /// Returns an error if:
-    /// - The DLL cannot be found (NI-DAQmx not installed)
-    /// - The DLL cannot be loaded
-    /// - Required symbols are missing from the DLL
+    /// Returns an error if the library cannot be found/loaded or lacks
+    /// `DAQmxGetSysDevNames` / `DAQmxResetDevice`.
     pub fn load() -> NimonResult<Self> {
-        let dll_path = Self::find_dll()?;
-
-        unsafe {
-            let library = Library::new(&dll_path).map_err(|e| {
-                NimonError::Connection(format!("Failed to load {:?}: {}", dll_path, e))
-            })?;
-
-            let get_sys_dev_names = Self::get_symbol(&library, b"DAQmxGetSysDevNames")?;
-            let get_dev_product_type_name =
-                Self::get_symbol(&library, b"DAQmxGetDevProductTypeName")?;
-            let get_dev_serial_num = Self::get_symbol(&library, b"DAQmxGetDevSerialNum")?;
-            let get_dev_temperature = Self::get_symbol(&library, b"DAQmxGetDevTemperature")?;
-            let get_dev_self_test_result =
-                Self::get_symbol(&library, b"DAQmxGetDevSelfTestResult")?;
-            let get_dev_ai_power_supply_voltages =
-                Self::get_symbol(&library, b"DAQmxGetDevAIPowerSupplyVoltages")?;
-            let reset_device = Self::get_symbol(&library, b"DAQmxResetDevice")?;
-            let get_dev_product_number = Self::get_symbol(&library, b"DAQmxGetDevProductNumber")?;
-
-            Ok(Self {
-                library,
-                get_sys_dev_names,
-                get_dev_product_type_name,
-                get_dev_serial_num,
-                get_dev_temperature,
-                get_dev_self_test_result,
-                get_dev_ai_power_supply_voltages,
-                reset_device,
-                get_dev_product_number,
-            })
-        }
-    }
-
-    unsafe fn get_symbol<T>(library: &Library, name: &[u8]) -> NimonResult<Symbol<T>> {
-        library
-            .get(name)
-            .map_err(|e| NimonError::Connection(format!("Symbol not found: {}", e)))
-    }
-
-    /// Find the NI-DAQmx DLL location
-    ///
-    /// Searches common installation paths for nicaiu.dll.
-    fn find_dll() -> NimonResult<std::path::PathBuf> {
-        let candidates = [
-            "C:\\Windows\\System32\\nicaiu.dll",
-            "C:\\Program Files\\NI\\Shared\\nicaiu.dll",
-            "C:\\Program Files (x86)\\NI\\Shared\\nicaiu.dll",
-        ];
-
-        for path in &candidates {
-            if Path::new(path).exists() {
-                return Ok(path.into());
-            }
-        }
-
-        Err(NimonError::Connection(
-            "nicaiu.dll not found. Please install NI-DAQmx.".into(),
-        ))
+        daqmx()
+            .map(|l| NiDaqMx { api: l.api })
+            .map_err(NimonError::Connection)
     }
 
     /// Check if NI-DAQmx is available on this system
     ///
-    /// Returns true if the DLL can be found, false otherwise.
+    /// Actually attempts the (cached) load.
     pub fn is_available() -> bool {
-        Self::find_dll().is_ok()
+        daqmx().is_ok()
+    }
+
+    /// Extended description of the most recent DAQmx error **on the
+    /// calling thread** (DAQmxGetExtendedErrorInfo), if available.
+    pub fn last_error_message(&self) -> Option<String> {
+        let f = self.api.get_extended_error_info?;
+        // fixed buffer (as in NI's examples): a separate size-query call
+        // could itself invalidate the per-thread error information
+        let mut buffer = vec![0 as c_char; 2048];
+        let status = unsafe { f(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if status < 0 {
+            return None;
+        }
+        Some(c_buf_to_string(&buffer).trim().to_string()).filter(|s| !s.is_empty())
+    }
+
+    /// Log and convert a status, attaching DAQmx's extended error info
+    fn check(&self, api_name: &'static str, status: i32, device: &str) -> NimonResult<()> {
+        if status < 0 {
+            if let Some(msg) = self.last_error_message() {
+                tracing::warn!("{api_name}('{device}') failed ({status}): {msg}");
+            }
+        }
+        check_status(api_name, status)
+    }
+
+    /// Names of all DAQmx devices on the system (DAQmxGetSysDevNames)
+    pub fn device_names(&self) -> NimonResult<Vec<String>> {
+        let f = self.api.get_sys_dev_names;
+        let names = read_daqmx_string("DAQmxGetSysDevNames", |buf, size| unsafe { f(buf, size) })?;
+        Ok(parse_device_names(&names))
     }
 
     /// Discover all DAQ devices on the system
     ///
-    /// Uses DAQmxGetSysDevNames to get a comma-separated list of device names,
-    /// then queries each device for its product name, product number, and serial number.
+    /// Queries each device for product type, product number, serial number
+    /// and simulation state where the driver supports it.
     pub fn discover_devices(&self) -> NimonResult<Vec<DaqDevice>> {
-        let mut dev_names_buffer = [0i8; DAQMX_BUFFER_SIZE];
-
-        let status = unsafe {
-            (self.get_sys_dev_names)(dev_names_buffer.as_mut_ptr(), DAQMX_BUFFER_SIZE as i32)
-        };
-        check_status("DAQmxGetSysDevNames", status)?;
-
-        let dev_names_str = unsafe { c_str_to_string(dev_names_buffer.as_ptr()) }
-            .ok_or_else(|| NimonError::Config("Failed to read device names".into()))?;
-
-        let device_names = parse_device_names(&dev_names_str);
-        let mut devices = Vec::with_capacity(device_names.len());
-
-        for name in device_names {
+        let mut devices = Vec::new();
+        for name in self.device_names()? {
             match self.get_device_info(&name) {
                 Ok(device) => devices.push(device),
-                Err(e) => {
-                    tracing::warn!("Failed to query info for DAQ device '{}': {}", name, e);
-                }
+                Err(e) => tracing::warn!("Failed to query info for DAQ device '{name}': {e}"),
             }
         }
-
         Ok(devices)
     }
 
     /// Get health information for a specific DAQ device
     ///
-    /// Queries the device for temperature, self-test result, and power supply voltages.
-    /// Individual query failures are captured as error_message rather than returning
-    /// an error, so partial health data can still be reported.
+    /// Non-invasive: a basic identity query decides reachability and the
+    /// calibration temperature is read where supported. No self-test is
+    /// run (see [`NiDaqMx::self_test_device`]).
     pub fn get_device_health(&self, device_name: &str) -> NimonResult<DaqHealth> {
-        let mut health = DaqHealth::new();
-        let dev_cstr = string_to_c_string(device_name)
+        let dev = string_to_c_string(device_name)
             .ok_or_else(|| NimonError::Config("Device name contains null bytes".into()))?;
+        let mut health = DaqHealth::new();
 
-        // Query temperature
-        match unsafe { self.query_temperature(dev_cstr.as_ptr()) } {
-            Ok(temp) => health.temperature = Some(temp),
-            Err(e) => {
-                health.error_message = Some(format!("Temperature query failed: {}", e));
+        // Reachability probe: serial number, else product type
+        let probe = if let Some(f) = self.api.get_dev_serial_num {
+            let mut serial: u32 = 0;
+            Some(unsafe { f(dev.as_ptr(), &mut serial) })
+        } else {
+            self.api.get_dev_product_type.map(|f| {
+                let mut buf = [0 as c_char; 256];
+                unsafe { f(dev.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+            })
+        };
+        match probe {
+            Some(status) if status < 0 => {
+                let detail = self.last_error_message();
+                health.is_reachable = Some(false);
+                health.error_message = Some(match detail {
+                    Some(d) => format!("Device query failed ({status}): {d}"),
+                    None => format!("Device query failed ({status})"),
+                });
+                return Ok(health);
             }
+            Some(_) => health.is_reachable = Some(true),
+            None => {}
         }
 
-        // Query self-test result
-        match unsafe { self.query_self_test(dev_cstr.as_ptr()) } {
-            Ok(passed) => health.self_test_passed = Some(passed),
-            Err(e) => {
-                let msg = format!("Self-test query failed: {}", e);
-                health.error_message = Some(match health.error_message {
-                    Some(existing) => format!("{}; {}", existing, msg),
-                    None => msg,
-                });
-            }
-        }
-
-        // Query power supply voltages
-        match unsafe { self.query_power_supply_voltages(dev_cstr.as_ptr()) } {
-            Ok((v5, v3v3, v_user, v_neg_user)) => {
-                health.voltage_5v = Some(v5);
-                health.voltage_3v3 = Some(v3v3);
-                health.voltage_user = Some(v_user);
-                health.voltage_negative_user = Some(v_neg_user);
-            }
-            Err(e) => {
-                let msg = format!("Power supply query failed: {}", e);
-                health.error_message = Some(match health.error_message {
-                    Some(existing) => format!("{}; {}", existing, msg),
-                    None => msg,
-                });
+        if let Some(f) = self.api.get_cal_dev_temp {
+            let mut temp: f64 = 0.0;
+            let status = unsafe { f(dev.as_ptr(), &mut temp) };
+            if status >= 0 {
+                health.temperature = Some(temp).filter(|t| t.is_finite());
+            } else if !is_unsupported(status) {
+                health.error_message = Some(format!("Temperature query failed: status {status}"));
             }
         }
 
         Ok(health)
     }
 
-    /// Reset a device to its default state
+    /// Reset a device to its default state (aborts its tasks)
     ///
     /// # Errors
     /// Returns an error if the reset operation fails.
     pub fn reset_device(&self, device_name: &str) -> NimonResult<()> {
-        let dev_cstr = string_to_c_string(device_name)
+        let dev = string_to_c_string(device_name)
             .ok_or_else(|| NimonError::Config("Device name contains null bytes".into()))?;
+        let status = unsafe { (self.api.reset_device)(dev.as_ptr()) };
+        self.check("DAQmxResetDevice", status, device_name)
+    }
 
-        let status = unsafe { (self.reset_device)(dev_cstr.as_ptr()) };
-        check_status("DAQmxResetDevice", status)
+    /// Run the device self-test (DAQmxSelfTestDevice)
+    ///
+    /// Returns `Ok(true)` when the test passes and `Ok(false)` when the
+    /// driver reports a failure; `Err` if the call itself is unavailable.
+    /// Invasive: the device must not be running tasks.
+    pub fn self_test_device(&self, device_name: &str) -> NimonResult<bool> {
+        let f = self.api.self_test_device.ok_or_else(|| {
+            NimonError::Connection("DAQmxSelfTestDevice not exported by this driver".into())
+        })?;
+        let dev = string_to_c_string(device_name)
+            .ok_or_else(|| NimonError::Config("Device name contains null bytes".into()))?;
+        let status = unsafe { f(dev.as_ptr()) };
+        if status < 0 {
+            if let Some(msg) = self.last_error_message() {
+                tracing::warn!("DAQmxSelfTestDevice('{device_name}') failed ({status}): {msg}");
+            }
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Query detailed information for a single DAQ device
     fn get_device_info(&self, device_name: &str) -> NimonResult<DaqDevice> {
         let mut device = DaqDevice::new(device_name.to_string());
-        let dev_cstr = string_to_c_string(device_name)
+        let dev = string_to_c_string(device_name)
             .ok_or_else(|| NimonError::Config("Device name contains null bytes".into()))?;
 
-        // Query product type name
-        let mut product_name_buffer = [0i8; 256];
-        let status = unsafe {
-            (self.get_dev_product_type_name)(
-                dev_cstr.as_ptr(),
-                product_name_buffer.as_mut_ptr(),
-                256,
-            )
-        };
-        if status == DAQMX_SUCCESS {
-            if let Some(name) = unsafe { c_str_to_string(product_name_buffer.as_ptr()) } {
-                device.product_name = name;
+        if let Some(f) = self.api.get_dev_product_type {
+            match read_daqmx_string("DAQmxGetDevProductType", |buf, size| unsafe {
+                f(dev.as_ptr(), buf, size)
+            }) {
+                Ok(name) => device.product_name = name,
+                Err(e) => tracing::debug!("{e} for '{device_name}'"),
             }
-        } else {
-            tracing::debug!(
-                "DAQmxGetDevProductTypeName for '{}' returned status {}",
-                device_name,
-                status
-            );
         }
-
-        // Query product number
-        let mut product_number: i32 = 0;
-        let status =
-            unsafe { (self.get_dev_product_number)(dev_cstr.as_ptr(), &mut product_number) };
-        if status == DAQMX_SUCCESS {
-            device.product_number = product_number.to_string();
-        } else {
-            tracing::debug!(
-                "DAQmxGetDevProductNumber for '{}' returned status {}",
-                device_name,
-                status
-            );
+        if let Some(f) = self.api.get_dev_product_num {
+            let mut num: u32 = 0;
+            let status = unsafe { f(dev.as_ptr(), &mut num) };
+            if status >= 0 {
+                device.product_number = format_product_number(num);
+            } else {
+                tracing::debug!("DAQmxGetDevProductNum for '{device_name}' returned {status}");
+            }
         }
-
-        // Query serial number
-        let mut serial_number: u32 = 0;
-        let status = unsafe { (self.get_dev_serial_num)(dev_cstr.as_ptr(), &mut serial_number) };
-        if status == DAQMX_SUCCESS {
-            device.serial_number = serial_number.to_string();
-        } else {
-            tracing::debug!(
-                "DAQmxGetDevSerialNum for '{}' returned status {}",
-                device_name,
-                status
-            );
+        if let Some(f) = self.api.get_dev_serial_num {
+            let mut serial: u32 = 0;
+            let status = unsafe { f(dev.as_ptr(), &mut serial) };
+            if status >= 0 {
+                device.serial_number = format_serial(serial);
+            } else {
+                tracing::debug!("DAQmxGetDevSerialNum for '{device_name}' returned {status}");
+            }
         }
-
+        if let Some(f) = self.api.get_dev_is_simulated {
+            let mut sim: Bool32 = 0;
+            if unsafe { f(dev.as_ptr(), &mut sim) } >= 0 {
+                device.is_simulated = sim != 0;
+            }
+        }
         Ok(device)
     }
+}
 
-    /// Query device temperature
-    ///
-    /// # Safety
-    /// `dev_name` must be a valid pointer to a null-terminated C string.
-    unsafe fn query_temperature(&self, dev_name: *const i8) -> NimonResult<f64> {
-        let mut temperature: f64 = 0.0;
-        let status = (self.get_dev_temperature)(dev_name, &mut temperature);
-        check_status("DAQmxGetDevTemperature", status)?;
-        Ok(temperature)
-    }
+/// DAQmx product numbers are hardware IDs, conventionally shown in hex
+fn format_product_number(num: u32) -> String {
+    format!("0x{num:04X}")
+}
 
-    /// Query device self-test result
-    ///
-    /// # Safety
-    /// `dev_name` must be a valid pointer to a null-terminated C string.
-    unsafe fn query_self_test(&self, dev_name: *const i8) -> NimonResult<bool> {
-        let mut self_test_result: i32 = 0;
-        let status = (self.get_dev_self_test_result)(dev_name, &mut self_test_result);
-        check_status("DAQmxGetDevSelfTestResult", status)?;
-        Ok(self_test_result == 0)
-    }
-
-    /// Query device power supply voltages
-    ///
-    /// Returns (5V, 3.3V, user+, user-) voltages.
-    ///
-    /// # Safety
-    /// `dev_name` must be a valid pointer to a null-terminated C string.
-    unsafe fn query_power_supply_voltages(
-        &self,
-        dev_name: *const i8,
-    ) -> NimonResult<(f64, f64, f64, f64)> {
-        let mut v5: f64 = 0.0;
-        let mut v3v3: f64 = 0.0;
-        let mut v_user: f64 = 0.0;
-        let mut v_neg_user: f64 = 0.0;
-
-        let status = (self.get_dev_ai_power_supply_voltages)(
-            dev_name,
-            &mut v5,
-            &mut v3v3,
-            &mut v_user,
-            &mut v_neg_user,
-        );
-        check_status("DAQmxGetDevAIPowerSupplyVoltages", status)?;
-        Ok((v5, v3v3, v_user, v_neg_user))
+/// Serial numbers are shown in hex by NI MAX / NI-SysCfg; 0 = none
+/// (simulated devices)
+fn format_serial(serial: u32) -> String {
+    if serial == 0 {
+        String::new()
+    } else {
+        format!("{serial:X}")
     }
 }
 
@@ -323,71 +339,123 @@ mod tests {
 
     #[test]
     fn test_is_available() {
-        // This will return false on systems without NI-DAQmx installed.
-        // The test just verifies the function doesn't panic.
+        // Must not panic whether or not NI-DAQmx is installed
         let _ = NiDaqMx::is_available();
     }
 
     #[test]
+    fn test_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NiDaqMx>();
+    }
+
+    #[test]
+    fn test_load_consistent_with_is_available() {
+        assert_eq!(NiDaqMx::load().is_ok(), NiDaqMx::is_available());
+    }
+
+    #[test]
     fn test_parse_device_names_single() {
-        let names = parse_device_names("Dev1");
-        assert_eq!(names, vec!["Dev1"]);
+        assert_eq!(parse_device_names("Dev1"), vec!["Dev1"]);
     }
 
     #[test]
     fn test_parse_device_names_multiple() {
-        let names = parse_device_names("Dev1,Dev2,Dev3");
-        assert_eq!(names, vec!["Dev1", "Dev2", "Dev3"]);
+        assert_eq!(
+            parse_device_names("Dev1,Dev2,Dev3"),
+            vec!["Dev1", "Dev2", "Dev3"]
+        );
     }
 
     #[test]
     fn test_parse_device_names_with_spaces() {
-        let names = parse_device_names("Dev1, Dev2, Dev3");
-        assert_eq!(names, vec!["Dev1", "Dev2", "Dev3"]);
+        assert_eq!(
+            parse_device_names("Dev1, Dev2, Dev3"),
+            vec!["Dev1", "Dev2", "Dev3"]
+        );
     }
 
     #[test]
     fn test_parse_device_names_trailing_comma() {
-        let names = parse_device_names("Dev1,Dev2,");
-        assert_eq!(names, vec!["Dev1", "Dev2"]);
+        assert_eq!(parse_device_names("Dev1,Dev2,"), vec!["Dev1", "Dev2"]);
     }
 
     #[test]
     fn test_parse_device_names_empty() {
-        let names = parse_device_names("");
-        assert!(names.is_empty());
+        assert!(parse_device_names("").is_empty());
     }
 
     #[test]
     fn test_parse_device_names_only_commas() {
-        let names = parse_device_names(",,");
-        assert!(names.is_empty());
+        assert!(parse_device_names(",,").is_empty());
     }
 
     #[test]
     fn test_parse_device_names_pxi_names() {
-        let names = parse_device_names("PXI1Slot2,PXI1Slot3,PXI1Slot4");
-        assert_eq!(names, vec!["PXI1Slot2", "PXI1Slot3", "PXI1Slot4"]);
+        assert_eq!(
+            parse_device_names("PXI1Slot2,PXI1Slot3,PXI1Slot4"),
+            vec!["PXI1Slot2", "PXI1Slot3", "PXI1Slot4"]
+        );
     }
 
     #[test]
     fn test_parse_device_names_mixed_whitespace() {
-        let names = parse_device_names("  Dev1  ,  Dev2  ,  Dev3  ");
-        assert_eq!(names, vec!["Dev1", "Dev2", "Dev3"]);
+        assert_eq!(
+            parse_device_names("  Dev1  ,  Dev2  ,  Dev3  "),
+            vec!["Dev1", "Dev2", "Dev3"]
+        );
     }
 
     #[test]
-    fn test_find_dll_not_found() {
-        // This test verifies the error path when DLL is not found.
-        // On systems without NI-DAQmx, find_dll() returns an error.
-        // We can't easily test this in isolation without mocking,
-        // but we can verify the function signature is correct.
-        let result = NiDaqMx::find_dll();
-        // The result depends on whether NI-DAQmx is installed.
-        // Just verify it doesn't panic.
-        match result {
-            Ok(path) => assert!(path.to_string_lossy().contains("nicaiu.dll")),
-            Err(_) => (), // Expected on systems without NI-DAQmx
-        }
+    fn test_read_daqmx_string_size_query() {
+        let src = b"Dev1, Dev2\0";
+        let s = read_daqmx_string("Test", |buf, size| {
+            if buf.is_null() {
+                return src.len() as i32; // required size incl. NUL
+            }
+            let n = (size as usize).min(src.len());
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr() as *const c_char, buf, n) };
+            0
+        })
+        .unwrap();
+        assert_eq!(s, "Dev1, Dev2");
+    }
+
+    #[test]
+    fn test_read_daqmx_string_empty_and_errors() {
+        assert_eq!(read_daqmx_string("Test", |_, _| 0).unwrap(), "");
+        assert!(matches!(
+            read_daqmx_string("Test", |_, _| -200220),
+            Err(NimonError::NiApi { code: -200220, .. })
+        ));
+        // size query ok, fill fails
+        let r = read_daqmx_string("Test", |buf, _| if buf.is_null() { 8 } else { -200228 });
+        assert!(r.is_err());
+        // fill returns a warning: value kept
+        let r = read_daqmx_string("Test", |buf, _| {
+            if buf.is_null() {
+                2
+            } else {
+                unsafe { *buf = b'A' as c_char };
+                200_000
+            }
+        });
+        assert_eq!(r.unwrap(), "A");
+    }
+
+    #[test]
+    fn test_is_unsupported() {
+        assert!(is_unsupported(-200197));
+        assert!(is_unsupported(-200452));
+        assert!(!is_unsupported(-200220)); // invalid device ID is a real error
+        assert!(!is_unsupported(0));
+    }
+
+    #[test]
+    fn test_formatting() {
+        assert_eq!(format_product_number(0x7262), "0x7262");
+        assert_eq!(format_product_number(0x1B), "0x001B");
+        assert_eq!(format_serial(0x01A2B3C4), "1A2B3C4");
+        assert_eq!(format_serial(0), "");
     }
 }

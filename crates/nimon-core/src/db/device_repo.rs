@@ -1,10 +1,98 @@
 //! Repository for device operations
 
 use chrono::{DateTime, Utc};
-use serde_json;
 use sqlx::SqlitePool;
 
 use crate::{Device, DeviceStatus, DeviceType, HealthStatus, MetricPoint, NimonError, NimonResult};
+
+/// Row shape of the `devices` columns selected by this repository.
+#[derive(sqlx::FromRow)]
+struct DeviceRow {
+    id: String,
+    edge_id: String,
+    device_name: String,
+    device_type: String,
+    model: Option<String>,
+    serial_number: Option<String>,
+    firmware_version: Option<String>,
+    driver_version: Option<String>,
+    ip_address: Option<String>,
+    slot: Option<i32>,
+    chassis: Option<String>,
+    is_simulated: Option<i64>,
+}
+
+impl From<DeviceRow> for Device {
+    fn from(row: DeviceRow) -> Self {
+        Device {
+            id: row.id,
+            edge_id: row.edge_id,
+            device_name: row.device_name,
+            device_type: DeviceType::parse(&row.device_type),
+            model: row.model,
+            serial_number: row.serial_number,
+            firmware_version: row.firmware_version,
+            driver_version: row.driver_version,
+            ip_address: row.ip_address,
+            slot: row.slot,
+            chassis: row.chassis,
+            is_simulated: row.is_simulated.unwrap_or(0) != 0,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct StatusRow {
+    status: String,
+    last_poll: Option<String>,
+    metrics: Option<String>,
+    error_message: Option<String>,
+    error_count: Option<i32>,
+    uptime_seconds: Option<i64>,
+}
+
+const DEVICE_COLUMNS: &str = "id, edge_id, device_name, device_type, model, serial_number, \
+     firmware_version, driver_version, ip_address, slot, chassis, is_simulated";
+
+/// SQL for a `device_name` that is unique on the edge: `?3` (preferred)
+/// unless another device on edge `?2` already uses it, then `?N`
+/// (fallback), then the globally unique device id `?1`.
+fn unique_name_sql(fallback_param: usize) -> String {
+    format!(
+        "CASE \
+            WHEN NOT EXISTS (SELECT 1 FROM devices WHERE edge_id = ?2 AND device_name = ?3 AND id <> ?1) THEN ?3 \
+            WHEN NOT EXISTS (SELECT 1 FROM devices WHERE edge_id = ?2 AND device_name = ?{fallback_param} AND id <> ?1) THEN ?{fallback_param} \
+            ELSE ?1 \
+         END"
+    )
+}
+
+/// The edge-local part of a composite device id (`edge:PXIe-6368#2` ->
+/// `PXIe-6368#2`), or the whole id when it has no `edge:` prefix. Splits at
+/// the FIRST colon: VISA resources (`edge:TCPIP0::10.0.0.5::INSTR`) contain
+/// `::` themselves.
+fn local_part(device_id: &str) -> &str {
+    match device_id.split_once(':') {
+        Some((_, rest)) if !rest.is_empty() => rest,
+        _ => device_id,
+    }
+}
+
+/// Descriptive device fields learned after first sighting (discovery,
+/// SysCfg, ...). `None` means "unknown, keep what is stored".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeviceMetadata {
+    pub device_name: Option<String>,
+    pub device_type: Option<DeviceType>,
+    pub model: Option<String>,
+    pub serial_number: Option<String>,
+    pub firmware_version: Option<String>,
+    pub driver_version: Option<String>,
+    pub ip_address: Option<String>,
+    pub slot: Option<i32>,
+    pub chassis: Option<String>,
+    pub is_simulated: Option<bool>,
+}
 
 pub struct DeviceRepository<'a> {
     pool: &'a SqlitePool,
@@ -15,12 +103,16 @@ impl<'a> DeviceRepository<'a> {
         Self { pool }
     }
 
+    /// Insert or fully update a device. If another device on the same edge
+    /// already uses `device.device_name` (e.g. two identical products),
+    /// the stored name falls back to the id's local part, then to the id,
+    /// so the `UNIQUE(edge_id, device_name)` constraint never rejects it.
     pub async fn upsert(&self, device: &Device) -> NimonResult<()> {
-        sqlx::query(
+        let sql = format!(
             r#"
             INSERT INTO devices (id, edge_id, device_name, device_type, model, serial_number,
                                  firmware_version, driver_version, ip_address, slot, chassis, is_simulated)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?1, ?2, {name}, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(id) DO UPDATE SET
                 edge_id = excluded.edge_id,
                 device_name = excluded.device_name,
@@ -33,129 +125,67 @@ impl<'a> DeviceRepository<'a> {
                 slot = excluded.slot,
                 chassis = excluded.chassis,
                 is_simulated = excluded.is_simulated
-            "#
-        )
-        .bind(&device.id)
-        .bind(&device.edge_id)
-        .bind(&device.device_name)
-        .bind(device.device_type.to_string())
-        .bind(&device.model)
-        .bind(&device.serial_number)
-        .bind(&device.firmware_version)
-        .bind(&device.driver_version)
-        .bind(&device.ip_address)
-        .bind(device.slot)
-        .bind(&device.chassis)
-        .bind(device.is_simulated as i64)
-        .execute(self.pool)
-        .await?;
+            "#,
+            name = unique_name_sql(13)
+        );
+        sqlx::query(&sql)
+            .bind(&device.id)
+            .bind(&device.edge_id)
+            .bind(&device.device_name)
+            .bind(device.device_type.to_string())
+            .bind(&device.model)
+            .bind(&device.serial_number)
+            .bind(&device.firmware_version)
+            .bind(&device.driver_version)
+            .bind(&device.ip_address)
+            .bind(device.slot)
+            .bind(&device.chassis)
+            .bind(device.is_simulated as i64)
+            .bind(local_part(&device.id))
+            .execute(self.pool)
+            .await?;
 
         Ok(())
     }
 
     pub async fn get(&self, id: &str) -> NimonResult<Device> {
-        let row: (
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i32>,
-            Option<String>,
-            Option<i64>,
-        ) = sqlx::query_as(
-            "SELECT id, edge_id, device_name, device_type, model, serial_number,
-                    firmware_version, driver_version, ip_address, slot, chassis, is_simulated
-             FROM devices WHERE id = ?",
-        )
+        let row: DeviceRow = sqlx::query_as(&format!(
+            "SELECT {DEVICE_COLUMNS} FROM devices WHERE id = ?"
+        ))
         .bind(id)
         .fetch_one(self.pool)
         .await
         .map_err(|e| map_not_found(e, NimonError::DeviceNotFound(id.to_string())))?;
-
-        Ok(Device {
-            id: row.0,
-            edge_id: row.1,
-            device_name: row.2,
-            device_type: parse_device_type(&row.3),
-            model: row.4,
-            serial_number: row.5,
-            firmware_version: row.6,
-            driver_version: row.7,
-            ip_address: row.8,
-            slot: row.9,
-            chassis: row.10,
-            is_simulated: row.11.unwrap_or(0) != 0,
-        })
+        Ok(row.into())
     }
 
     pub async fn list_by_edge(&self, edge_id: &str) -> NimonResult<Vec<Device>> {
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i32>,
-            Option<String>,
-            Option<i64>,
-        )> = sqlx::query_as(
-            "SELECT id, edge_id, device_name, device_type, model, serial_number,
-                    firmware_version, driver_version, ip_address, slot, chassis, is_simulated
-             FROM devices WHERE edge_id = ? ORDER BY device_name",
-        )
+        let rows: Vec<DeviceRow> = sqlx::query_as(&format!(
+            "SELECT {DEVICE_COLUMNS} FROM devices WHERE edge_id = ? ORDER BY device_name"
+        ))
         .bind(edge_id)
         .fetch_all(self.pool)
         .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| Device {
-                id: row.0,
-                edge_id: row.1,
-                device_name: row.2,
-                device_type: parse_device_type(&row.3),
-                model: row.4,
-                serial_number: row.5,
-                firmware_version: row.6,
-                driver_version: row.7,
-                ip_address: row.8,
-                slot: row.9,
-                chassis: row.10,
-                is_simulated: row.11.unwrap_or(0) != 0,
-            })
-            .collect())
+        Ok(rows.into_iter().map(Device::from).collect())
     }
 
-    /// Best-effort upsert of a device first seen in a status update, so
+    /// Best-effort insert of a device first seen in a status update, so
     /// `alerts`/`device_status` FK references resolve. Existing rows
-    /// (from real discovery) are left untouched; the name/type are
-    /// derived from the composite id.
-    pub async fn upsert_snapshot(
-        &self,
-        device_id: &str,
-        edge_id: &str,
-    ) -> NimonResult<()> {
-        let local = match device_id.rsplit_once(':') {
-            Some((_, rest)) if !rest.is_empty() => rest,
-            _ => device_id,
-        };
-        let device_name = match local.rsplit_once('#') {
-            Some((name, _)) => name,
-            None => local,
-        };
+    /// (from real discovery) are left untouched. The name is the id's
+    /// local part INCLUDING any `#n` suffix (`edge:PXIe-6368#2` ->
+    /// `PXIe-6368#2`) so identical products do not collide; if the name
+    /// is still taken on the edge, the full id is used.
+    pub async fn upsert_snapshot(&self, device_id: &str, edge_id: &str) -> NimonResult<()> {
+        let device_name = local_part(device_id);
         let device_type = classify_device_name(device_name);
         sqlx::query(
-            "INSERT INTO devices (id, edge_id, device_name, device_type) VALUES (?, ?, ?, ?)
-             ON CONFLICT(id) DO NOTHING",
+            "INSERT INTO devices (id, edge_id, device_name, device_type)
+             VALUES (?1, ?2,
+                     CASE WHEN NOT EXISTS (SELECT 1 FROM devices
+                                           WHERE edge_id = ?2 AND device_name = ?3 AND id <> ?1)
+                          THEN ?3 ELSE ?1 END,
+                     ?4)
+             ON CONFLICT DO NOTHING",
         )
         .bind(device_id)
         .bind(edge_id)
@@ -163,6 +193,63 @@ impl<'a> DeviceRepository<'a> {
         .bind(device_type)
         .execute(self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Create the device row if missing (like [`Self::upsert_snapshot`])
+    /// and store every metadata field that is `Some`, keeping stored
+    /// values for fields that are `None`.
+    pub async fn upsert_metadata(
+        &self,
+        device_id: &str,
+        edge_id: &str,
+        meta: &DeviceMetadata,
+    ) -> NimonResult<()> {
+        let preferred = meta
+            .device_name
+            .clone()
+            .unwrap_or_else(|| local_part(device_id).to_string());
+        let insert_type = meta
+            .device_type
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| classify_device_name(&preferred).to_string());
+        let sql = format!(
+            r#"
+            INSERT INTO devices (id, edge_id, device_name, device_type, model, serial_number,
+                                 firmware_version, driver_version, ip_address, slot, chassis, is_simulated)
+            VALUES (?1, ?2, {name}, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, 0))
+            ON CONFLICT(id) DO UPDATE SET
+                device_name = CASE WHEN ?14 IS NULL THEN devices.device_name ELSE excluded.device_name END,
+                device_type = COALESCE(?15, devices.device_type),
+                model = COALESCE(excluded.model, devices.model),
+                serial_number = COALESCE(excluded.serial_number, devices.serial_number),
+                firmware_version = COALESCE(excluded.firmware_version, devices.firmware_version),
+                driver_version = COALESCE(excluded.driver_version, devices.driver_version),
+                ip_address = COALESCE(excluded.ip_address, devices.ip_address),
+                slot = COALESCE(excluded.slot, devices.slot),
+                chassis = COALESCE(excluded.chassis, devices.chassis),
+                is_simulated = COALESCE(?12, devices.is_simulated)
+            "#,
+            name = unique_name_sql(13)
+        );
+        sqlx::query(&sql)
+            .bind(device_id) // ?1
+            .bind(edge_id) // ?2
+            .bind(&preferred) // ?3
+            .bind(&insert_type) // ?4
+            .bind(&meta.model) // ?5
+            .bind(&meta.serial_number) // ?6
+            .bind(&meta.firmware_version) // ?7
+            .bind(&meta.driver_version) // ?8
+            .bind(&meta.ip_address) // ?9
+            .bind(meta.slot) // ?10
+            .bind(&meta.chassis) // ?11
+            .bind(meta.is_simulated.map(|b| b as i64)) // ?12
+            .bind(local_part(device_id)) // ?13
+            .bind(&meta.device_name) // ?14
+            .bind(meta.device_type.map(|t| t.to_string())) // ?15
+            .execute(self.pool)
+            .await?;
         Ok(())
     }
 
@@ -195,15 +282,10 @@ impl<'a> DeviceRepository<'a> {
         Ok(())
     }
 
+    /// Current status of a device. Stored metric entries that cannot be
+    /// parsed (e.g. `null` from a NaN) are skipped individually.
     pub async fn get_status(&self, device_id: &str) -> NimonResult<DeviceStatus> {
-        let row: (
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i32>,
-            Option<i64>,
-        ) = sqlx::query_as(
+        let row: StatusRow = sqlx::query_as(
             "SELECT status, last_poll, metrics, error_message, error_count, uptime_seconds
                  FROM device_status WHERE device_id = ?",
         )
@@ -212,31 +294,36 @@ impl<'a> DeviceRepository<'a> {
         .await
         .map_err(|e| map_not_found(e, NimonError::DeviceNotFound(device_id.to_string())))?;
 
-        let last_poll = row.1.as_deref().and_then(parse_ts).ok_or_else(|| {
+        let last_poll = row.last_poll.as_deref().and_then(parse_ts).ok_or_else(|| {
             NimonError::InvalidState(format!(
                 "unparsable last_poll stored for device {}",
                 device_id
             ))
         })?;
 
-        // Deserialize the metrics JSON that upsert_status stores
-        let metrics: Option<std::collections::HashMap<String, crate::MetricValue>> = row
-            .2
+        let metrics = row
+            .metrics
             .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok());
+            .map(crate::types::parse_metrics_lenient)
+            .unwrap_or_default();
 
         Ok(DeviceStatus {
             device_id: device_id.to_string(),
-            status: parse_health_status(&row.0),
+            status: parse_health_status(&row.status),
             last_poll,
-            metrics: metrics.unwrap_or_default(),
-            error_message: row.3,
-            error_count: row.4.unwrap_or(0),
-            uptime_seconds: row.5.unwrap_or(0),
+            metrics,
+            error_message: row.error_message,
+            error_count: row.error_count.unwrap_or(0),
+            uptime_seconds: row.uptime_seconds.unwrap_or(0),
         })
     }
 
+    /// Insert one metric point. Non-finite values (NaN/Inf) cannot be
+    /// stored in the `REAL NOT NULL` column and are silently skipped.
     pub async fn insert_metric(&self, metric: &MetricPoint) -> NimonResult<()> {
+        if !metric.metric_value.is_finite() {
+            return Ok(());
+        }
         sqlx::query(
             "INSERT INTO device_metrics_history (device_id, timestamp, metric_name, metric_value) VALUES (?, ?, ?, ?)"
         )
@@ -248,6 +335,41 @@ impl<'a> DeviceRepository<'a> {
         .await?;
 
         Ok(())
+    }
+
+    /// Insert many `(device_id, metric_name, value, timestamp)` rows in ONE
+    /// transaction (all or nothing). Non-finite values are skipped.
+    /// Returns the number of rows written.
+    pub async fn insert_metrics_batch<D, M>(
+        &self,
+        rows: &[(D, M, f64, DateTime<Utc>)],
+    ) -> NimonResult<u64>
+    where
+        D: AsRef<str>,
+        M: AsRef<str>,
+    {
+        if rows.iter().all(|r| !r.2.is_finite()) {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut written = 0u64;
+        for (device_id, metric_name, value, timestamp) in rows {
+            if !value.is_finite() {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO device_metrics_history (device_id, timestamp, metric_name, metric_value) VALUES (?, ?, ?, ?)",
+            )
+            .bind(device_id.as_ref())
+            .bind(timestamp.to_rfc3339())
+            .bind(metric_name.as_ref())
+            .bind(*value)
+            .execute(&mut *tx)
+            .await?;
+            written += 1;
+        }
+        tx.commit().await?;
+        Ok(written)
     }
 
     pub async fn get_metrics(
@@ -306,31 +428,18 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
-fn parse_device_type(s: &str) -> DeviceType {
-    match s {
-        "daq" => DeviceType::Daq,
-        "pxi" => DeviceType::Pxi,
-        "cdaq" => DeviceType::CDaq,
-        "visa" => DeviceType::Visa,
-        "xnet" => DeviceType::Xnet,
-        "gpib" => DeviceType::Gpib,
-        "power_supply" => DeviceType::PowerSupply,
-        _ => DeviceType::Daq,
-    }
-}
-
 /// Classify a device from its name (best effort; defaults to Daq).
 fn classify_device_name(name: &str) -> &'static str {
     let upper = name.to_uppercase();
-    if upper.contains("PXI") {
-        "pxi"
-    } else if upper.contains("CDAQ") || upper.contains("CDAQ") {
+    if upper.contains("CDAQ") || upper.contains("COMPACTDAQ") {
         "cdaq"
+    } else if upper.contains("PXI") {
+        "pxi"
     } else if upper.contains("GPIB") {
         "gpib"
     } else if upper.contains("XNET") {
         "xnet"
-    } else if upper.contains("VISA") {
+    } else if upper.contains("VISA") || upper.contains("::") {
         "visa"
     } else {
         "daq"
@@ -525,5 +634,254 @@ mod tests {
             .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].metric_value, 41.0);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_identical_products_both_get_rows() {
+        let pool = create_test_db().await;
+        setup(&pool).await;
+        let repo = DeviceRepository::new(&pool);
+
+        repo.upsert_snapshot("edge-1:PXIe-6368#1", "edge-1")
+            .await
+            .unwrap();
+        repo.upsert_snapshot("edge-1:PXIe-6368#2", "edge-1")
+            .await
+            .unwrap();
+        // Idempotent
+        repo.upsert_snapshot("edge-1:PXIe-6368#2", "edge-1")
+            .await
+            .unwrap();
+
+        let devices = repo.list_by_edge("edge-1").await.unwrap();
+        assert_eq!(devices.len(), 2);
+        let d1 = repo.get("edge-1:PXIe-6368#1").await.unwrap();
+        let d2 = repo.get("edge-1:PXIe-6368#2").await.unwrap();
+        assert_eq!(d1.device_name, "PXIe-6368#1");
+        assert_eq!(d2.device_name, "PXIe-6368#2");
+        assert_eq!(d2.device_type, DeviceType::Pxi);
+
+        // FK-dependent inserts now succeed for both
+        for id in ["edge-1:PXIe-6368#1", "edge-1:PXIe-6368#2"] {
+            repo.upsert_status(&DeviceStatus {
+                device_id: id.to_string(),
+                status: HealthStatus::Healthy,
+                last_poll: Utc::now(),
+                metrics: Default::default(),
+                error_message: None,
+                error_count: 0,
+                uptime_seconds: 0,
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upsert_disambiguates_duplicate_names() {
+        let pool = create_test_db().await;
+        setup(&pool).await;
+        let repo = DeviceRepository::new(&pool);
+
+        // Two discovered devices with the same product name
+        let mut a = sample_device();
+        a.id = "edge-1:PXIe-6368#1".to_string();
+        a.device_name = "PXIe-6368".to_string();
+        let mut b = a.clone();
+        b.id = "edge-1:PXIe-6368#2".to_string();
+        repo.upsert(&a).await.unwrap();
+        repo.upsert(&b).await.unwrap();
+        // Re-upserting keeps both working
+        repo.upsert(&a).await.unwrap();
+        repo.upsert(&b).await.unwrap();
+
+        assert_eq!(repo.get(&a.id).await.unwrap().device_name, "PXIe-6368");
+        assert_eq!(repo.get(&b.id).await.unwrap().device_name, "PXIe-6368#2");
+
+        // Snapshot row first, discovery second (same id): upsert updates it
+        repo.upsert_snapshot("edge-1:Dev3", "edge-1").await.unwrap();
+        let mut c = sample_device();
+        c.id = "edge-1:Dev3".to_string();
+        c.device_name = "Dev3".to_string();
+        c.model = Some("USB-6009".to_string());
+        repo.upsert(&c).await.unwrap();
+        assert_eq!(
+            repo.get("edge-1:Dev3").await.unwrap().model.as_deref(),
+            Some("USB-6009")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upsert_metadata_merges_known_fields() {
+        let pool = create_test_db().await;
+        setup(&pool).await;
+        let repo = DeviceRepository::new(&pool);
+
+        // Creates the row when missing
+        repo.upsert_metadata(
+            "edge-1:PXI1Slot2",
+            "edge-1",
+            &DeviceMetadata {
+                model: Some("PXIe-6368".to_string()),
+                serial_number: Some("0x1A2B".to_string()),
+                slot: Some(2),
+                is_simulated: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let d = repo.get("edge-1:PXI1Slot2").await.unwrap();
+        assert_eq!(d.device_name, "PXI1Slot2");
+        assert_eq!(d.device_type, DeviceType::Pxi);
+        assert_eq!(d.model.as_deref(), Some("PXIe-6368"));
+        assert_eq!(d.slot, Some(2));
+        assert!(d.is_simulated);
+
+        // Partial update: only firmware known; the rest is kept
+        repo.upsert_metadata(
+            "edge-1:PXI1Slot2",
+            "edge-1",
+            &DeviceMetadata {
+                firmware_version: Some("1.2.3".to_string()),
+                device_type: Some(DeviceType::PowerSupply),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let d = repo.get("edge-1:PXI1Slot2").await.unwrap();
+        assert_eq!(d.firmware_version.as_deref(), Some("1.2.3"));
+        assert_eq!(d.model.as_deref(), Some("PXIe-6368"));
+        assert_eq!(d.serial_number.as_deref(), Some("0x1A2B"));
+        assert_eq!(d.device_type, DeviceType::PowerSupply);
+        assert!(d.is_simulated);
+        assert_eq!(d.device_name, "PXI1Slot2");
+
+        // Metadata on an existing snapshot row
+        repo.upsert_snapshot("edge-1:Dev1", "edge-1").await.unwrap();
+        repo.upsert_metadata(
+            "edge-1:Dev1",
+            "edge-1",
+            &DeviceMetadata {
+                is_simulated: Some(false),
+                chassis: Some("PXI1".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let d = repo.get("edge-1:Dev1").await.unwrap();
+        assert_eq!(d.chassis.as_deref(), Some("PXI1"));
+        assert!(!d.is_simulated);
+    }
+
+    #[tokio::test]
+    async fn test_insert_metrics_batch() {
+        let pool = create_test_db().await;
+        setup(&pool).await;
+        let repo = DeviceRepository::new(&pool);
+        repo.upsert(&sample_device()).await.unwrap();
+
+        let now = Utc::now();
+        let rows = vec![
+            ("device-1".to_string(), "temperature".to_string(), 40.0, now),
+            (
+                "device-1".to_string(),
+                "temperature".to_string(),
+                f64::NAN,
+                now,
+            ),
+            ("device-1".to_string(), "voltage".to_string(), 5.0, now),
+        ];
+        assert_eq!(repo.insert_metrics_batch(&rows).await.unwrap(), 2);
+        assert_eq!(
+            repo.get_metrics("device-1", "temperature", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // Borrowed rows work too; empty batch is a no-op
+        let borrowed = [("device-1", "voltage", 5.5, now)];
+        assert_eq!(repo.insert_metrics_batch(&borrowed).await.unwrap(), 1);
+        let empty: [(&str, &str, f64, DateTime<Utc>); 0] = [];
+        assert_eq!(repo.insert_metrics_batch(&empty).await.unwrap(), 0);
+
+        // One failing row (FK: unknown device) rolls back the whole batch
+        let bad = [
+            ("device-1", "current", 1.0, now),
+            ("ghost", "current", 1.0, now),
+        ];
+        assert!(repo.insert_metrics_batch(&bad).await.is_err());
+        assert!(repo
+            .get_metrics("device-1", "current", 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Single-row insert skips NaN instead of failing NOT NULL
+        repo.insert_metric(&MetricPoint {
+            device_id: "device-1".to_string(),
+            timestamp: now,
+            metric_name: "voltage".to_string(),
+            metric_value: f64::INFINITY,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.get_metrics("device-1", "voltage", 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_status_skips_unparseable_metrics() {
+        let pool = create_test_db().await;
+        setup(&pool).await;
+        let repo = DeviceRepository::new(&pool);
+        repo.upsert(&sample_device()).await.unwrap();
+
+        let mut metrics = std::collections::HashMap::new();
+        metrics.insert(
+            "temperature".to_string(),
+            crate::MetricValue::Float(f64::NAN),
+        );
+        metrics.insert("voltage".to_string(), crate::MetricValue::Float(5.0));
+        repo.upsert_status(&DeviceStatus {
+            device_id: "device-1".to_string(),
+            status: HealthStatus::Healthy,
+            last_poll: Utc::now(),
+            metrics,
+            error_message: None,
+            error_count: 0,
+            uptime_seconds: 0,
+        })
+        .await
+        .unwrap();
+
+        let fetched = repo.get_status("device-1").await.unwrap();
+        assert_eq!(fetched.metrics.len(), 1);
+        assert_eq!(
+            fetched.metrics.get("voltage"),
+            Some(&crate::MetricValue::Float(5.0))
+        );
+    }
+
+    #[test]
+    fn test_local_part_keeps_visa_resource_intact() {
+        assert_eq!(
+            local_part("edge-01:TCPIP0::10.0.0.5::inst0::INSTR"),
+            "TCPIP0::10.0.0.5::inst0::INSTR"
+        );
+        assert_eq!(local_part("edge-01:PXIe-6368#2"), "PXIe-6368#2");
+        assert_eq!(local_part("standalone"), "standalone");
+        assert_eq!(classify_device_name("TCPIP0::10.0.0.5::inst0::INSTR"), "visa");
+        assert_eq!(classify_device_name("ASRL3::INSTR"), "visa");
+        assert_eq!(classify_device_name("GPIB0::5::INSTR"), "gpib");
+        assert_eq!(classify_device_name("PXIe-6368#2"), "pxi");
     }
 }

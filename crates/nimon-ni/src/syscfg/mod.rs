@@ -17,6 +17,21 @@
 //!     }
 //! }
 //! ```
+//!
+//! # Reusing a session across sweeps
+//! All calls block; run them on a blocking thread. The session is
+//! `Send + Sync`, reopens itself after an enumeration failure, and closes
+//! its handle on drop.
+//! ```no_run
+//! use std::sync::Arc;
+//! use nimon_ni::syscfg::SysCfgSession;
+//!
+//! let session = Arc::new(SysCfgSession::open().unwrap()); // once
+//! // every sweep (e.g. inside spawn_blocking):
+//! let s = Arc::clone(&session);
+//! let sweep = s.discover_with_health();
+//! let system = s.system_info();
+//! ```
 
 mod ffi;
 mod safe;

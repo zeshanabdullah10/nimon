@@ -1,65 +1,243 @@
-# nimon-hub configuration
+# nimon-hub configuration reference
 #
-# This file is loaded with `nimon-hub config/hub.yaml`. Without it the hub
-# starts with the defaults below. See README.md for the full rule/channel
-# reference.
+# Start the hub with:   nimon-hub config/hub.yaml
+# Without a path the hub runs with the built-in defaults shown here. NOTE:
+# a path that does not exist is silently replaced by the defaults, so check
+# the "Loading config from" log line. Unknown keys are ignored.
+#
+# Every key below is optional and shows its default unless marked
+# "example". Environment overrides (take precedence over this file):
+#   NIMON_API_TOKEN           auth.api_token
+#   NIMON_EDGE_TOKEN          auth.edge_token
+#   NIMON_SMTP_USER           smtp_username of every email channel
+#   NIMON_SMTP_PASSWORD       smtp_password of every email channel
+#   NIMON_SMTP_PASSWORD_FILE  file whose first line is the SMTP password
+#   RUST_LOG                  log filter (default "info"), e.g. "info,nimon_hub=debug"
 
+# --------------------------------------------------------------------------
+# Server
+# --------------------------------------------------------------------------
+
+# Bind address: an IP (0.0.0.0, 127.0.0.1, ::) or "localhost"
 host: "0.0.0.0"
-port: 8080
+
+# HTTP + WebSocket port: dashboard at /, REST API under /api/v1, edges on /ws
+port: 9090
+
+# SQLite database (WAL mode; the parent directory is created). Relative
+# paths resolve against the working directory; in Windows service mode
+# against the directory of this file. ":memory:" keeps everything in RAM.
 database_path: "data/nimon.db"
 
+# Origins allowed to call the API cross-origin. Empty = no CORS headers
+# at all (the embedded dashboard is same-origin and needs none). "*" allows
+# any origin.
+cors_allowed_origins: []
+#  - "https://ops.example.com"          # example
+
+# --------------------------------------------------------------------------
+# Authentication (off by default; empty strings count as "not set")
+# --------------------------------------------------------------------------
+auth:
+  # When set, every non-GET /api/* request (acknowledge, resolve, actions,
+  # config push) needs "Authorization: Bearer <token>"; reads stay open.
+  # Missing/wrong token -> 401 {"error": ...}.
+  api_token: null
+  # When set, edges must present it on /ws as "Authorization: Bearer <token>"
+  # or "?token=<token>" (edge config: node.hub_token / NIMON_EDGE_TOKEN).
+  edge_token: null
+
+# --------------------------------------------------------------------------
+# Alerting
+# --------------------------------------------------------------------------
 alert:
-  # Cooldown between repeated firings of the same rule+device (minutes)
+  # Minutes between re-fires of the same rule+device; used by rules that
+  # omit cooldown_minutes. A manually resolved alert does not re-open
+  # before this cooldown has passed.
   default_cooldown_minutes: 5
-  # Suppress further alerts for a rule beyond this many active alerts
+
+  # Cap on simultaneously active alerts per rule; further alerts of that
+  # rule are suppressed. Rules may override it.
   max_firing_count: 100
-  # Retention cleanup cadence (hours)
+
+  # How often retention cleanup runs (hours; see maintenance.*)
   cleanup_interval_hours: 24
-  # Probability at which predictions are persisted and alerted (0.0-1.0)
+
+  # Probability (0.0-1.0) at which an edge prediction raises an alert.
+  # Every prediction is persisted regardless. >= 0.9 is critical.
   prediction_alert_threshold: 0.8
 
-  # Notification channels; a built-in console channel is always active so
-  # default deployments never lose alerts silently.
+  # Prediction alerts auto-resolve when no fresh matching prediction
+  # arrives within this many minutes
+  prediction_ttl_minutes: 15
+
+  # Edge-reported alerts auto-resolve when the device reports healthy again
+  # or after this many minutes without a re-report
+  edge_alert_ttl_minutes: 30
+
+  # Built-in "edge offline" alert (rule id builtin-edge-offline) when an
+  # edge has not been seen for this long (seconds). Resolves when the edge
+  # is seen again. 0 disables it.
+  edge_offline_after_secs: 90
+
+  # Periodic sweep that evaluates time-based conditions (device offline,
+  # duration windows, TTL auto-resolve), in seconds
+  evaluate_interval_secs: 30
+
+  # ------------------------------------------------------------------------
+  # Notification channels. A built-in "console" channel (log output) is
+  # always added when none is configured, so alerts are never lost. Rules
+  # pick channels by `name` (defaults to channel_type when omitted).
+  # ------------------------------------------------------------------------
   notification_channels: []
+  # Examples:
+  #  - channel_type: "console"          # console | email | slack | teams | webhook
+  #    name: "console"
+  #    enabled: true                    # default true
+  #
   #  - channel_type: "email"
   #    name: "ops-mail"
-  #    smtp_server: "smtp.example.com"
-  #    smtp_port: 587
-  #    smtp_username: "nimon@example.com"   # NIMON_SMTP_USER env overrides
-  #    smtp_password: "secret"              # NIMON_SMTP_PASSWORD env overrides
-  #    from_addr: "nimon@example.com"
-  #    to_addrs: ["ops@example.com"]
-  #  - channel_type: "webhook"
+  #    smtp_server: "smtp.example.com"  # default "localhost"
+  #    smtp_port: 587                   # default 587
+  #    # TLS mode: implicit (aliases wrapper/smtps/tls), starttls (alias
+  #    # required), opportunistic, none (aliases plain/plaintext).
+  #    # Default by port: 465 -> implicit, 25 -> opportunistic, else starttls.
+  #    smtp_tls: "starttls"
+  #    # Allow credentials over an unencrypted connection (default false)
+  #    smtp_allow_plaintext_auth: false
+  #    # Accept invalid/self-signed server certificates (default false)
+  #    smtp_skip_tls_verify: false
+  #    # Credentials. Precedence: NIMON_SMTP_USER over smtp_username;
+  #    # NIMON_SMTP_PASSWORD > file named by NIMON_SMTP_PASSWORD_FILE >
+  #    # smtp_password_file > smtp_password. Prefer a file / env over
+  #    # putting the password here.
+  #    smtp_username: "nimon@example.com"
+  #    smtp_password_file: "smtp-password"   # relative to this file in service mode
+  #    # smtp_password: "secret"
+  #    from_addr: "nimon@example.com"   # default "nimon@localhost"
+  #    to_addrs: ["ops@example.com"]    # default ["admin@localhost"]
+  #
+  #  - channel_type: "slack"
+  #    name: "slack-ops"
+  #    webhook_url: "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+  #
+  #  - channel_type: "teams"
+  #    name: "teams-ops"
+  #    webhook_url: "https://example.webhook.office.com/webhookb2/XXX"
+  #
+  #  - channel_type: "webhook"          # JSON POST of the alert
   #    name: "hooks"
   #    webhook_url: "https://hooks.example.com/nimon"
-  #    headers:
+  #    headers:                         # list of [name, value] pairs
   #      - ["X-Token", "abc"]
 
+  # ------------------------------------------------------------------------
+  # Rules. `rules: []` loads the built-in defaults:
+  #   rule-device-offline   critical  no status report for 5 min (no repeats)
+  #   rule-high-temp        warning   temperature >= 65 C, hysteresis 2 C, cooldown 5 min
+  #   rule-critical-temp    critical  temperature >= 75 C, hysteresis 2 C, cooldown 2 min
+  #   rule-device-error     critical  health healthy -> error (no repeats)
+  # As soon as any rule is configured the defaults are NOT used (if every
+  # configured rule fails to parse, the hub logs an error and runs with no
+  # rules). The edge-offline, edge-reported and prediction alerts are
+  # independent of rules.
+  # ------------------------------------------------------------------------
   rules: []
-  #  - name: "High Temperature"
-  #    severity: "critical"            # info | warning | critical
+  # Examples (one per condition type):
+  #  - name: "High Temperature"         # required; slug becomes the rule id
+  #    description: "Module too hot"    # default ""
+  #    enabled: true                    # default true
+  #    severity: "critical"             # info | warning | critical (default warning)
   #    condition:
-  #      MetricThreshold:
-  #        metric: "temperature"
-  #        threshold: 75.0
-  #        comparison: "greater_than"  # gt lt eq ne ge le
-  #    cooldown_minutes: 5
-  #    notification_channels: ["ops-mail"]
-  #    action:                       # optional self-healing action
+  #      MetricThreshold:               # nested form; the flat form (keys directly
+  #        metric: "temperature"        # under condition:) is accepted too
+  #        threshold: 75.0              # required
+  #        comparison: "greater_than"   # greater_than (gt, >), less_than (lt, <),
+  #                                     # equal (eq, ==), not_equal (ne, !=),
+  #                                     # greater_or_equal (ge, >=), less_or_equal (le, <=)
+  #                                     # default greater_than
+  #        hysteresis: 2.0              # clears only 2 C below the threshold (default none)
+  #        duration_minutes: 3          # must breach continuously for 3 min before firing
+  #    cooldown_minutes: 5              # default alert.default_cooldown_minutes
+  #    max_firing_count: 10             # default alert.max_firing_count
+  #    suppress_repeat: false           # true: never re-fire while active
+  #    notification_channels: ["ops-mail", "slack-ops"]   # default: every enabled channel
+  #    action:                          # optional self-healing action (see below)
   #      type: power_cycle
   #      delay_secs: 5
+  #    on_failure:                      # optional fallback when `action` still fails
+  #      type: custom_script            # after its retries
+  #      script: "escalate.ps1"
+  #
+  #  - name: "Device Offline"
+  #    severity: "warning"
+  #    condition:
+  #      DeviceOffline:
+  #        max_minutes_since_poll: 10
+  #
+  #  - name: "Device Error"
+  #    severity: "critical"
+  #    condition:
+  #      HealthStatusChange:            # healthy | warning | error | offline
+  #        from: "healthy"              # optional: any previous state when omitted
+  #        to: "error"
+  #    suppress_repeat: true
+  #
+  #  - name: "Overheating predicted"
+  #    condition:
+  #      Prediction:
+  #        prediction_type: "overheating"
+  #        min_probability: 0.7
+  #        max_eta_minutes: 30          # optional
+  #
+  #  - name: "Hot and silent"
+  #    condition:
+  #      Composite:
+  #        op: "and"                    # and | or (default and)
+  #        conditions:
+  #          - MetricThreshold: { metric: "temperature", threshold: 60.0 }
+  #          - DeviceOffline: { max_minutes_since_poll: 3 }
+  #
+  # Action types (`type:`):
+  #   power_cycle     { delay_secs }                 edge: DAQmx device reset
+  #   edge_command    { command, parameters: {} }    edge: reset_driver | power_cycle |
+  #                                                  restart_services (parameters.services)
+  #                                                  | any other name = allowlisted edge script
+  #   custom_script   { script }                     edge: allowlisted script in scripts_dir
+  #   script          { script, args: [], timeout_secs, env: {}, working_dir }
+  #                                                  hub host, argv (no shell); ${ALERT_ID}
+  #                                                  ${RULE_ID} ${DEVICE_ID} ${EDGE_ID} ${SEVERITY}
+  #                                                  ${METRIC} ${VALUE} ${THRESHOLD} substituted;
+  #                                                  run_as is rejected at load
+  #   restart_service { service_name }               hub host OS service
 
-# Desired-state pushed to edges when they register (and via
-# POST /api/v1/edges/{id}/config)
+# --------------------------------------------------------------------------
+# Desired state for edges: pushed when an edge registers, and changed at
+# runtime with POST /api/v1/edges/:id/config (nimon-cli edges push-config).
+# Unset values leave the edge's own YAML in charge.
+# --------------------------------------------------------------------------
 edges:
   defaults:
-    poll_interval_secs: 30
-    temperature_warning: 65
-    temperature_critical: 75
+    poll_interval_secs: null           # example: 30
+    temperature_warning: null          # example: 65  (hub fallback when unset: 65)
+    temperature_critical: null         # example: 75  (hub fallback when unset: 75)
+  overrides: []
+  #  - edge_id: "test-cell-01"          # example
+  #    temperature_critical: 80
+  #    poll_interval_secs: 10
+  # A connected edge that sends nothing for this long (seconds) is
+  # disconnected and marked offline
+  session_timeout_secs: 120
 
+# --------------------------------------------------------------------------
 # Retention / maintenance
+# --------------------------------------------------------------------------
 maintenance:
-  alert_retention_days: 30
-  metric_retention_days: 30
+  alert_retention_days: 30             # resolved alerts
+  metric_retention_days: 30            # metric history
   prediction_retention_days: 30
-  prediction_expiry_minutes: 60
+  prediction_expiry_minutes: 60        # unrefreshed active predictions expire
+  action_retention_days: 30            # action history
+  metric_sample_interval_secs: 60      # min spacing of stored samples per device
+  metric_flush_interval_secs: 10       # buffered samples are written in one batch
+  device_state_retention_hours: 24     # in-memory state of silent devices dropped

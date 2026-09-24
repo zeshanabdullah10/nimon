@@ -12,10 +12,14 @@ pub struct DaqDevice {
     pub device_name: String,
     /// Product type name (e.g., "NI PXIe-6363")
     pub product_name: String,
-    /// Product number (e.g., "6363")
+    /// Product number: DAQmxGetDevProductNum, the numeric hardware ID,
+    /// formatted as hex (e.g. "0x7262"); empty if unavailable
     pub product_number: String,
-    /// Serial number of the device
+    /// Serial number of the device (hex, as shown in NI MAX)
     pub serial_number: String,
+    /// Whether DAQmx reports the device as simulated
+    #[serde(default)]
+    pub is_simulated: bool,
 }
 
 impl DaqDevice {
@@ -26,6 +30,7 @@ impl DaqDevice {
             product_name: String::new(),
             product_number: String::new(),
             serial_number: String::new(),
+            is_simulated: false,
         }
     }
 }
@@ -33,18 +38,24 @@ impl DaqDevice {
 /// Health information for a DAQ device
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaqHealth {
-    /// Device temperature in degrees Celsius
+    /// Device temperature in degrees Celsius (DAQmxGetCalDevTemp)
     pub temperature: Option<f64>,
-    /// Whether the device self-test passed (0 = pass)
+    /// Whether the device self-test passed. Only set by an explicit
+    /// self-test; health polling never runs one.
     pub self_test_passed: Option<bool>,
-    /// 5V power supply voltage
+    /// 5V power supply voltage. NI-DAQmx has no generic power-supply
+    /// query, so this is always `None` from this crate (kept for API
+    /// compatibility / external producers).
     pub voltage_5v: Option<f64>,
-    /// 3.3V power supply voltage
+    /// 3.3V power supply voltage (see `voltage_5v`)
     pub voltage_3v3: Option<f64>,
-    /// User+ power supply voltage
+    /// User+ power supply voltage (see `voltage_5v`)
     pub voltage_user: Option<f64>,
-    /// User- power supply voltage
+    /// User- power supply voltage (see `voltage_5v`)
     pub voltage_negative_user: Option<f64>,
+    /// Whether the device answered a basic DAQmx query (`None` = unknown)
+    #[serde(default)]
+    pub is_reachable: Option<bool>,
     /// Error message if health check failed
     pub error_message: Option<String>,
     /// Additional metrics collected from the device
@@ -61,6 +72,7 @@ impl DaqHealth {
             voltage_3v3: None,
             voltage_user: None,
             voltage_negative_user: None,
+            is_reachable: None,
             error_message: None,
             metrics: HashMap::new(),
         }
@@ -70,50 +82,52 @@ impl DaqHealth {
     ///
     /// This is the primary interface for consumers that need to turn raw health
     /// data into a status and metrics map for DeviceStatusUpdate messages.
+    /// Non-finite readings are dropped (they would serialise as `null`).
     pub fn to_status_and_metrics(self) -> (HealthStatus, HashMap<String, MetricValue>) {
         let mut metrics = self.metrics;
+        metrics.retain(|_, v| !matches!(v, MetricValue::Float(f) if !f.is_finite()));
+        let finite = |v: Option<f64>| v.filter(|x| x.is_finite());
+        let temperature = finite(self.temperature);
+        let voltage_5v = finite(self.voltage_5v);
+        let voltage_3v3 = finite(self.voltage_3v3);
 
-        // Populate temperature metric
-        if let Some(temp) = self.temperature {
+        if let Some(temp) = temperature {
             metrics.insert("temperature_celsius".to_string(), MetricValue::Float(temp));
         }
-
-        // Populate self-test result metric
         if let Some(passed) = self.self_test_passed {
             metrics.insert("self_test_passed".to_string(), MetricValue::Boolean(passed));
         }
+        if let Some(reachable) = self.is_reachable {
+            metrics.insert("is_reachable".to_string(), MetricValue::Boolean(reachable));
+        }
+        for (key, value) in [
+            ("voltage_5v", voltage_5v),
+            ("voltage_3v3", voltage_3v3),
+            ("voltage_user", finite(self.voltage_user)),
+            ("voltage_neg_user", finite(self.voltage_negative_user)),
+        ] {
+            if let Some(v) = value {
+                metrics.insert(key.to_string(), MetricValue::Float(v));
+            }
+        }
 
-        // Populate power supply voltage metrics
-        if let Some(v) = self.voltage_5v {
-            metrics.insert("voltage_5v".to_string(), MetricValue::Float(v));
-        }
-        if let Some(v) = self.voltage_3v3 {
-            metrics.insert("voltage_3v3".to_string(), MetricValue::Float(v));
-        }
-        if let Some(v) = self.voltage_user {
-            metrics.insert("voltage_user".to_string(), MetricValue::Float(v));
-        }
-        if let Some(v) = self.voltage_negative_user {
-            metrics.insert("voltage_neg_user".to_string(), MetricValue::Float(v));
-        }
+        let voltage_warning = voltage_5v.is_some_and(|v| !(4.75..=5.25).contains(&v))
+            || voltage_3v3.is_some_and(|v| !(3.15..=3.45).contains(&v));
 
-        // Determine overall health status
-        let status = if self.error_message.is_some() {
+        let status = if self.is_reachable == Some(false) {
+            HealthStatus::Offline
+        } else if self.error_message.is_some() || self.self_test_passed == Some(false) {
             HealthStatus::Error
-        } else if self.self_test_passed == Some(false) {
-            HealthStatus::Error
-        } else if self.self_test_passed.is_none() && self.temperature.is_none() {
+        } else if self.is_reachable.is_none()
+            && self.self_test_passed.is_none()
+            && temperature.is_none()
+        {
             // No health data at all -- treat as unknown/offline
             HealthStatus::Offline
+        } else if voltage_warning {
+            HealthStatus::Warning
         } else {
-            // Check for voltage warnings
-            let voltage_warning = self.voltage_5v.map_or(false, |v| v < 4.75 || v > 5.25)
-                || self.voltage_3v3.map_or(false, |v| v < 3.15 || v > 3.45);
-            if voltage_warning {
-                HealthStatus::Warning
-            } else {
-                HealthStatus::Healthy
-            }
+            HealthStatus::Healthy
         };
 
         (status, metrics)
@@ -146,6 +160,7 @@ mod tests {
             product_name: "NI PXIe-6363".to_string(),
             product_number: "6363".to_string(),
             serial_number: "01234567".to_string(),
+            is_simulated: false,
         };
         assert_eq!(device.device_name, "PXI1Slot3");
         assert_eq!(device.product_name, "NI PXIe-6363");
@@ -160,6 +175,7 @@ mod tests {
             product_name: "NI USB-6009".to_string(),
             product_number: "6009".to_string(),
             serial_number: "01ABCDEF".to_string(),
+            is_simulated: true,
         };
 
         let json = serde_json::to_string(&device).unwrap();
@@ -168,6 +184,48 @@ mod tests {
         assert_eq!(parsed.product_name, device.product_name);
         assert_eq!(parsed.product_number, device.product_number);
         assert_eq!(parsed.serial_number, device.serial_number);
+    }
+
+    #[test]
+    fn test_daq_health_reachability() {
+        let mut h = DaqHealth::new();
+        h.is_reachable = Some(true);
+        // reachable device without a temperature sensor is healthy, not offline
+        let (status, metrics) = h.clone().to_status_and_metrics();
+        assert_eq!(status, HealthStatus::Healthy);
+        assert!(matches!(
+            metrics.get("is_reachable"),
+            Some(MetricValue::Boolean(true))
+        ));
+
+        h.is_reachable = Some(false);
+        h.error_message = Some("Device query failed".into());
+        let (status, _) = h.to_status_and_metrics();
+        assert_eq!(status, HealthStatus::Offline);
+    }
+
+    #[test]
+    fn test_daq_health_non_finite_dropped() {
+        let mut h = DaqHealth::new();
+        h.is_reachable = Some(true);
+        h.temperature = Some(f64::NAN);
+        h.voltage_5v = Some(f64::INFINITY);
+        h.metrics
+            .insert("x".into(), MetricValue::Float(f64::NEG_INFINITY));
+        let (status, metrics) = h.to_status_and_metrics();
+        assert_eq!(status, HealthStatus::Healthy);
+        assert!(!metrics.contains_key("temperature_celsius"));
+        assert!(!metrics.contains_key("voltage_5v"));
+        assert!(!metrics.contains_key("x"));
+    }
+
+    #[test]
+    fn test_daq_health_deserializes_without_is_reachable() {
+        let json = r#"{"temperature":40.0,"self_test_passed":null,"voltage_5v":null,
+            "voltage_3v3":null,"voltage_user":null,"voltage_negative_user":null,
+            "error_message":null,"metrics":{}}"#;
+        let h: DaqHealth = serde_json::from_str(json).unwrap();
+        assert!(h.is_reachable.is_none());
     }
 
     #[test]
@@ -195,6 +253,7 @@ mod tests {
             voltage_3v3: Some(3.3),
             voltage_user: None,
             voltage_negative_user: None,
+            is_reachable: None,
             error_message: None,
             metrics: HashMap::new(),
         };
@@ -206,7 +265,7 @@ mod tests {
         ));
         assert!(matches!(
             metrics.get("self_test_passed"),
-            Some(MetricValue::Boolean(v)) if *v == true
+            Some(MetricValue::Boolean(true))
         ));
         assert!(matches!(
             metrics.get("voltage_5v"),
@@ -223,6 +282,7 @@ mod tests {
             voltage_3v3: Some(3.3),
             voltage_user: None,
             voltage_negative_user: None,
+            is_reachable: None,
             error_message: None,
             metrics: HashMap::new(),
         };
@@ -239,6 +299,7 @@ mod tests {
             voltage_3v3: None,
             voltage_user: None,
             voltage_negative_user: None,
+            is_reachable: None,
             error_message: Some("Device not responding".to_string()),
             metrics: HashMap::new(),
         };
@@ -262,6 +323,7 @@ mod tests {
             voltage_3v3: Some(3.3),
             voltage_user: None,
             voltage_negative_user: None,
+            is_reachable: None,
             error_message: None,
             metrics: HashMap::new(),
         };
@@ -278,6 +340,7 @@ mod tests {
             voltage_3v3: Some(3.3),
             voltage_user: None,
             voltage_negative_user: None,
+            is_reachable: None,
             error_message: None,
             metrics: HashMap::new(),
         };
@@ -294,6 +357,7 @@ mod tests {
             voltage_3v3: Some(3.0), // Below 3.15 threshold
             voltage_user: None,
             voltage_negative_user: None,
+            is_reachable: None,
             error_message: None,
             metrics: HashMap::new(),
         };
@@ -312,6 +376,7 @@ mod tests {
             voltage_3v3: None,
             voltage_user: None,
             voltage_negative_user: None,
+            is_reachable: None,
             error_message: None,
             metrics: extra,
         };
@@ -331,6 +396,7 @@ mod tests {
             voltage_3v3: None,
             voltage_user: None,
             voltage_negative_user: None,
+            is_reachable: None,
             error_message: None,
             metrics: HashMap::new(),
         };
@@ -349,6 +415,7 @@ mod tests {
             voltage_3v3: Some(3.3),
             voltage_user: Some(2.5),
             voltage_negative_user: Some(-2.5),
+            is_reachable: None,
             error_message: None,
             metrics: HashMap::new(),
         };

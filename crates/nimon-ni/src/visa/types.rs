@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(status, HealthStatus::Healthy);
         assert!(matches!(
             metrics.get("is_reachable"),
-            Some(MetricValue::Boolean(v)) if *v == true
+            Some(MetricValue::Boolean(true))
         ));
         assert!(matches!(
             metrics.get("response_time_ms"),
@@ -199,7 +199,7 @@ mod tests {
         assert_eq!(status, HealthStatus::Offline);
         assert!(matches!(
             metrics.get("is_reachable"),
-            Some(MetricValue::Boolean(v)) if *v == false
+            Some(MetricValue::Boolean(false))
         ));
     }
 

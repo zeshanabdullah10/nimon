@@ -177,6 +177,126 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the alert_action command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-alert-action",
+          "markdownDescription": "Enables the alert_action command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-state",
+          "markdownDescription": "Enables the get_state command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the move_by command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-move-by",
+          "markdownDescription": "Enables the move_by command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the open_dashboard command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-dashboard",
+          "markdownDescription": "Enables the open_dashboard command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the poll command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-poll",
+          "markdownDescription": "Enables the poll command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the quit command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-quit",
+          "markdownDescription": "Enables the quit command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the save_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-save-state",
+          "markdownDescription": "Enables the save_state command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_locked command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-locked",
+          "markdownDescription": "Enables the set_locked command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ui_log command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ui-log",
+          "markdownDescription": "Enables the ui_log command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the update_geometry command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-update-geometry",
+          "markdownDescription": "Enables the update_geometry command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the alert_action command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-alert-action",
+          "markdownDescription": "Denies the alert_action command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-state",
+          "markdownDescription": "Denies the get_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the move_by command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-move-by",
+          "markdownDescription": "Denies the move_by command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_dashboard command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-dashboard",
+          "markdownDescription": "Denies the open_dashboard command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the poll command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-poll",
+          "markdownDescription": "Denies the poll command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the quit command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-quit",
+          "markdownDescription": "Denies the quit command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the save_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-save-state",
+          "markdownDescription": "Denies the save_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_locked command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-locked",
+          "markdownDescription": "Denies the set_locked command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ui_log command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ui-log",
+          "markdownDescription": "Denies the ui_log command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the update_geometry command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-update-geometry",
+          "markdownDescription": "Denies the update_geometry command without any pre-configured scope."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

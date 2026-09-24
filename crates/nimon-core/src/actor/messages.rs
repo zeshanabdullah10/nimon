@@ -31,7 +31,11 @@ pub struct DevicePollResult {
     pub success: bool,
     /// Current health status
     pub status: HealthStatus,
-    /// Collected metrics
+    /// Collected metrics (lenient deserialization, see `DeviceStatusUpdate`)
+    #[serde(
+        default,
+        deserialize_with = "crate::types::deserialize_metrics_lenient"
+    )]
     pub metrics: HashMap<String, MetricValue>,
     /// Error message if poll failed
     pub error: Option<String>,
@@ -49,7 +53,13 @@ pub struct DeviceStatusUpdate {
     pub edge_id: String,
     /// Current health status
     pub status: HealthStatus,
-    /// Current metrics
+    /// Current metrics. Deserialization is lenient: entries that are
+    /// `null` (e.g. a NaN serialized by serde_json) or otherwise not a
+    /// valid `MetricValue` are skipped rather than failing the update.
+    #[serde(
+        default,
+        deserialize_with = "crate::types::deserialize_metrics_lenient"
+    )]
     pub metrics: HashMap<String, MetricValue>,
     /// Timestamp
     pub timestamp: DateTime<Utc>,
@@ -75,6 +85,18 @@ pub struct DeviceAlert {
     /// Metric value that triggered alert
     pub metric_value: Option<f64>,
     /// Timestamp
+    pub timestamp: DateTime<Utc>,
+}
+
+/// A device disappeared from discovery on an edge (edge -> hub)
+#[derive(Debug, Clone, PartialEq, Message, Serialize, Deserialize)]
+#[rtype(result = "()")]
+pub struct DeviceRemoved {
+    /// Edge node ID
+    pub edge_id: String,
+    /// Device ID that is no longer discovered
+    pub device_id: String,
+    /// When the removal was detected
     pub timestamp: DateTime<Utc>,
 }
 
@@ -108,6 +130,12 @@ pub struct EdgeHeartbeat {
     pub device_count: usize,
     /// Hub connector status
     pub status: String,
+    /// Edge process uptime in seconds (absent from older edges)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_secs: Option<u64>,
+    /// Edge software version (absent from older edges)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Configuration update from hub
@@ -122,21 +150,44 @@ pub struct ConfigUpdate {
     pub thresholds: ThresholdConfig,
 }
 
-/// Threshold configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Default temperature warning threshold (C) used when nothing is configured
+pub const DEFAULT_TEMP_WARNING_C: f64 = 65.0;
+/// Default temperature critical threshold (C) used when nothing is configured
+pub const DEFAULT_TEMP_CRITICAL_C: f64 = 75.0;
+
+/// Threshold configuration (partial push): `None` means "no change",
+/// `Some(v)` overrides the receiver's current value. `Default` is all-`None`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ThresholdConfig {
     /// Temperature warning threshold (C)
-    pub temperature_warning: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_warning: Option<f64>,
     /// Temperature critical threshold (C)
-    pub temperature_critical: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_critical: Option<f64>,
 }
 
-impl Default for ThresholdConfig {
-    fn default() -> Self {
+impl ThresholdConfig {
+    /// A config that sets both thresholds.
+    pub fn full(warning: f64, critical: f64) -> Self {
         Self {
-            temperature_warning: 65.0,
-            temperature_critical: 75.0,
+            temperature_warning: Some(warning),
+            temperature_critical: Some(critical),
         }
+    }
+
+    /// True when the config changes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.temperature_warning.is_none() && self.temperature_critical.is_none()
+    }
+
+    /// Overlay the `Some` values onto the current thresholds and return
+    /// the resulting `(warning, critical)`.
+    pub fn resolve(&self, current_warning: f64, current_critical: f64) -> (f64, f64) {
+        (
+            self.temperature_warning.unwrap_or(current_warning),
+            self.temperature_critical.unwrap_or(current_critical),
+        )
     }
 }
 
@@ -264,8 +315,113 @@ mod tests {
     #[test]
     fn test_config_update_default() {
         let config = ThresholdConfig::default();
-        assert_eq!(config.temperature_warning, 65.0);
-        assert_eq!(config.temperature_critical, 75.0);
+        assert_eq!(config.temperature_warning, None);
+        assert_eq!(config.temperature_critical, None);
+        assert!(config.is_empty());
+        assert_eq!(
+            config.resolve(DEFAULT_TEMP_WARNING_C, DEFAULT_TEMP_CRITICAL_C),
+            (65.0, 75.0)
+        );
+        assert_eq!(serde_json::to_string(&config).unwrap(), "{}");
+    }
+
+    #[test]
+    fn test_threshold_config_partial_and_full() {
+        // Old full payloads still parse
+        let old: ThresholdConfig =
+            serde_json::from_str(r#"{"temperature_warning":70,"temperature_critical":80}"#)
+                .unwrap();
+        assert_eq!(old, ThresholdConfig::full(70.0, 80.0));
+        assert_eq!(old.resolve(1.0, 2.0), (70.0, 80.0));
+
+        // Partial: only critical changes
+        let partial: ThresholdConfig =
+            serde_json::from_str(r#"{"temperature_critical":90}"#).unwrap();
+        assert_eq!(partial.temperature_warning, None);
+        assert_eq!(partial.resolve(60.0, 70.0), (60.0, 90.0));
+        assert_eq!(
+            serde_json::to_string(&partial).unwrap(),
+            r#"{"temperature_critical":90.0}"#
+        );
+
+        // ConfigUpdate without thresholds -> no change
+        let update: ConfigUpdate = serde_json::from_str(r#"{"poll_interval_secs":5}"#).unwrap();
+        assert!(update.thresholds.is_empty());
+    }
+
+    #[test]
+    fn test_status_update_skips_null_metrics() {
+        // serde_json writes NaN as null: one bad reading must not drop the update
+        let mut metrics = HashMap::new();
+        metrics.insert("temperature".to_string(), MetricValue::Float(f64::NAN));
+        metrics.insert("voltage".to_string(), MetricValue::Float(5.0));
+        let update = DeviceStatusUpdate {
+            device_id: "d".to_string(),
+            edge_id: "e".to_string(),
+            status: HealthStatus::Healthy,
+            metrics,
+            timestamp: Utc::now(),
+            is_simulated: false,
+        };
+        let json = serde_json::to_string(&update).unwrap();
+        assert!(json.contains("null"));
+        let parsed: DeviceStatusUpdate = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.metrics.len(), 1);
+        assert_eq!(
+            parsed.metrics.get("voltage"),
+            Some(&MetricValue::Float(5.0))
+        );
+
+        let json = r#"{"device_id":"d","edge_id":"e","status":"healthy",
+            "metrics":{"a":null,"b":{"x":1},"c":[1],"d":1.5,"e":"txt","f":false},
+            "timestamp":"2024-01-01T00:00:00Z"}"#;
+        let parsed: DeviceStatusUpdate = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.metrics.len(), 3);
+        assert!(parsed.metrics.contains_key("d"));
+        assert!(parsed.metrics.contains_key("e"));
+        assert!(parsed.metrics.contains_key("f"));
+    }
+
+    #[test]
+    fn test_sanitize_before_send_drops_non_finite() {
+        let mut metrics = HashMap::new();
+        metrics.insert("t".to_string(), MetricValue::Float(f64::INFINITY));
+        metrics.insert("v".to_string(), MetricValue::Float(1.0));
+        crate::sanitize_metrics(&mut metrics);
+        assert_eq!(metrics.len(), 1);
+    }
+
+    #[test]
+    fn test_heartbeat_optional_fields() {
+        // Old edges omit the new fields
+        let old =
+            r#"{"edge_id":"e","timestamp":"2024-01-01T00:00:00Z","device_count":2,"status":"ok"}"#;
+        let hb: EdgeHeartbeat = serde_json::from_str(old).unwrap();
+        assert_eq!(hb.uptime_secs, None);
+        assert_eq!(hb.version, None);
+        assert!(!serde_json::to_string(&hb).unwrap().contains("uptime_secs"));
+
+        let hb = EdgeHeartbeat {
+            uptime_secs: Some(42),
+            version: Some("0.2.0".to_string()),
+            ..hb
+        };
+        let parsed: EdgeHeartbeat =
+            serde_json::from_str(&serde_json::to_string(&hb).unwrap()).unwrap();
+        assert_eq!(parsed.uptime_secs, Some(42));
+        assert_eq!(parsed.version.as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
+    fn test_device_removed_roundtrip() {
+        let removed = DeviceRemoved {
+            edge_id: "e".to_string(),
+            device_id: "e:PXIe-6368#2".to_string(),
+            timestamp: Utc::now(),
+        };
+        let json = serde_json::to_string(&removed).unwrap();
+        let parsed: DeviceRemoved = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, removed);
     }
 
     #[test]

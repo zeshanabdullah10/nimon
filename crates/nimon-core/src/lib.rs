@@ -7,5 +7,6 @@ pub mod error;
 pub mod protocol;
 pub mod types;
 
+pub use actor::messages::{DEFAULT_TEMP_CRITICAL_C, DEFAULT_TEMP_WARNING_C};
 pub use error::{NimonError, NimonResult};
 pub use types::*;

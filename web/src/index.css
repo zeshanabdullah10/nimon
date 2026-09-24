@@ -2,34 +2,114 @@
 @tailwind components;
 @tailwind utilities;
 
-@layer base {
-  html {
-    color-scheme: dark;
-  }
+/* Dark is the default look; light applies via prefers-color-scheme or the
+ * theme toggle (both resolve to html[data-theme]). */
+:root,
+:root[data-theme='dark'] {
+  --app: 10 10 10;
+  --window: 16 17 18;
+  --card: 21 22 24;
+  --fg: 255 255 255; /* overlay base for rows/lines */
+  --t1: 255 255 255;
+  --t2: 184 187 191; /* 9.6:1 on card */
+  --t3: 146 150 156; /* 5.9:1 on card */
+  --ok: 47 212 99;
+  --warn: 232 180 55;
+  --crit: 247 100 104; /* 5.6:1 on card */
+  --info: 90 200 255;
+  --onaccent: 10 10 10;
+  --focus: 90 200 255;
+  color-scheme: dark;
+}
 
+:root[data-theme='light'] {
+  --app: 238 240 243;
+  --window: 246 247 249;
+  --card: 255 255 255;
+  --fg: 0 0 0;
+  --t1: 17 19 22;
+  --t2: 58 63 70;
+  --t3: 86 92 100; /* 6.6:1 on white */
+  --ok: 18 122 56;
+  --warn: 138 90 0;
+  --crit: 196 38 43;
+  --info: 3 102 158;
+  --onaccent: 255 255 255;
+  --focus: 3 102 158;
+  color-scheme: light;
+}
+
+@layer base {
   body {
     @apply bg-app font-sans text-t1 antialiased;
-    font-variant-numeric: tabular-nums; /* mandatory: values refresh live */
+    font-variant-numeric: tabular-nums; /* values refresh live */
     margin: 0;
   }
-
-  ::selection {
-    background: rgba(47, 212, 99, 0.25);
+  :focus-visible {
+    outline: 2px solid rgb(var(--focus));
+    outline-offset: 2px;
+    border-radius: 6px;
   }
-
+  ::selection {
+    background: rgb(var(--info) / 0.3);
+  }
   * {
     scrollbar-width: thin;
-    scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+    scrollbar-color: rgb(var(--fg) / 0.18) transparent;
   }
-  ::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
+  dialog::backdrop {
+    background: rgb(0 0 0 / 0.55);
   }
-  ::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.12);
-    border-radius: 3px;
+  dialog {
+    color: inherit;
   }
-  ::-webkit-scrollbar-track {
-    background: transparent;
+}
+
+@layer components {
+  /* 100vh fallback for browsers without dynamic viewport units */
+  .app-shell {
+    height: 100vh;
+    height: 100dvh;
+  }
+  .card {
+    @apply rounded-xl border border-fg/[0.07] bg-card;
+  }
+  .card-title {
+    @apply text-xs font-semibold uppercase tracking-wide text-t2;
+  }
+  .row {
+    @apply rounded-lg bg-fg/[0.035];
+  }
+  .btn {
+    @apply inline-flex min-h-[36px] items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-fg/[0.14] px-3 text-[13px] font-medium text-t1 transition-colors hover:bg-fg/[0.06] disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-sm {
+    @apply min-h-[30px] px-2.5 text-xs;
+  }
+  .btn-primary {
+    @apply border-transparent bg-ok text-onaccent hover:bg-ok/90;
+  }
+  .btn-danger {
+    @apply border-transparent bg-crit text-onaccent hover:bg-crit/90;
+  }
+  .btn-ghost {
+    @apply border-transparent text-t2 hover:text-t1;
+  }
+  .input {
+    @apply min-h-[36px] w-full rounded-lg border border-fg/[0.16] bg-window px-2.5 text-[13px] text-t1 placeholder:text-t3;
+  }
+  .label {
+    @apply mb-1 block text-xs font-medium text-t2;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

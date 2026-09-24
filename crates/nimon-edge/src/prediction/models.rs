@@ -1,16 +1,44 @@
 //! Prediction models for device failure prediction
 //!
 //! This module provides three prediction model implementations:
-//! - [`EwmaAnomalyDetector`]: EWMA-based anomaly detection using z-scores
+//! - [`EwmaAnomalyDetector`]: EWMA-based detection of *rising* anomalies
+//!   (z-score with a standard-deviation floor)
 //! - [`TrendPredictor`]: timestamp-based linear regression trend detection
-//!   with real ETA computation against a critical value
+//!   with real ETA computation against a critical value, deduplicated
 //! - [`ThresholdPredictor`]: threshold-band prediction with transition
 //!   deduplication
+//!
+//! Model instances hold per-series state: create one set per
+//! (device, metric) pair.
+//!
+//! Probabilities come from [`excess_probability`]: 0 at the trigger
+//! threshold, growing with the excess over it and saturating at 0.99, so
+//! only clearly anomalous readings look "high confidence".
 
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
 
 use nimon_core::PredictionType;
+
+/// Probability saturation (a model never claims certainty)
+const MAX_PROBABILITY: f64 = 0.99;
+
+/// Map how far `x` exceeds `threshold` to a probability:
+/// `1 - exp(-(x - threshold) / scale)`, clamped to `[0, 0.99]`.
+/// At `x = threshold + scale` the probability is ~0.63, at
+/// `threshold + 2*scale` ~0.86.
+pub fn excess_probability(x: f64, threshold: f64, scale: f64) -> f64 {
+    if !x.is_finite() {
+        return 0.0;
+    }
+    let excess = (x - threshold).max(0.0);
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    (1.0 - (-excess / scale).exp()).clamp(0.0, MAX_PROBABILITY)
+}
 
 /// Prediction model trait
 ///
@@ -23,10 +51,15 @@ pub trait PredictionModel: Send + Sync {
     fn update(&mut self, metric_name: &str, value: f64, timestamp: DateTime<Utc>) -> ModelUpdate;
 
     /// Get the most recent prediction for a metric, if any.
-    ///
-    /// Models that generate predictions eagerly in `update()` return
-    /// the last prediction they produced.
     fn predict(&self, metric_name: &str) -> Option<Prediction>;
+
+    /// Apply new warning/critical thresholds in place (state is kept).
+    fn set_thresholds(&mut self, _warning: f64, _critical: f64) {}
+
+    /// Short model name (for logs)
+    fn name(&self) -> &'static str {
+        "custom"
+    }
 }
 
 /// Result of a model update
@@ -55,20 +88,57 @@ pub struct Prediction {
     pub model_version: String,
 }
 
+/// Built-in model kinds, selectable from `prediction.models`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelKind {
+    Threshold,
+    Ewma,
+    Trend,
+}
+
+impl ModelKind {
+    /// Parse a config name (`threshold`, `ewma_anomaly`/`ewma`,
+    /// `trend_prediction`/`trend`)
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "threshold" => Some(ModelKind::Threshold),
+            "ewma" | "ewma_anomaly" => Some(ModelKind::Ewma),
+            "trend" | "trend_prediction" => Some(ModelKind::Trend),
+            _ => None,
+        }
+    }
+}
+
+fn last_for(last: &Option<(String, Prediction)>, metric_name: &str) -> Option<Prediction> {
+    last.as_ref()
+        .filter(|(metric, _)| metric == metric_name)
+        .map(|(_, p)| p.clone())
+}
+
 // ============================================================================
 // EWMA Anomaly Detector
 // ============================================================================
 
+/// Default minimum standard deviation for z-scores (same unit as the
+/// metric; 0.5 °C for temperatures)
+pub const DEFAULT_MIN_STD: f64 = 0.5;
+
 /// EWMA-based anomaly detection model.
 ///
-/// Uses Exponentially Weighted Moving Average to track mean and variance,
-/// then flags values that exceed a z-score threshold as anomalous.
+/// Tracks an exponentially weighted mean and variance and flags values
+/// whose z-score *above* the mean exceeds the threshold (a sudden drop
+/// is not an overheating risk). The standard deviation used for the
+/// z-score is floored at `min_std`, so a perfectly flat, quantized signal
+/// followed by one quantization step does not look like a 10000-sigma
+/// event.
 pub struct EwmaAnomalyDetector {
     /// Smoothing factor (0.0 to 1.0). Higher = more responsive to recent values.
     pub alpha: f64,
     /// Z-score threshold for anomaly detection
     pub threshold: f64,
-    /// Recent values for initial variance calculation
+    /// Floor for the standard deviation used in z-scores
+    pub min_std: f64,
+    /// Warm-up samples (cleared once initialized)
     pub values: VecDeque<f64>,
     /// EWMA mean
     pub mean: f64,
@@ -76,8 +146,10 @@ pub struct EwmaAnomalyDetector {
     pub variance: f64,
     /// Whether the model has been initialized with enough data
     pub initialized: bool,
-    /// Minimum samples before anomaly detection kicks in
+    /// Minimum samples before anomaly detection kicks in (>= 1)
     min_samples: usize,
+    /// Samples seen since creation
+    samples_seen: usize,
     /// Last prediction produced (returned by `predict`)
     last_prediction: Option<(String, Prediction)>,
 }
@@ -91,113 +163,103 @@ impl EwmaAnomalyDetector {
     /// * `min_samples` - Minimum samples before detection starts
     pub fn new(alpha: f64, threshold: f64, min_samples: usize) -> Self {
         Self {
-            alpha,
+            alpha: alpha.clamp(f64::EPSILON, 1.0),
             threshold,
+            min_std: DEFAULT_MIN_STD,
             values: VecDeque::new(),
             mean: 0.0,
             variance: 0.0,
             initialized: false,
-            min_samples,
+            min_samples: min_samples.max(1),
+            samples_seen: 0,
             last_prediction: None,
         }
+    }
+
+    /// Set the standard-deviation floor
+    pub fn with_min_std(mut self, min_std: f64) -> Self {
+        if min_std.is_finite() && min_std > 0.0 {
+            self.min_std = min_std;
+        }
+        self
     }
 
     /// Create with default parameters (alpha=0.3, threshold=2.0, min_samples=5)
     pub fn default_params() -> Self {
         Self::new(0.3, 2.0, 5)
     }
+
+    fn initialize(&mut self) {
+        let n = self.values.len() as f64;
+        self.mean = self.values.iter().sum::<f64>() / n;
+        self.variance = if self.values.len() >= 2 {
+            self.values
+                .iter()
+                .map(|v| (v - self.mean).powi(2))
+                .sum::<f64>()
+                / (n - 1.0)
+        } else {
+            0.0
+        };
+        self.values = VecDeque::new(); // release warm-up memory
+        self.initialized = true;
+    }
 }
 
 impl PredictionModel for EwmaAnomalyDetector {
     fn update(&mut self, metric_name: &str, value: f64, _timestamp: DateTime<Utc>) -> ModelUpdate {
-        self.values.push_back(value);
-
-        if self.values.len() < self.min_samples {
-            // Not enough data yet - compute simple mean
-            let sum: f64 = self.values.iter().sum();
-            self.mean = sum / self.values.len() as f64;
+        if !value.is_finite() {
             return ModelUpdate::NoPrediction;
         }
+        self.samples_seen += 1;
 
         if !self.initialized {
-            // Initialize from collected samples
-            let sum: f64 = self.values.iter().sum();
-            self.mean = sum / self.values.len() as f64;
-
-            let variance_sum: f64 = self.values.iter().map(|v| (v - self.mean).powi(2)).sum();
-            self.variance = variance_sum / (self.values.len() - 1) as f64;
-
-            // Ensure variance is never zero
-            if self.variance < 1e-10 {
-                self.variance = 1e-10;
+            self.values.push_back(value);
+            if self.values.len() >= self.min_samples {
+                self.initialize();
             }
-
-            self.initialized = true;
             return ModelUpdate::NoPrediction;
         }
 
-        // Compute z-score against current (pre-update) mean and variance
+        // z-score against the pre-update state; only rises count
+        let std_dev = self.variance.max(0.0).sqrt().max(self.min_std);
         let old_mean = self.mean;
-        let old_variance = self.variance;
-        let old_std_dev = old_variance.sqrt();
-        let z_score = (value - old_mean).abs() / old_std_dev;
+        let z_score = (value - old_mean) / std_dev;
 
-        // Check z-score before updating state
-        if z_score > self.threshold {
-            let probability = (z_score / self.threshold).min(1.0);
-            let confidence = 0.5
-                + 0.3
-                    * ((self.values.len() - self.min_samples) as f64 / self.min_samples as f64)
-                        .min(1.0);
+        // EW mean/variance update (West's incremental form)
+        let diff = value - old_mean;
+        let increment = self.alpha * diff;
+        self.mean = old_mean + increment;
+        self.variance = (1.0 - self.alpha) * (self.variance + diff * increment);
 
-            // Now update state after detection
-            self.mean = self.alpha * value + (1.0 - self.alpha) * old_mean;
-            let diff_sq = value - self.mean;
-            self.variance = self.alpha * diff_sq * diff_sq + (1.0 - self.alpha) * old_variance;
-            if self.variance < 1e-10 {
-                self.variance = 1e-10;
-            }
-
-            let prediction = Prediction {
-                prediction_type: PredictionType::Overheating,
-                probability,
-                confidence: confidence.min(1.0),
-                eta_minutes: None,
-                reason: format!(
-                    "EWMA anomaly detected: z-score={:.2} (threshold={:.1}), value={:.2}, mean={:.2}",
-                    z_score, self.threshold, value, old_mean
-                ),
-                model_version: "ewma-v1".to_string(),
-            };
-            self.last_prediction = Some((metric_name.to_string(), prediction.clone()));
-            return ModelUpdate::NewPrediction(prediction);
+        if z_score <= self.threshold {
+            return ModelUpdate::NoPrediction;
         }
 
-        // No anomaly - update EWMA state
-        self.mean = self.alpha * value + (1.0 - self.alpha) * old_mean;
-        let diff_sq = value - self.mean;
-        self.variance = self.alpha * diff_sq * diff_sq + (1.0 - self.alpha) * old_variance;
-
-        // Ensure variance stays positive
-        if self.variance < 1e-10 {
-            self.variance = 1e-10;
-        }
-
-        // Trim values to keep memory bounded (keep min_samples * 3)
-        let max_values = self.min_samples * 3;
-        while self.values.len() > max_values {
-            self.values.pop_front();
-        }
-
-        ModelUpdate::NoPrediction
+        let probability = excess_probability(z_score, self.threshold, self.threshold);
+        let warm = (self.samples_seen - self.min_samples) as f64 / self.min_samples as f64;
+        let confidence = (0.5 + 0.3 * warm.min(1.0)).min(1.0);
+        let prediction = Prediction {
+            prediction_type: PredictionType::Overheating,
+            probability,
+            confidence,
+            eta_minutes: None,
+            reason: format!(
+                "EWMA anomaly: value {:.2} is {:.1} sigma above mean {:.2} (threshold {:.1}, std {:.2})",
+                value, z_score, old_mean, self.threshold, std_dev
+            ),
+            model_version: "ewma-v2".to_string(),
+        };
+        self.last_prediction = Some((metric_name.to_string(), prediction.clone()));
+        ModelUpdate::NewPrediction(prediction)
     }
 
     fn predict(&self, metric_name: &str) -> Option<Prediction> {
-        self.last_prediction
-            .iter()
-            .filter(|(metric, _)| metric == metric_name)
-            .map(|(_, p)| p.clone())
-            .next()
+        last_for(&self.last_prediction, metric_name)
+    }
+
+    fn name(&self) -> &'static str {
+        "ewma"
     }
 }
 
@@ -205,14 +267,31 @@ impl PredictionModel for EwmaAnomalyDetector {
 // Trend Predictor
 // ============================================================================
 
+/// Default minimum time between repeated trend predictions
+pub const DEFAULT_TREND_REEMIT_MINUTES: i64 = 10;
+/// Default regression window (minutes of history)
+pub const DEFAULT_TREND_WINDOW_MINUTES: u64 = 5;
+/// Default cap on stored trend samples (memory bound; 1 s polls over a
+/// 5 minute window fit comfortably)
+pub const MAX_TREND_SAMPLES: usize = 1024;
+
 /// Timestamp-based linear regression trend detection model.
 ///
-/// Tracks recent (timestamp, value) pairs and computes the slope in
-/// units per MINUTE, so predictions and ETAs are independent of the
-/// polling cadence.
+/// Tracks the (timestamp, value) pairs of the last `window` (time based,
+/// default 5 minutes) and computes the slope in units per MINUTE, so
+/// predictions, ETAs *and sensitivity* are independent of the polling
+/// cadence: a single quantization step is spread over the whole window
+/// whether the edge polls every 5 s or every 60 s. No trend is reported
+/// until at least half a window of history (and 3 samples) exists.
+///
+/// While the slope stays above the threshold the prediction is emitted
+/// once on the crossing, then again only when the ETA moves by more than
+/// 20% or the re-emit interval has passed.
 pub struct TrendPredictor {
-    /// Number of recent samples to consider for trend calculation
+    /// Maximum number of samples kept (memory bound)
     pub window_size: usize,
+    /// Regression window (history span)
+    window: chrono::Duration,
     /// Rate-of-change threshold (units per minute) that triggers a prediction
     pub threshold_rate: f64,
     /// Value considered critical for ETA computation
@@ -221,6 +300,10 @@ pub struct TrendPredictor {
     pub samples: VecDeque<(DateTime<Utc>, f64)>,
     /// Type of prediction to generate
     prediction_type: PredictionType,
+    /// Minimum time between repeated predictions of one rising episode
+    reemit_after: chrono::Duration,
+    /// Active rising episode: (last emit time, ETA at last emit)
+    active: Option<(DateTime<Utc>, Option<i32>)>,
     /// Last prediction produced (returned by `predict`)
     last_prediction: Option<(String, Prediction)>,
 }
@@ -229,7 +312,9 @@ impl TrendPredictor {
     /// Create a new trend predictor.
     ///
     /// # Arguments
-    /// * `window_size` - Number of samples in the sliding window
+    /// * `window_size` - Maximum number of samples kept (memory cap; the
+    ///   regression window itself is time based, see
+    ///   [`with_window_minutes`](Self::with_window_minutes))
     /// * `threshold_rate` - Minimum slope per minute to trigger a prediction
     /// * `critical_value` - Value at which the failure is expected (ETA target)
     /// * `prediction_type` - Type of prediction to emit
@@ -239,63 +324,98 @@ impl TrendPredictor {
         critical_value: f64,
         prediction_type: PredictionType,
     ) -> Self {
+        let window_size = window_size.max(3);
         Self {
             window_size,
+            window: chrono::Duration::minutes(DEFAULT_TREND_WINDOW_MINUTES as i64),
             threshold_rate,
             critical_value,
-            samples: VecDeque::new(),
+            samples: VecDeque::with_capacity((window_size + 1).min(64)),
             prediction_type,
+            reemit_after: chrono::Duration::minutes(DEFAULT_TREND_REEMIT_MINUTES),
+            active: None,
             last_prediction: None,
         }
     }
 
+    /// Set the minimum time between repeated predictions (minutes)
+    pub fn with_reemit_minutes(mut self, minutes: u64) -> Self {
+        self.reemit_after = chrono::Duration::minutes(minutes.min(24 * 60) as i64);
+        self
+    }
+
+    /// Set the regression window (minutes of history, 1..=1440)
+    pub fn with_window_minutes(mut self, minutes: u64) -> Self {
+        self.window = chrono::Duration::minutes(minutes.clamp(1, 24 * 60) as i64);
+        self
+    }
+
+    /// Time covered by the stored samples
+    fn span(&self) -> chrono::Duration {
+        match (self.samples.front(), self.samples.back()) {
+            (Some(first), Some(last)) => last.0.signed_duration_since(first.0),
+            _ => chrono::Duration::zero(),
+        }
+    }
+
     /// Calculate the linear regression slope of recent samples in
-    /// units per minute.
+    /// units per minute (single pass, no allocation).
     pub fn calculate_trend(&self) -> Option<f64> {
         let n = self.samples.len();
         if n < 3 {
             return None;
         }
-
-        // x = elapsed minutes since the first sample
-        let t0 = self.samples.front().unwrap().0;
-        let xs: Vec<f64> = self
-            .samples
-            .iter()
-            .map(|(t, _)| t.signed_duration_since(t0).num_seconds() as f64 / 60.0)
-            .collect();
-        let ys: Vec<f64> = self.samples.iter().map(|(_, v)| *v).collect();
-
-        // Guard: all samples inside the same instant -> no trend signal
-        let sum_x: f64 = xs.iter().sum();
-        let n_f = n as f64;
-        if sum_x <= f64::EPSILON {
-            return None;
+        let t0 = self.samples.front()?.0;
+        let (mut sum_x, mut sum_y, mut sum_xy, mut sum_x2) = (0.0, 0.0, 0.0, 0.0);
+        for (t, y) in &self.samples {
+            // x = elapsed minutes since the first sample
+            let x = t.signed_duration_since(t0).num_milliseconds() as f64 / 60_000.0;
+            sum_x += x;
+            sum_y += y;
+            sum_xy += x * y;
+            sum_x2 += x * x;
         }
 
-        let sum_y: f64 = ys.iter().sum();
-        let sum_xy: f64 = xs.iter().zip(ys.iter()).map(|(x, y)| x * y).sum();
-        let sum_x2: f64 = xs.iter().map(|x| x * x).sum();
-
+        // Guard: all samples inside the same instant -> no trend signal
+        if sum_x.abs() <= f64::EPSILON {
+            return None;
+        }
+        let n_f = n as f64;
         let denominator = n_f * sum_x2 - sum_x * sum_x;
         if denominator.abs() < 1e-10 {
             return Some(0.0);
         }
-
         Some((n_f * sum_xy - sum_x * sum_y) / denominator)
+    }
+
+    fn eta_changed(old: Option<i32>, new: Option<i32>) -> bool {
+        match (old, new) {
+            (Some(a), Some(b)) => (a - b).abs() as f64 > 0.2 * a.max(1) as f64,
+            (None, None) => false,
+            _ => true,
+        }
     }
 }
 
 impl PredictionModel for TrendPredictor {
     fn update(&mut self, metric_name: &str, value: f64, timestamp: DateTime<Utc>) -> ModelUpdate {
+        if !value.is_finite() {
+            return ModelUpdate::NoPrediction;
+        }
+        // clock went backwards: the old history is not comparable
+        if self.samples.back().is_some_and(|(t, _)| timestamp < *t) {
+            self.samples.clear();
+        }
         self.samples.push_back((timestamp, value));
-
-        if self.samples.len() > self.window_size {
+        let oldest = timestamp - self.window;
+        while self.samples.front().is_some_and(|(t, _)| *t < oldest) {
             self.samples.pop_front();
         }
-
-        // Need at least 3 samples for trend analysis
-        if self.samples.len() < 3 {
+        while self.samples.len() > self.window_size {
+            self.samples.pop_front();
+        }
+        // too little history: a single quantization step would look steep
+        if self.span() < self.window / 2 {
             return ModelUpdate::NoPrediction;
         }
 
@@ -304,50 +424,69 @@ impl PredictionModel for TrendPredictor {
             None => return ModelUpdate::NoPrediction,
         };
 
-        // Only trigger on upward trends exceeding threshold
-        if slope_per_min > self.threshold_rate {
-            let latest = self.samples.back().unwrap().1;
-            let probability = (slope_per_min / self.threshold_rate).min(1.0);
-            let confidence =
-                0.6 + 0.2 * (self.samples.len() as f64 / self.window_size as f64).min(1.0);
-
-            // ETA: minutes until the critical value at the current slope
-            let eta_minutes = if latest < self.critical_value {
-                let minutes = (self.critical_value - latest) / slope_per_min;
-                // Cap absurdly large ETAs (the trend will change before then)
-                if minutes.is_finite() && minutes < 24.0 * 60.0 {
-                    Some(minutes.max(1.0) as i32)
-                } else {
-                    None
-                }
-            } else {
-                Some(0) // already at/above critical
-            };
-
-            let prediction = Prediction {
-                prediction_type: self.prediction_type.clone(),
-                probability,
-                confidence: confidence.min(1.0),
-                eta_minutes,
-                reason: format!(
-                    "Upward trend detected: {:+.3}/min (threshold={:.3}/min), current={:.2}, critical={:.2}",
-                    slope_per_min, self.threshold_rate, latest, self.critical_value
-                ),
-                model_version: "trend-v1".to_string(),
-            };
-            self.last_prediction = Some((metric_name.to_string(), prediction.clone()));
-            return ModelUpdate::NewPrediction(prediction);
+        // Only upward trends exceeding the threshold; anything else ends
+        // the current episode
+        if slope_per_min <= self.threshold_rate {
+            self.active = None;
+            return ModelUpdate::NoPrediction;
         }
 
-        ModelUpdate::NoPrediction
+        let latest = value;
+        // ETA: minutes until the critical value at the current slope
+        let eta_minutes = if latest < self.critical_value {
+            let minutes = (self.critical_value - latest) / slope_per_min;
+            // Cap absurdly large ETAs (the trend will change before then)
+            if minutes.is_finite() && minutes < 24.0 * 60.0 {
+                Some(minutes.max(1.0) as i32)
+            } else {
+                None
+            }
+        } else {
+            Some(0) // already at/above critical
+        };
+
+        let emit = match self.active {
+            None => true,
+            Some((last_emit, last_eta)) => {
+                timestamp.signed_duration_since(last_emit) >= self.reemit_after
+                    || Self::eta_changed(last_eta, eta_minutes)
+            }
+        };
+        if !emit {
+            return ModelUpdate::NoPrediction;
+        }
+        self.active = Some((timestamp, eta_minutes));
+
+        let threshold = self.threshold_rate.abs().max(f64::EPSILON);
+        let probability = excess_probability(slope_per_min, threshold, threshold);
+        let coverage =
+            self.span().num_milliseconds() as f64 / self.window.num_milliseconds().max(1) as f64;
+        let confidence = 0.6 + 0.2 * coverage.clamp(0.0, 1.0);
+        let prediction = Prediction {
+            prediction_type: self.prediction_type.clone(),
+            probability,
+            confidence: confidence.min(1.0),
+            eta_minutes,
+            reason: format!(
+                "Upward trend detected: {:+.3}/min (threshold={:.3}/min), current={:.2}, critical={:.2}",
+                slope_per_min, self.threshold_rate, latest, self.critical_value
+            ),
+            model_version: "trend-v2".to_string(),
+        };
+        self.last_prediction = Some((metric_name.to_string(), prediction.clone()));
+        ModelUpdate::NewPrediction(prediction)
     }
 
     fn predict(&self, metric_name: &str) -> Option<Prediction> {
-        self.last_prediction
-            .iter()
-            .filter(|(metric, _)| metric == metric_name)
-            .map(|(_, p)| p.clone())
-            .next()
+        last_for(&self.last_prediction, metric_name)
+    }
+
+    fn set_thresholds(&mut self, _warning: f64, critical: f64) {
+        self.critical_value = critical;
+    }
+
+    fn name(&self) -> &'static str {
+        "trend"
     }
 }
 
@@ -378,6 +517,8 @@ pub struct ThresholdPredictor {
     prediction_type: PredictionType,
     /// Band of the previous update (dedupes repeated predictions)
     last_band: ThresholdBand,
+    /// Previous value (re-banded when thresholds change)
+    last_value: Option<f64>,
     /// Last prediction produced (returned by `predict`)
     last_prediction: Option<(String, Prediction)>,
 }
@@ -399,6 +540,7 @@ impl ThresholdPredictor {
             warning_threshold,
             prediction_type,
             last_band: ThresholdBand::Normal,
+            last_value: None,
             last_prediction: None,
         }
     }
@@ -416,21 +558,29 @@ impl ThresholdPredictor {
 
 impl PredictionModel for ThresholdPredictor {
     fn update(&mut self, metric_name: &str, value: f64, _timestamp: DateTime<Utc>) -> ModelUpdate {
+        if !value.is_finite() {
+            return ModelUpdate::NoPrediction;
+        }
         let band = self.band(value);
         let previous = self.last_band;
         self.last_band = band;
+        self.last_value = Some(value);
 
         // Only emit on transitions into (or escalation within) a risk band
         if band == previous {
             return ModelUpdate::NoPrediction;
         }
 
-        match band {
-            ThresholdBand::Normal => ModelUpdate::NoPrediction,
+        let prediction = match band {
+            ThresholdBand::Normal => return ModelUpdate::NoPrediction,
+            // de-escalation critical -> warning is not news
+            ThresholdBand::Warning if previous == ThresholdBand::Critical => {
+                return ModelUpdate::NoPrediction
+            }
             ThresholdBand::Warning => {
                 let ratio = (value - self.warning_threshold)
                     / (self.critical_threshold - self.warning_threshold).max(f64::EPSILON);
-                let prediction = Prediction {
+                Prediction {
                     prediction_type: self.prediction_type.clone(),
                     probability: (0.5 + 0.3 * ratio).min(0.85),
                     confidence: 0.6,
@@ -440,34 +590,40 @@ impl PredictionModel for ThresholdPredictor {
                         value, self.warning_threshold, self.critical_threshold
                     ),
                     model_version: "threshold-v1".to_string(),
-                };
-                self.last_prediction = Some((metric_name.to_string(), prediction.clone()));
-                ModelUpdate::NewPrediction(prediction)
+                }
             }
-            ThresholdBand::Critical => {
-                let prediction = Prediction {
-                    prediction_type: self.prediction_type.clone(),
-                    probability: 0.9,
-                    confidence: 0.95,
-                    eta_minutes: Some(0),
-                    reason: format!(
-                        "Value {:.2} exceeds critical threshold {:.2}",
-                        value, self.critical_threshold
-                    ),
-                    model_version: "threshold-v1".to_string(),
-                };
-                self.last_prediction = Some((metric_name.to_string(), prediction.clone()));
-                ModelUpdate::NewPrediction(prediction)
-            }
-        }
+            ThresholdBand::Critical => Prediction {
+                prediction_type: self.prediction_type.clone(),
+                probability: 0.9,
+                confidence: 0.95,
+                eta_minutes: Some(0),
+                reason: format!(
+                    "Value {:.2} exceeds critical threshold {:.2}",
+                    value, self.critical_threshold
+                ),
+                model_version: "threshold-v1".to_string(),
+            },
+        };
+        self.last_prediction = Some((metric_name.to_string(), prediction.clone()));
+        ModelUpdate::NewPrediction(prediction)
     }
 
     fn predict(&self, metric_name: &str) -> Option<Prediction> {
-        self.last_prediction
-            .iter()
-            .filter(|(metric, _)| metric == metric_name)
-            .map(|(_, p)| p.clone())
-            .next()
+        last_for(&self.last_prediction, metric_name)
+    }
+
+    fn set_thresholds(&mut self, warning: f64, critical: f64) {
+        self.warning_threshold = warning;
+        self.critical_threshold = critical;
+        // the previous value is judged by the new bands, so the next
+        // transition is detected correctly
+        if let Some(v) = self.last_value {
+            self.last_band = self.band(v);
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "threshold"
     }
 }
 
@@ -488,16 +644,45 @@ mod tests {
         base + Duration::minutes(minutes)
     }
 
+    fn fired(u: &ModelUpdate) -> bool {
+        matches!(u, ModelUpdate::NewPrediction(_))
+    }
+
+    #[test]
+    fn test_excess_probability_shape() {
+        assert_eq!(excess_probability(2.0, 2.0, 2.0), 0.0);
+        assert_eq!(excess_probability(1.0, 2.0, 2.0), 0.0);
+        let p1 = excess_probability(3.0, 2.0, 2.0);
+        let p2 = excess_probability(4.0, 2.0, 2.0);
+        let p3 = excess_probability(8.0, 2.0, 2.0);
+        assert!(0.0 < p1 && p1 < p2 && p2 < p3, "{p1} {p2} {p3}");
+        assert!((p2 - (1.0 - (-1.0f64).exp())).abs() < 1e-12);
+        assert_eq!(excess_probability(1e9, 2.0, 2.0), MAX_PROBABILITY);
+        assert_eq!(excess_probability(f64::NAN, 2.0, 2.0), 0.0);
+        assert!(
+            excess_probability(5.0, 2.0, 0.0) > 0.0,
+            "bad scale falls back"
+        );
+    }
+
+    #[test]
+    fn test_model_kind_parse() {
+        assert_eq!(ModelKind::parse("threshold"), Some(ModelKind::Threshold));
+        assert_eq!(ModelKind::parse(" EWMA_anomaly "), Some(ModelKind::Ewma));
+        assert_eq!(ModelKind::parse("ewma"), Some(ModelKind::Ewma));
+        assert_eq!(ModelKind::parse("trend_prediction"), Some(ModelKind::Trend));
+        assert_eq!(ModelKind::parse("trend"), Some(ModelKind::Trend));
+        assert_eq!(ModelKind::parse("neural"), None);
+    }
+
     // -- EWMA Anomaly Detector Tests --
 
     #[test]
     fn test_ewma_detector_no_prediction_with_few_samples() {
         let mut detector = EwmaAnomalyDetector::new(0.3, 2.0, 5);
         let ts = now();
-
         for val in [10.0, 10.1, 10.2] {
-            let result = detector.update("temperature", val, ts);
-            assert!(matches!(result, ModelUpdate::NoPrediction));
+            assert!(!fired(&detector.update("temperature", val, ts)));
         }
     }
 
@@ -505,10 +690,8 @@ mod tests {
     fn test_ewma_detector_no_prediction_for_normal_values() {
         let mut detector = EwmaAnomalyDetector::new(0.3, 3.0, 5);
         let ts = now();
-
         for val in [10.0, 10.5, 10.2, 9.8, 10.1, 10.3, 9.9, 10.0, 10.4, 9.7] {
-            let result = detector.update("temperature", val, ts);
-            assert!(matches!(result, ModelUpdate::NoPrediction));
+            assert!(!fired(&detector.update("temperature", val, ts)));
         }
     }
 
@@ -516,43 +699,101 @@ mod tests {
     fn test_ewma_detector_anomaly_detected() {
         let mut detector = EwmaAnomalyDetector::new(0.3, 2.0, 5);
         let ts = now();
-
         for val in [10.0, 10.1, 10.0, 9.9, 10.0] {
             let _ = detector.update("temperature", val, ts);
         }
-
-        let result = detector.update("temperature", 25.0, ts);
-
-        match result {
+        match detector.update("temperature", 25.0, ts) {
             ModelUpdate::NewPrediction(pred) => {
-                assert!(
-                    pred.probability > 0.5,
-                    "Expected probability > 0.5, got {}",
-                    pred.probability
-                );
+                assert!(pred.probability > 0.5, "got {}", pred.probability);
+                assert!(pred.probability < 1.0);
                 assert!(pred.confidence > 0.0);
                 assert!(pred.reason.contains("anomaly"));
             }
-            ModelUpdate::NoPrediction => {
-                panic!("Expected NewPrediction after anomalous value, got NoPrediction");
-            }
+            ModelUpdate::NoPrediction => panic!("Expected NewPrediction after anomalous value"),
         }
+    }
+
+    #[test]
+    fn test_ewma_quantized_flat_then_small_step_is_not_anomalous() {
+        // identical quantized readings: variance 0 -> min_std floor
+        let mut detector = EwmaAnomalyDetector::new(0.3, 2.0, 5);
+        let ts = now();
+        for _ in 0..20 {
+            assert!(!fired(&detector.update("temperature", 45.0, ts)));
+        }
+        assert!(
+            !fired(&detector.update("temperature", 45.25, ts)),
+            "one quantization step must not be an anomaly"
+        );
+        // a real jump still fires
+        assert!(fired(&detector.update("temperature", 48.0, ts)));
+    }
+
+    #[test]
+    fn test_ewma_sudden_drop_is_not_overheating() {
+        let mut detector = EwmaAnomalyDetector::new(0.3, 2.0, 5);
+        let ts = now();
+        for val in [60.0, 60.1, 59.9, 60.0, 60.1, 60.0] {
+            let _ = detector.update("temperature", val, ts);
+        }
+        assert!(!fired(&detector.update("temperature", 30.0, ts)));
+    }
+
+    #[test]
+    fn test_ewma_min_samples_one_is_safe() {
+        let mut detector = EwmaAnomalyDetector::new(0.3, 2.0, 1);
+        let ts = now();
+        assert!(!fired(&detector.update("temperature", 40.0, ts)));
+        assert!(detector.initialized);
+        assert_eq!(detector.variance, 0.0);
+        let r = detector.update("temperature", 50.0, ts);
+        match r {
+            ModelUpdate::NewPrediction(p) => {
+                assert!(p.probability.is_finite() && p.confidence.is_finite())
+            }
+            ModelUpdate::NoPrediction => panic!("10 C jump with std floor 0.5 should fire"),
+        }
+        assert!(detector.mean.is_finite() && detector.variance.is_finite());
+        // zero min_samples is clamped to one
+        let mut d0 = EwmaAnomalyDetector::new(0.3, 2.0, 0);
+        assert!(!fired(&d0.update("temperature", 1.0, ts)));
+    }
+
+    #[test]
+    fn test_ewma_probability_grows_with_excess() {
+        let run = |spike: f64| {
+            let mut d = EwmaAnomalyDetector::new(0.3, 2.0, 5).with_min_std(1.0);
+            let ts = now();
+            for _ in 0..5 {
+                let _ = d.update("temperature", 40.0, ts);
+            }
+            match d.update("temperature", spike, ts) {
+                ModelUpdate::NewPrediction(p) => p.probability,
+                ModelUpdate::NoPrediction => 0.0,
+            }
+        };
+        let (a, b, c) = (run(42.5), run(45.0), run(60.0));
+        assert!(a > 0.0 && a < b && b < c, "{a} {b} {c}");
+        assert!(a < 0.8, "barely over the threshold is not high confidence");
+    }
+
+    #[test]
+    fn test_ewma_ignores_non_finite() {
+        let mut d = EwmaAnomalyDetector::default_params();
+        assert!(!fired(&d.update("temperature", f64::NAN, now())));
+        assert!(d.values.is_empty());
     }
 
     #[test]
     fn test_ewma_detector_predict_returns_last_prediction() {
         let mut detector = EwmaAnomalyDetector::new(0.3, 2.0, 5);
         let ts = now();
-
         assert!(detector.predict("temperature").is_none());
-
         for val in [10.0, 10.1, 10.0, 9.9, 10.0] {
             let _ = detector.update("temperature", val, ts);
         }
         let _ = detector.update("temperature", 25.0, ts);
-
         assert!(detector.predict("temperature").is_some());
-        // A different metric has no prediction
         assert!(detector.predict("voltage").is_none());
     }
 
@@ -562,6 +803,7 @@ mod tests {
         assert_eq!(detector.alpha, 0.3);
         assert_eq!(detector.threshold, 2.0);
         assert_eq!(detector.min_samples, 5);
+        assert_eq!(detector.min_std, DEFAULT_MIN_STD);
         assert!(!detector.initialized);
     }
 
@@ -569,13 +811,12 @@ mod tests {
     fn test_ewma_detector_initializes_after_min_samples() {
         let mut detector = EwmaAnomalyDetector::new(0.3, 2.0, 5);
         let ts = now();
-
         for val in [10.0, 10.1, 10.2, 10.0, 10.1] {
             let _ = detector.update("temperature", val, ts);
         }
-
         assert!(detector.initialized);
         assert!(detector.variance > 0.0);
+        assert!(detector.values.is_empty(), "warm-up buffer released");
     }
 
     // -- Trend Predictor Tests --
@@ -588,10 +829,12 @@ mod tests {
     fn test_trend_predictor_no_prediction_few_samples() {
         let mut predictor = trend_predictor();
         let base = now();
-
         for i in 0..2 {
-            let result = predictor.update("temperature", 10.0 + i as f64, at(base, i));
-            assert!(matches!(result, ModelUpdate::NoPrediction));
+            assert!(!fired(&predictor.update(
+                "temperature",
+                10.0 + i as f64,
+                at(base, i)
+            )));
         }
     }
 
@@ -599,10 +842,8 @@ mod tests {
     fn test_trend_predictor_no_prediction_flat_trend() {
         let mut predictor = trend_predictor();
         let base = now();
-
         for i in 0..5 {
-            let result = predictor.update("temperature", 10.0, at(base, i));
-            assert!(matches!(result, ModelUpdate::NoPrediction));
+            assert!(!fired(&predictor.update("temperature", 10.0, at(base, i))));
         }
     }
 
@@ -616,10 +857,10 @@ mod tests {
         for i in 0..5 {
             last = predictor.update("temperature", 60.0 + 5.0 * i as f64, at(base, i));
         }
-
         match last {
             ModelUpdate::NewPrediction(pred) => {
                 assert!(pred.probability > 0.9);
+                assert!(pred.probability < 1.0);
                 // ETA: (85 - 80) / 5 per min = 1 minute
                 assert_eq!(pred.eta_minutes, Some(1));
                 assert!(pred.reason.contains("critical"));
@@ -629,47 +870,142 @@ mod tests {
     }
 
     #[test]
+    fn test_trend_predictor_dedupes_while_eta_stable() {
+        // slow rise far from critical: ETA barely changes between samples
+        let mut predictor = TrendPredictor::new(10, 1.0, 1000.0, PredictionType::Overheating)
+            .with_reemit_minutes(10);
+        let base = now();
+        let mut fires = Vec::new();
+        for i in 0..30 {
+            if fired(&predictor.update("temperature", 10.0 + 2.0 * i as f64, at(base, i))) {
+                fires.push(i);
+            }
+        }
+        // first crossing once half the 5 min window is covered (4th
+        // sample), then once per 10 minutes
+        assert_eq!(fires, vec![3, 13, 23]);
+    }
+
+    #[test]
+    fn test_trend_quantization_step_at_fast_poll_is_not_a_trend() {
+        // 5 s poll, flat 45 C with one 1 C quantization step: with a
+        // 10-sample window this looked like ~1.8 C/min
+        let mut predictor =
+            TrendPredictor::new(MAX_TREND_SAMPLES, 1.0, 85.0, PredictionType::Overheating);
+        let base = now();
+        let mut any = false;
+        for i in 0..240 {
+            let v = if i < 120 { 45.0 } else { 46.0 };
+            any |= fired(&predictor.update("temperature", v, base + Duration::seconds(5 * i)));
+        }
+        assert!(!any, "one quantization step must not be a trend");
+        // same at a 60 s poll
+        let mut predictor =
+            TrendPredictor::new(MAX_TREND_SAMPLES, 1.0, 85.0, PredictionType::Overheating);
+        let mut any = false;
+        for i in 0..20 {
+            let v = if i < 10 { 45.0 } else { 46.0 };
+            any |= fired(&predictor.update("temperature", v, at(base, i)));
+        }
+        assert!(!any);
+    }
+
+    #[test]
+    fn test_trend_needs_half_window_of_history_then_fires_at_fast_poll() {
+        // real 3 C/min rise sampled every 5 s
+        let mut predictor =
+            TrendPredictor::new(MAX_TREND_SAMPLES, 1.0, 85.0, PredictionType::Overheating)
+                .with_window_minutes(4);
+        let base = now();
+        let mut first = None;
+        for i in 0..60 {
+            let t = base + Duration::seconds(5 * i);
+            if fired(&predictor.update("temperature", 40.0 + 0.25 * i as f64, t)) && first.is_none()
+            {
+                first = Some(i);
+            }
+        }
+        // 2 minutes (half of 4) = 24 samples
+        assert_eq!(first, Some(24));
+        // window is time based: 4 min at 5 s = 49 samples at most
+        assert!(predictor.samples.len() <= 49, "{}", predictor.samples.len());
+    }
+
+    #[test]
+    fn test_trend_predictor_reemits_on_eta_change_and_new_episode() {
+        let mut predictor = trend_predictor().with_reemit_minutes(60);
+        let base = now();
+        for i in 0..3 {
+            let _ = predictor.update("temperature", 20.0 + 2.0 * i as f64, at(base, i));
+        }
+        // slope accelerates strongly -> ETA shrinks by far more than 20%
+        let r = predictor.update("temperature", 60.0, at(base, 3));
+        assert!(fired(&r));
+        // flat for a while ends the episode
+        for i in 4..20 {
+            let _ = predictor.update("temperature", 60.0, at(base, i));
+        }
+        assert!(predictor.active.is_none());
+        // a new rise fires immediately again
+        let mut again = false;
+        for i in 20..24 {
+            again |=
+                fired(&predictor.update("temperature", 60.0 + 3.0 * (i - 19) as f64, at(base, i)));
+        }
+        assert!(again);
+    }
+
+    #[test]
     fn test_trend_predictor_same_instant_no_signal() {
         let mut predictor = trend_predictor();
         let ts = now();
-
-        // All samples at the same instant: regression is undefined
-        let mut fired = false;
+        let mut any = false;
         for i in 0..6 {
-            if let ModelUpdate::NewPrediction(_) =
-                predictor.update("temperature", 10.0 + i as f64, ts)
-            {
-                fired = true;
-            }
+            any |= fired(&predictor.update("temperature", 10.0 + i as f64, ts));
         }
-        assert!(!fired, "zero time span must not produce a trend prediction");
+        assert!(!any, "zero time span must not produce a trend prediction");
+    }
+
+    #[test]
+    fn test_trend_uses_sub_second_precision() {
+        let mut predictor = trend_predictor();
+        let base = now();
+        for i in 0..5 {
+            let t = base + Duration::milliseconds(500 * i);
+            let _ = predictor.update("temperature", 10.0 + i as f64, t);
+        }
+        // 1 unit per 0.5 s = 120 units/min
+        let slope = predictor.calculate_trend().unwrap();
+        assert!((slope - 120.0).abs() < 1e-6, "{slope}");
     }
 
     #[test]
     fn test_trend_predictor_window_size_respected() {
         let mut predictor = TrendPredictor::new(5, 1.0, 85.0, PredictionType::Overheating);
         let base = now();
-
         for i in 0..8 {
             let _ = predictor.update("temperature", 10.0 + i as f64, at(base, i));
         }
-
         assert_eq!(predictor.samples.len(), 5);
     }
 
     #[test]
     fn test_trend_predictor_calculate_trend_insufficient_data() {
-        let predictor = trend_predictor();
-        assert!(predictor.calculate_trend().is_none());
+        assert!(trend_predictor().calculate_trend().is_none());
+    }
+
+    #[test]
+    fn test_trend_set_thresholds_updates_critical() {
+        let mut predictor = trend_predictor();
+        predictor.set_thresholds(60.0, 95.0);
+        assert_eq!(predictor.critical_value, 95.0);
     }
 
     #[test]
     fn test_trend_predictor_predict_returns_last() {
         let mut predictor = trend_predictor();
         let base = now();
-
         assert!(predictor.predict("temperature").is_none());
-
         for i in 0..5 {
             let _ = predictor.update("temperature", 60.0 + 5.0 * i as f64, at(base, i));
         }
@@ -685,78 +1021,62 @@ mod tests {
     #[test]
     fn test_threshold_predictor_below_threshold() {
         let mut predictor = threshold_predictor();
-        let result = predictor.update("temperature", 50.0, now());
-        assert!(matches!(result, ModelUpdate::NoPrediction));
+        assert!(!fired(&predictor.update("temperature", 50.0, now())));
     }
 
     #[test]
     fn test_threshold_predictor_warning_range_transition_only() {
         let mut predictor = threshold_predictor();
         let ts = now();
-
-        // Entering the warning band fires once
-        let result = predictor.update("temperature", 70.0, ts);
-        match result {
+        match predictor.update("temperature", 70.0, ts) {
             ModelUpdate::NewPrediction(pred) => {
-                assert!(
-                    pred.probability < 0.9,
-                    "Warning should have lower probability"
-                );
-                assert!(
-                    pred.confidence < 0.9,
-                    "Warning should have lower confidence"
-                );
-                assert!(pred.eta_minutes.is_none(), "Warning should not have ETA");
+                assert!(pred.probability < 0.9);
+                assert!(pred.confidence < 0.9);
+                assert!(pred.eta_minutes.is_none());
             }
-            ModelUpdate::NoPrediction => {
-                panic!("Expected NewPrediction for warning-range value, got NoPrediction");
-            }
+            ModelUpdate::NoPrediction => panic!("Expected NewPrediction for warning-range value"),
         }
-
-        // Staying in the band does NOT re-fire (dedupe)
-        let result = predictor.update("temperature", 71.0, ts);
-        assert!(matches!(result, ModelUpdate::NoPrediction));
+        assert!(!fired(&predictor.update("temperature", 71.0, ts)));
     }
 
     #[test]
     fn test_threshold_predictor_critical_and_escalation() {
         let mut predictor = threshold_predictor();
         let ts = now();
-
-        // Warning first
-        let result = predictor.update("temperature", 70.0, ts);
-        assert!(matches!(result, ModelUpdate::NewPrediction(_)));
-
-        // Escalation to critical fires
-        let result = predictor.update("temperature", 80.0, ts);
-        match result {
+        assert!(fired(&predictor.update("temperature", 70.0, ts)));
+        match predictor.update("temperature", 80.0, ts) {
             ModelUpdate::NewPrediction(pred) => {
-                assert!(
-                    pred.probability >= 0.9,
-                    "Critical should have high probability"
-                );
+                assert!(pred.probability >= 0.9);
                 assert_eq!(pred.confidence, 0.95);
                 assert_eq!(pred.eta_minutes, Some(0));
                 assert!(pred.reason.contains("critical"));
             }
             ModelUpdate::NoPrediction => panic!("Expected critical prediction"),
         }
-
-        // Staying critical does not re-fire
-        let result = predictor.update("temperature", 82.0, ts);
-        assert!(matches!(result, ModelUpdate::NoPrediction));
-
+        assert!(!fired(&predictor.update("temperature", 82.0, ts)));
+        // cooling from critical into warning is not a new risk
+        assert!(!fired(&predictor.update("temperature", 70.0, ts)));
         // Recovery resets the band; re-entering warning fires again
         let _ = predictor.update("temperature", 40.0, ts);
-        let result = predictor.update("temperature", 66.0, ts);
-        assert!(matches!(result, ModelUpdate::NewPrediction(_)));
+        assert!(fired(&predictor.update("temperature", 66.0, ts)));
+    }
+
+    #[test]
+    fn test_threshold_set_thresholds_in_place() {
+        let mut predictor = threshold_predictor();
+        let ts = now();
+        assert!(fired(&predictor.update("temperature", 70.0, ts)));
+        predictor.set_thresholds(80.0, 90.0);
+        assert_eq!(predictor.warning_threshold, 80.0);
+        // 70 is now normal; 85 enters the new warning band
+        assert!(!fired(&predictor.update("temperature", 70.0, ts)));
+        assert!(fired(&predictor.update("temperature", 85.0, ts)));
     }
 
     #[test]
     fn test_threshold_predictor_exactly_at_critical() {
         let mut predictor = threshold_predictor();
-        let result = predictor.update("temperature", 75.0, now());
-        assert!(matches!(result, ModelUpdate::NewPrediction(_)));
+        assert!(fired(&predictor.update("temperature", 75.0, now())));
     }
 
     #[test]
@@ -767,29 +1087,21 @@ mod tests {
         assert!(predictor.predict("temperature").is_some());
     }
 
-    // -- Integration Tests --
-
     #[test]
     fn test_multiple_models_on_same_data() {
         let mut ewma = EwmaAnomalyDetector::default_params();
         let mut trend = TrendPredictor::new(10, 2.0, 85.0, PredictionType::Overheating);
         let mut threshold = threshold_predictor();
         let base = now();
-
         for i in 0..5 {
             let ts = at(base, i);
             ewma.update("temperature", 30.0 + i as f64 * 0.2, ts);
             trend.update("temperature", 30.0 + i as f64 * 0.2, ts);
             threshold.update("temperature", 30.0 + i as f64 * 0.2, ts);
         }
-
-        // Anomalous spike at minute 5
         let ts = at(base, 5);
-        let _ewma_result = ewma.update("temperature", 90.0, ts);
-        let _trend_result = trend.update("temperature", 90.0, ts);
-        let threshold_result = threshold.update("temperature", 90.0, ts);
-
-        // At least threshold should fire for a value of 90
-        assert!(matches!(threshold_result, ModelUpdate::NewPrediction(_)));
+        assert!(fired(&ewma.update("temperature", 90.0, ts)));
+        let _ = trend.update("temperature", 90.0, ts);
+        assert!(fired(&threshold.update("temperature", 90.0, ts)));
     }
 }

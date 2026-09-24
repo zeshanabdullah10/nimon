@@ -4,6 +4,31 @@ use crate::{EdgeNode, EdgeStatus, NimonError, NimonResult};
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
+/// `(id, name, hostname, ip_address, last_seen, status)`
+type EdgeRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn edge_from_row((id, name, hostname, ip_address, last_seen, status): EdgeRow) -> EdgeNode {
+    EdgeNode {
+        id,
+        name,
+        hostname,
+        ip_address,
+        last_seen: last_seen.and_then(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        }),
+        status: parse_edge_status(&status),
+    }
+}
+
 pub struct EdgeRepository<'a> {
     pool: &'a SqlitePool,
 }
@@ -39,14 +64,7 @@ impl<'a> EdgeRepository<'a> {
     }
 
     pub async fn get(&self, id: &str) -> NimonResult<EdgeNode> {
-        let row: (
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            String,
-        ) = sqlx::query_as(
+        let row: EdgeRow = sqlx::query_as(
             "SELECT id, name, hostname, ip_address, last_seen, status FROM edge_nodes WHERE id = ?",
         )
         .bind(id)
@@ -56,44 +74,16 @@ impl<'a> EdgeRepository<'a> {
             sqlx::Error::RowNotFound => NimonError::EdgeNotFound(id.to_string()),
             other => NimonError::Database(other),
         })?;
-
-        Ok(EdgeNode {
-            id: row.0,
-            name: row.1,
-            hostname: row.2,
-            ip_address: row.3,
-            last_seen: row.4.and_then(|s| {
-                DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|d| d.with_timezone(&Utc))
-            }),
-            status: parse_edge_status(&row.5),
-        })
+        Ok(edge_from_row(row))
     }
 
     pub async fn list(&self) -> NimonResult<Vec<EdgeNode>> {
-        let rows: Vec<(String, String, Option<String>, Option<String>, Option<String>, String)> =
-            sqlx::query_as(
-                "SELECT id, name, hostname, ip_address, last_seen, status FROM edge_nodes ORDER BY name"
-            )
-            .fetch_all(self.pool)
-            .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| EdgeNode {
-                id: row.0,
-                name: row.1,
-                hostname: row.2,
-                ip_address: row.3,
-                last_seen: row.4.and_then(|s| {
-                    DateTime::parse_from_rfc3339(&s)
-                        .ok()
-                        .map(|d| d.with_timezone(&Utc))
-                }),
-                status: parse_edge_status(&row.5),
-            })
-            .collect())
+        let rows: Vec<EdgeRow> = sqlx::query_as(
+            "SELECT id, name, hostname, ip_address, last_seen, status FROM edge_nodes ORDER BY name",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows.into_iter().map(edge_from_row).collect())
     }
 
     pub async fn update_status(&self, id: &str, status: EdgeStatus) -> NimonResult<()> {

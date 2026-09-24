@@ -1,20 +1,83 @@
+# NIMon hub - systemd unit
+#
+# Install (see README "Services"):
+#   sudo useradd --system --home-dir /var/lib/nimon --shell /usr/sbin/nologin nimon
+#   sudo install -Dm755 target/release/nimon-hub /opt/nimon/bin/nimon-hub
+#   sudo install -Dm644 config/hub.example.yaml /etc/nimon/hub.yaml
+#   sudo cp systemd/nimon-hub.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nimon-hub
+#
+# Paths: the binary and /etc/nimon are read-only to the service; state lives
+# in /var/lib/nimon (created by StateDirectory=, owned by nimon). The working
+# directory is /var/lib/nimon, so the default database_path "data/nimon.db"
+# resolves to /var/lib/nimon/data/nimon.db. An absolute database_path must
+# be under /var/lib/nimon (or be added to ReadWritePaths=).
+
 [Unit]
 Description=NIMon Hub Server - NI Hardware Monitoring Platform
+Documentation=https://github.com/zeshanabdullah10/nimon
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+User=nimon
+Group=nimon
+ExecStart=/opt/nimon/bin/nimon-hub /etc/nimon/hub.yaml
+WorkingDirectory=/var/lib/nimon
+StateDirectory=nimon
+StateDirectoryMode=0750
 Restart=on-failure
 RestartSec=5
+# The hub shuts down gracefully on SIGTERM (flushes buffered metrics and
+# queued database writes)
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
 Environment=RUST_LOG=info
-Environment=NIMON_SMTP_PASSWORD_FILE=/opt/nimon/config/smtp-password
-WorkingDirectory=/opt/nimon
-ExecStart=/opt/nimon/nimon-hub /opt/nimon/config/hub.yaml
-# SMTP credentials come from the environment (NIMON_SMTP_USER /
-# NIMON_SMTP_PASSWORD) rather than the world-readable unit file.
-#Environment=NIMON_SMTP_USER=nimon@example.com
-#Environment=NIMON_SMTP_PASSWORD=secret
+
+# Secrets: keep them out of this (world-readable) unit file. Put
+#   NIMON_API_TOKEN=...      (write API bearer token)
+#   NIMON_EDGE_TOKEN=...     (edge WebSocket token)
+#   NIMON_SMTP_USER=...
+# in /etc/nimon/hub.env (root:root, mode 0600). The "-" makes it optional.
+EnvironmentFile=-/etc/nimon/hub.env
+
+# SMTP password from a root-only file (mode 0600): systemd copies it into a
+# private credentials directory readable by the service, and the hub reads
+# the file named by NIMON_SMTP_PASSWORD_FILE (first line). Uncomment both
+# lines once /etc/nimon/smtp-password exists (the unit fails to start while
+# the source file is missing). Requires systemd >= 248; on older systems set
+# NIMON_SMTP_PASSWORD in hub.env instead.
+#LoadCredential=smtp-password:/etc/nimon/smtp-password
+#Environment=NIMON_SMTP_PASSWORD_FILE=%d/smtp-password
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nimon
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+# Rule actions of type `script` / `restart_service` run on the hub host as
+# the nimon user within this sandbox; loosen the settings above (and grant
+# the needed permissions) only if you use them.
 
 [Install]
 WantedBy=multi-user.target

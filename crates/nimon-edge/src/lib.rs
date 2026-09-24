@@ -4,11 +4,11 @@
 //! communicates with the central hub.
 //!
 //! # Features
-//! - Device discovery via NI-SysCfg
-//! - Health monitoring and polling
-//! - Local prediction engine
-//! - Data buffering for offline operation
-//! - WebSocket communication with hub
+//! - Device discovery + health via one shared NI-SysCfg sweep
+//! - Optional NI-VISA resource discovery
+//! - Local prediction engine (per device)
+//! - In-memory buffering while the hub is unreachable
+//! - WebSocket (`ws://` / `wss://`, bearer token) communication with the hub
 //!
 //! # Example
 //! ```no_run
@@ -16,128 +16,130 @@
 //!
 //! let config = EdgeConfig::from_file("config/edge.yaml").unwrap();
 //! println!("Edge node: {} ({})", config.node.name, config.node.id);
+//! // run until Ctrl-C:
+//! actix_rt::System::new().block_on(nimon_edge::start_with_shutdown(config, async {
+//!     let _ = tokio::signal::ctrl_c().await;
+//! }));
 //! ```
 
 pub mod action;
 pub mod actor;
 pub mod comm;
 pub mod config;
+pub mod devices;
+pub mod logging;
 pub mod prediction;
 
 pub use config::EdgeConfig;
 
-/// Start the edge node (devices, prediction, hub connector) and run forever.
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
+use actix::prelude::*;
+use tracing::info;
+
+use crate::action::ActionRuntime;
+use crate::actor::{
+    AttachDeviceManager, DeviceManagerActor, DeviceManagerSettings, Disconnect, HubConnectorActor,
+    HubConnectorConfig, StopDeviceManager,
+};
+use crate::comm::WsClientConfig;
+use crate::devices::DeviceRegistry;
+
+/// Start the edge node and run forever (no signal handling).
 ///
-/// This is the library entry point used by the `nimon-edge` binary and by
-/// embedding applications (e.g. `nimon-widget`). Must run inside an actix
+/// Kept for embedders that run the edge on a dedicated thread for the
+/// process lifetime (e.g. `nimon-widget`). Must run inside an actix
 /// system (e.g. `actix_rt::System::new().block_on(start(cfg))`).
 pub async fn start(config: EdgeConfig) {
-    use actix::prelude::*;
-    use std::sync::Arc;
-    use std::time::Duration;
+    start_with_shutdown(config, std::future::pending::<()>()).await
+}
 
-    use crate::action::ActionRuntime;
-    use crate::actor::{
-        ConnectionStateChanged, DeviceManagerActor, HubConnectorActor, HubConnectorConfig,
-    };
-    use crate::comm::{Connect, WsClient, WsClientConfig, WsClientEvent};
-    use tracing::{error, info, warn};
-
+/// Start the edge node and run until `shutdown` completes, then shut down
+/// gracefully: stop the sweep timer, close the hub connection with a
+/// close frame (bounded wait) and return.
+///
+/// Must run inside an actix system. Typical shutdown futures:
+/// `async { let _ = tokio::signal::ctrl_c().await; }` or a
+/// `tokio::sync::oneshot::Receiver` (`async { let _ = rx.await; }`).
+pub async fn start_with_shutdown<F>(config: EdgeConfig, shutdown: F)
+where
+    F: Future<Output = ()>,
+{
+    let (hub, manager) = spawn_actors(&config);
     info!(
-        "Starting NIMon edge node {} ({})",
-        config.node.name, config.node.id
+        "Edge node {} running - sweep every {}s, hub at {}",
+        config.node.id,
+        config.api.syscfg.poll_interval_secs,
+        config.node.hub_url()
     );
 
-    let hub_url = format!("ws://{}/ws", config.node.hub_address);
+    shutdown.await;
 
-    // WebSocket transport
-    let ws_config = WsClientConfig {
-        hub_url: hub_url.clone(),
-        edge_id: config.node.id.clone(),
-        auto_reconnect: true,
-        max_reconnect_attempts: 0,
-        reconnect_delay: Duration::from_secs(config.node.reconnect_interval_secs),
-        ping_interval: Duration::from_secs(30),
-        buffer_size: 1000,
+    info!("Shutting down edge node {}", config.node.id);
+    let _ = manager.send(StopDeviceManager).await;
+    let _ = hub.send(Disconnect).await;
+    info!("Edge node stopped");
+}
+
+/// Build all actors from the config (must be inside an actix system).
+/// Returns the hub connector and the device manager.
+pub fn spawn_actors(config: &EdgeConfig) -> (Addr<HubConnectorActor>, Addr<DeviceManagerActor>) {
+    info!(
+        "Starting NIMon edge node {} ({}) v{}",
+        config.node.name,
+        config.node.id,
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let registry = DeviceRegistry::new();
+    let action_runtime = Arc::new(ActionRuntime::new(
+        &config.action,
+        config.api.daqmx.enabled,
+        config.node.id.clone(),
+        registry.clone(),
+    ));
+
+    let node = &config.node;
+    let ws = WsClientConfig {
+        hub_url: node.hub_url(),
+        auth_token: node.resolved_hub_token(),
+        reconnect_delay: Duration::from_secs(node.reconnect_interval_secs.max(1)),
+        max_reconnect_delay: Duration::from_secs(
+            node.max_reconnect_interval_secs
+                .max(node.reconnect_interval_secs.max(1)),
+        ),
+        ping_interval: Duration::from_secs(node.ping_interval_secs),
+        ..WsClientConfig::default()
     };
-    let mut ws_client = WsClient::new(ws_config);
-    let events = ws_client.subscribe();
-    let ws_addr = ws_client.start();
-
-    // Hub connector: registration, heartbeat, message buffering
     let hostname = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok();
     let hub_config = HubConnectorConfig {
-        hub_url,
-        edge_id: config.node.id.clone(),
-        edge_name: config.node.name.clone(),
+        edge_id: node.id.clone(),
+        edge_name: node.name.clone(),
         hostname,
         ip_address: None,
-        heartbeat_interval: Duration::from_secs(30),
-        auto_connect: false,
-        action_runtime: Arc::new(ActionRuntime {
-            allowed_scripts: config.action.allowed_scripts.clone(),
-            scripts_dir: std::path::PathBuf::from(&config.action.scripts_dir),
-            timeout_secs: config.action.timeout_secs,
-        }),
+        heartbeat_interval: Duration::from_secs(node.heartbeat_interval_secs.max(1)),
+        auto_connect: true,
+        action_runtime,
+        ws,
+        buffer_enabled: config.buffer.enabled,
+        buffer_max_messages: config.buffer.max_messages,
+        buffer_max_bytes: (config.buffer.max_size_mb.max(1) as usize).saturating_mul(1024 * 1024),
+        config_path: config.source_path.clone(),
     };
-    let hub_addr = HubConnectorActor::new(hub_config, ws_addr.clone()).start();
+    let hub = HubConnectorActor::new(hub_config).start();
 
-    // Bridge WebSocket client events into the hub connector so it
-    // registers on connect and re-registers after every reconnect
-    let bridge_hub = hub_addr.clone();
-    tokio::spawn(async move {
-        let mut events = events;
-        while let Some(event) = events.recv().await {
-            match event {
-                WsClientEvent::Connected => {
-                    let _ = bridge_hub
-                        .send(ConnectionStateChanged {
-                            new_state: crate::comm::ConnectionState::Connected,
-                        })
-                        .await;
-                }
-                WsClientEvent::Disconnected => {
-                    let _ = bridge_hub
-                        .send(ConnectionStateChanged {
-                            new_state: crate::comm::ConnectionState::Disconnected,
-                        })
-                        .await;
-                }
-                WsClientEvent::MessageReceived(msg) => {
-                    bridge_hub.do_send(crate::actor::MessageReceived { message: msg });
-                }
-                WsClientEvent::Error(e) => warn!("WebSocket error: {}", e),
-            }
-        }
+    let manager = DeviceManagerActor::new(node.id.clone())
+        .with_settings(DeviceManagerSettings::from_config(config))
+        .with_registry(registry)
+        .with_hub_connector(hub.clone())
+        .start();
+
+    hub.do_send(AttachDeviceManager {
+        manager: manager.clone(),
     });
-
-    // Device discovery + polling. Auto-discovers real NI devices via
-    // NI-SysCfg (falls back to simulated devices when unavailable).
-    let manager = DeviceManagerActor::new(config.node.id.clone())
-        .with_poll_interval(config.api.syscfg.poll_interval_secs)
-        .with_hub_connector(hub_addr.clone())
-        .with_count_subscriber(hub_addr.clone().recipient());
-    let manager_addr = manager.start();
-
-    // Hub pushes config updates down through the connector
-    hub_addr
-        .send(crate::actor::AttachDeviceManager {
-            manager: manager_addr.clone(),
-        })
-        .await
-        .ok();
-
-    info!(
-        "Edge node running - polling every {}s, hub at {}",
-        config.api.syscfg.poll_interval_secs, config.node.hub_address
-    );
-
-    // Initial connect attempt (errors are surfaced; WsClient auto-reconnects)
-    if let Err(e) = ws_addr.send(Connect).await {
-        error!("Initial hub connection failed: {}", e);
-    }
-
-    futures::future::pending::<()>().await;
+    (hub, manager)
 }

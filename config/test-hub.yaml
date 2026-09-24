@@ -1,1 +1,7 @@
+# Minimal development hub config: nimon-hub config/test-hub.yaml
+# Built-in alert rules, console notifications, no auth.
+# See hub.example.yaml for every key. nimon-widget also loads this file for
+# its embedded hub (it forces host 127.0.0.1 and its own --port).
+host: "127.0.0.1"
 port: 9090
+database_path: "data/nimon.db"

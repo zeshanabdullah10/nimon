@@ -8,12 +8,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::actor::messages::{
-    ActionResult, ConfigUpdate, DeviceAlert, DeviceStatusUpdate, EdgeHeartbeat, EdgeRegister,
-    ExecuteAction, PredictionResult,
+    ActionResult, ConfigUpdate, DeviceAlert, DeviceRemoved, DeviceStatusUpdate, EdgeHeartbeat,
+    EdgeRegister, ExecuteAction, PredictionResult,
 };
 
-/// Protocol version for compatibility
-pub const PROTOCOL_VERSION: &str = "1.0";
+/// Protocol version for compatibility.
+///
+/// 1.1 (additive over 1.0): `reply_to` envelope field, `device_removed`
+/// message type, partial `ThresholdConfig`, optional heartbeat fields.
+pub const PROTOCOL_VERSION: &str = "1.1";
 
 /// WebSocket message wrapper
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +32,10 @@ pub struct WsMessage {
     pub timestamp: DateTime<Utc>,
     /// Unique message ID for tracking
     pub msg_id: String,
+    /// For replies: the `msg_id` of the request this message answers
+    /// (e.g. an `action_result` answering an `execute_action`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 /// Message types that can be sent over WebSocket
@@ -42,6 +49,8 @@ pub enum WsMessageType {
     Prediction,
     Heartbeat,
     ActionResult,
+    /// A device disappeared from discovery (payload: `DeviceRemoved`)
+    DeviceRemoved,
 
     // Hub -> Edge messages
     ConfigUpdate,
@@ -53,6 +62,12 @@ pub enum WsMessageType {
     Error,
     Ping,
     Pong,
+
+    /// Any type this build does not know (sent by a newer peer). Parsing
+    /// succeeds so the receiver can ignore/log it instead of failing.
+    /// Must stay the last variant.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Acknowledgment message
@@ -127,7 +142,20 @@ impl WsMessage {
             payload,
             timestamp: Utc::now(),
             msg_id: ulid::Ulid::new().to_string(),
+            reply_to: None,
         }
+    }
+
+    /// Mark this message as a reply to the request with `msg_id == id`.
+    pub fn with_reply_to(mut self, id: impl Into<String>) -> Self {
+        self.reply_to = Some(id.into());
+        self
+    }
+
+    /// The id to correlate this message with a request: `reply_to` when
+    /// set, otherwise this message's own `msg_id`.
+    pub fn correlation_id(&self) -> &str {
+        self.reply_to.as_deref().unwrap_or(&self.msg_id)
     }
 
     /// True when the sender's protocol version is compatible with ours.
@@ -165,6 +193,11 @@ impl WsMessage {
         Self::new(WsMessageType::ActionResult, to_payload(result))
     }
 
+    /// Create a device removed message (edge -> hub)
+    pub fn device_removed(removed: DeviceRemoved) -> Self {
+        Self::new(WsMessageType::DeviceRemoved, to_payload(removed))
+    }
+
     /// Create a config update message (hub -> edge)
     pub fn config_update(update: ConfigUpdate) -> Self {
         Self::new(WsMessageType::ConfigUpdate, to_payload(update))
@@ -180,8 +213,10 @@ impl WsMessage {
         Self::new(WsMessageType::HubCommand, to_payload(command))
     }
 
-    /// Create an acknowledgment message
+    /// Create an acknowledgment message (also sets `reply_to` to
+    /// `original_msg_id`)
     pub fn ack(original_msg_id: String, success: bool, error: Option<String>) -> Self {
+        let reply_to = original_msg_id.clone();
         Self::new(
             WsMessageType::Ack,
             to_payload(AckMessage {
@@ -190,6 +225,7 @@ impl WsMessage {
                 error,
             }),
         )
+        .with_reply_to(reply_to)
     }
 
     /// Create an error message
@@ -235,9 +271,15 @@ impl WsMessage {
         serde_json::from_str(json)
     }
 
-    /// Extract payload as specific type
+    /// Extract payload as specific type (clones the payload; prefer
+    /// [`WsMessage::into_payload`] when the message is no longer needed)
     pub fn payload<T: for<'de> Deserialize<'de>>(&self) -> Result<T, serde_json::Error> {
-        serde_json::from_value(self.payload.clone())
+        T::deserialize(&self.payload)
+    }
+
+    /// Consume the message and extract its payload without cloning
+    pub fn into_payload<T: for<'de> Deserialize<'de>>(self) -> Result<T, serde_json::Error> {
+        serde_json::from_value(self.payload)
     }
 }
 
@@ -311,16 +353,97 @@ mod tests {
     fn test_config_update_message_roundtrip() {
         let update = ConfigUpdate {
             poll_interval_secs: Some(30),
-            thresholds: crate::actor::messages::ThresholdConfig {
-                temperature_warning: 70.0,
-                temperature_critical: 80.0,
-            },
+            thresholds: crate::actor::messages::ThresholdConfig::full(70.0, 80.0),
         };
         let msg = WsMessage::config_update(update);
         let parsed = WsMessage::from_json(&msg.to_json().unwrap()).unwrap();
         let payload: ConfigUpdate = parsed.payload().unwrap();
         assert_eq!(payload.poll_interval_secs, Some(30));
-        assert_eq!(payload.thresholds.temperature_warning, 70.0);
+        assert_eq!(payload.thresholds.temperature_warning, Some(70.0));
+    }
+
+    #[test]
+    fn test_reply_to_correlation() {
+        let request = WsMessage::execute_action(ExecuteAction {
+            action_id: "a".to_string(),
+            device_id: "d".to_string(),
+            action_type: ActionType::ResetDriver,
+            parameters: HashMap::new(),
+        });
+        assert_eq!(request.reply_to, None);
+        assert_eq!(request.correlation_id(), request.msg_id);
+        // reply_to is omitted from the wire when unset
+        assert!(!request.to_json().unwrap().contains("reply_to"));
+
+        let reply = WsMessage::action_result(ActionResult {
+            action_id: "a".to_string(),
+            success: true,
+            output: None,
+            error: None,
+            exit_code: None,
+            duration_ms: 1,
+        })
+        .with_reply_to(request.msg_id.clone());
+        assert_ne!(reply.msg_id, request.msg_id);
+        let parsed = WsMessage::from_json(&reply.to_json().unwrap()).unwrap();
+        assert_eq!(parsed.reply_to.as_deref(), Some(request.msg_id.as_str()));
+        assert_eq!(parsed.correlation_id(), request.msg_id);
+
+        // Acks carry reply_to too
+        let ack = WsMessage::ack("orig".to_string(), true, None);
+        assert_eq!(ack.correlation_id(), "orig");
+    }
+
+    #[test]
+    fn test_v1_0_message_without_reply_to_parses() {
+        let json = r#"{"version":"1.0","type":"ping","payload":null,
+            "timestamp":"2024-01-01T00:00:00Z","msg_id":"01ABC"}"#;
+        let msg = WsMessage::from_json(json).unwrap();
+        assert_eq!(msg.reply_to, None);
+        assert_eq!(msg.correlation_id(), "01ABC");
+        assert!(msg.version_compatible());
+    }
+
+    #[test]
+    fn test_unknown_message_type_parses() {
+        let json = r#"{"version":"1.7","type":"some_future_type","payload":{"x":1},
+            "timestamp":"2024-01-01T00:00:00Z","msg_id":"01ABC"}"#;
+        let msg = WsMessage::from_json(json).unwrap();
+        assert_eq!(msg.msg_type, WsMessageType::Unknown);
+        assert!(msg.version_compatible());
+        // Known types are unaffected
+        assert_eq!(
+            serde_json::from_str::<WsMessageType>("\"device_status\"").unwrap(),
+            WsMessageType::DeviceStatus
+        );
+    }
+
+    #[test]
+    fn test_device_removed_message_roundtrip() {
+        let ts = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let msg = WsMessage::device_removed(DeviceRemoved {
+            edge_id: "e".to_string(),
+            device_id: "e:Dev1".to_string(),
+            timestamp: ts,
+        });
+        let json = msg.to_json().unwrap();
+        assert!(json.contains("\"type\":\"device_removed\""));
+        let parsed = WsMessage::from_json(&json).unwrap();
+        assert_eq!(parsed.msg_type, WsMessageType::DeviceRemoved);
+        let payload: DeviceRemoved = parsed.into_payload().unwrap();
+        assert_eq!(payload.device_id, "e:Dev1");
+        assert_eq!(payload.timestamp, ts);
+    }
+
+    #[test]
+    fn test_into_payload_matches_payload() {
+        let msg = WsMessage::hub_command(HubCommand {
+            command: "reload_config".to_string(),
+            parameters: HashMap::new(),
+        });
+        let a: HubCommand = msg.payload().unwrap();
+        let b: HubCommand = msg.into_payload().unwrap();
+        assert_eq!(a.command, b.command);
     }
 
     #[test]
@@ -344,7 +467,18 @@ mod tests {
         let msg = WsMessage::new(WsMessageType::Ping, serde_json::Value::Null);
         let json = msg.to_json().unwrap();
         assert!(json.contains("\"type\":\"ping\""));
-        assert!(json.contains("\"version\":\"1.0\""));
+        assert!(json.contains("\"version\":\"1.1\""));
+        assert!(!json.contains("reply_to"));
+        let json = msg.clone().with_reply_to("req-1").to_json().unwrap();
+        assert!(json.contains("\"reply_to\":\"req-1\""));
+        assert_eq!(
+            serde_json::to_string(&WsMessageType::DeviceRemoved).unwrap(),
+            "\"device_removed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WsMessageType::ActionResult).unwrap(),
+            "\"action_result\""
+        );
 
         let alert = DeviceAlert {
             device_id: "d".to_string(),

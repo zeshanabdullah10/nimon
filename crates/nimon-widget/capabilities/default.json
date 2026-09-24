@@ -1,8 +1,19 @@
 {
     "identifier": "default",
-    "description": "Default capability for the NIMon widget window",
+    "description": "Minimal capability for the NIMon widget window: its own commands plus event listen (lock-changed / geometry-changed). No fs, shell, http or window APIs.",
     "windows": ["main"],
     "permissions": [
-        "core:default"
+        "core:event:allow-listen",
+        "core:event:allow-unlisten",
+        "allow-poll",
+        "allow-alert-action",
+        "allow-update-geometry",
+        "allow-move-by",
+        "allow-set-locked",
+        "allow-get-state",
+        "allow-save-state",
+        "allow-open-dashboard",
+        "allow-quit",
+        "allow-ui-log"
     ]
 }

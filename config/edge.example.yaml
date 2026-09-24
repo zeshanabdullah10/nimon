@@ -1,5 +1,7 @@
 # NIMon Edge Node Configuration Example
-# Copy this file to config/edge.yaml and customize for your environment
+# Copy this file to config/edge.yaml and customize for your environment.
+# Unknown keys are ignored, so older files (api.xnet, buffer.persist_path,
+# api.daqmx.poll_interval_secs) still load.
 
 # Node identification and connection settings
 node:
@@ -9,64 +11,111 @@ node:
   # Human-readable name (required)
   name: "Test Cell 1"
 
-  # Hub server address in host:port format (required)
-  hub_address: "192.168.1.100:8080"
+  # Hub address: host:port, or a full ws:// / wss:// URL (required).
+  # "/ws" is appended when no path is given.
+  hub_address: "192.168.1.100:9090"
 
-  # Seconds between reconnection attempts when hub is unreachable
+  # Use TLS (wss://) even when hub_address has no scheme
+  tls: false
+
+  # Bearer token sent as "Authorization: Bearer <token>" in the WebSocket
+  # handshake. The NIMON_EDGE_TOKEN environment variable overrides it.
+  # hub_token: "change-me"
+
+  # Reconnect backoff: starts here, doubles per failure (with jitter) up
+  # to the maximum; resets after a stable connection
   reconnect_interval_secs: 5
+  max_reconnect_interval_secs: 60
 
-# API-specific settings for device monitoring
+  # Heartbeat to the hub (device count, status, uptime, version)
+  heartbeat_interval_secs: 30
+
+  # WebSocket ping interval; the connection is dropped and re-established
+  # when nothing arrives from the hub for 3 intervals (0 = off)
+  ping_interval_secs: 30
+
+# NI API settings
 api:
-  # NI System Configuration API (device discovery)
+  # NI System Configuration: one shared discovery + health sweep
   syscfg:
     enabled: true
     poll_interval_secs: 10
 
-  # NI-DAQmx (data acquisition devices)
+  # NI-DAQmx: allows hub-requested device resets (PowerCycle / ResetDriver)
   daqmx:
     enabled: true
-    poll_interval_secs: 5
 
-  # NI-VISA (instrument communication)
+  # NI-VISA: list instruments periodically and report them as devices.
+  # Listing does no I/O. probe_idn sends "*IDN?" to every resource, which
+  # WRITES to instruments and serial ports - keep it off on stations where
+  # test software owns the instruments.
   visa:
-    enabled: true
-    poll_interval_secs: 15
+    enabled: false
+    poll_interval_secs: 60
+    probe_idn: false
+    expression: "?*INSTR"
 
-  # NI-XNET (CAN/LIN/FlexRay)
-  xnet:
-    enabled: true
-    poll_interval_secs: 2
+  # Consecutive sweeps a device must be missing before it is reported to
+  # the hub as removed
+  removal_sweeps: 3
 
 # Prediction engine configuration
 prediction:
-  # Enable local prediction engine
   enabled: true
 
-  # Prediction models to use
+  # Models: threshold, ewma_anomaly, trend_prediction
   models:
     - threshold
     - ewma_anomaly
     - trend_prediction
 
-  # Temperature thresholds (Celsius)
+  # Temperature thresholds (Celsius); the hub may override them
   temperature_warning: 65
   temperature_critical: 75
 
-# Data buffering for offline operation
+  # EWMA: minimum standard deviation (C) for anomaly z-scores
+  ewma_min_std: 0.5
+
+  # Trend: re-send a persisting trend prediction at most every N minutes
+  # (sooner when its ETA changes by more than 20%)
+  trend_reemit_minutes: 10
+
+  # Trend: regression window in minutes of history (time based, so the
+  # sensitivity does not depend on poll_interval_secs). No trend is
+  # reported before half a window of history exists.
+  trend_window_minutes: 5
+
+# Hub-requested remediation actions
+action:
+  # Scripts that may be run (CustomScript), located in scripts_dir
+  allowed_scripts: []
+  scripts_dir: "./scripts"
+
+  # OS services that may be restarted (empty = service restarts denied)
+  allowed_services: []
+
+  # Timeout for any single action (seconds)
+  timeout_secs: 120
+
+  # Actions allowed to run at the same time (one per device always)
+  max_concurrent: 1
+
+# In-memory buffering while the hub is unreachable. When full, the oldest
+# device-status messages are dropped first; alerts, predictions and action
+# results are kept.
 buffer:
-  # Enable local buffering when hub is unreachable
   enabled: true
+  max_messages: 1000
+  max_size_mb: 16
 
-  # Maximum buffer size before dropping old data
-  max_size_mb: 100
-
-  # Path to persist buffered data
-  persist_path: "./data/buffer.db"
-
-# Logging configuration
+# Logging (RUST_LOG overrides level)
 logging:
-  # Log level: trace, debug, info, warn, error
+  # Level or filter directive: trace, debug, info, warn, error,
+  # or e.g. "info,nimon_edge=debug"
   level: info
 
-  # Path to log file
+  # Log file, rotated daily (7 files kept); "" = no file
   file: "./logs/nimon-edge.log"
+
+  # Also log to the console
+  stdout: true

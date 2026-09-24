@@ -1,8 +1,8 @@
 //! NI-DAQmx device monitoring
 //!
 //! This module provides safe Rust wrappers around the NI-DAQmx C API for
-//! discovering DAQ devices and querying their health information (temperature,
-//! self-test results, power supply voltages).
+//! discovering DAQ devices, querying their health (reachability, calibration
+//! temperature), resetting them, and running explicit self-tests.
 //!
 //! # Example
 //! ```no_run

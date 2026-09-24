@@ -1,144 +1,118 @@
 //! Raw FFI bindings to NI-VISA API
 //!
-//! This module contains the low-level C FFI definitions for the NI-VISA API.
-//! NI-VISA uses visa64.dll (or visa32.dll as fallback) on Windows.
+//! Verified against visa.h / visatype.h (IVI Foundation VISA, Win64 and
+//! WinNT include directories). `_VI_FUNC` is `__stdcall` on Win32/Win64
+//! and empty on Unix, i.e. Rust's `extern "system"`.
+//! Library: visa64.dll (64-bit) / visa32.dll (32-bit) on Windows,
+//! libvisa.so on Linux.
 
-#![allow(dead_code)]
+use std::os::raw::{c_char, c_void};
 
-use std::os::raw::{c_char, c_int, c_long, c_ulong, c_void};
+/// ViStatus: ViInt32; < 0 error, 0 success, > 0 completion/warning code
+pub type ViStatus = i32;
+/// ViUInt32 (unsigned long on Win32/LLP64, unsigned int on LP64: 32 bits)
+pub type ViUInt32 = u32;
+/// ViObject / ViSession / ViFindList are all ViUInt32 *values*, not pointers
+pub type ViObject = ViUInt32;
+pub type ViSession = ViObject;
+pub type ViFindList = ViObject;
+pub type ViAttr = ViUInt32;
+pub type ViAccessMode = ViUInt32;
+/// ViAttrState: ViUInt64 when `_VISA_ENV_IS_64_BIT` (Win64 / LP64),
+/// otherwise ViUInt32
+#[cfg(target_pointer_width = "64")]
+pub type ViAttrState = u64;
+#[cfg(not(target_pointer_width = "64"))]
+pub type ViAttrState = u32;
 
-// ---------------------------------------------------------------------------
-// Status constants
-// ---------------------------------------------------------------------------
+/// VI_NULL session / object
+pub const VI_NULL: ViObject = 0;
+/// VI_NO_LOCK access mode
+pub const VI_NO_LOCK: ViAccessMode = 0;
+/// VI_FIND_BUFLEN: buffer size for viFindRsrc / viFindNext descriptors
+pub const VI_FIND_BUFLEN: usize = 256;
 
-/// VISA success status code (VI_SUCCESS)
-pub const VI_SUCCESS: c_long = 0;
+/// VI_ERROR_RSRC_NFOUND (0xBFFF0011): no resource matched the expression
+pub const VI_ERROR_RSRC_NFOUND: ViStatus = 0xBFFF0011u32 as ViStatus;
+/// VI_ERROR_TMO (0xBFFF0015): timeout expired before operation completed
+pub const VI_ERROR_TMO: ViStatus = 0xBFFF0015u32 as ViStatus;
 
-/// Null end-of-termination indicator for viFindRsrc / viFindNext
-pub const VI_NULL: *const c_char = std::ptr::null();
-
-/// Maximum error message length
-pub const VI_ERROR_DESCR_BUF_SIZE: usize = 256;
-
-// ---------------------------------------------------------------------------
-// Attribute IDs
-// ---------------------------------------------------------------------------
-
+/// Attribute IDs (ViAttr)
 pub mod attributes {
-    use std::os::raw::c_int;
+    use super::ViAttr;
 
-    /// Resource name attribute (ViAttr)
-    pub const VI_ATTR_RSRC_NAME: c_int = 0xBFFFFFF1u32 as c_int;
-    /// Timeout value in milliseconds
-    pub const VI_ATTR_TMO_VALUE: c_int = 0x3FFF001A;
-    /// Interface type (TCPIP, GPIB, ASRL, etc.)
-    pub const VI_ATTR_INTF_TYPE: c_int = 0xBFFF0017u32 as c_int;
+    /// I/O timeout in milliseconds (ViUInt32, read/write)
+    pub const VI_ATTR_TMO_VALUE: ViAttr = 0x3FFF001A;
+    /// Interface type (ViUInt16, read-only)
+    pub const VI_ATTR_INTF_TYPE: ViAttr = 0x3FFF0171;
 }
 
-// ---------------------------------------------------------------------------
-// Interface type constants (returned by VI_ATTR_INTF_TYPE)
-// ---------------------------------------------------------------------------
-
+/// Interface type values returned by VI_ATTR_INTF_TYPE
 pub mod intf {
-    use std::os::raw::c_int;
-
-    /// Unknown / no interface
-    pub const VI_INTF_UNKNOWN: c_int = 0;
-    /// GPIB interface
-    pub const VI_INTF_GPIB: c_int = 1;
-    /// VXI interface
-    pub const VI_INTF_VXI: c_int = 2;
-    /// GPIB-VXI interface
-    pub const VI_INTF_GPIB_VXI: c_int = 3;
-    /// Serial (ASRL) interface
-    pub const VI_INTF_ASRL: c_int = 4;
-    /// PXI interface
-    pub const VI_INTF_PXI: c_int = 5;
-    /// TCPIP (LAN) interface
-    pub const VI_INTF_TCPIP: c_int = 6;
-    /// USB interface
-    pub const VI_INTF_USB: c_int = 7;
+    pub const VI_INTF_GPIB: u16 = 1;
+    pub const VI_INTF_VXI: u16 = 2;
+    pub const VI_INTF_GPIB_VXI: u16 = 3;
+    pub const VI_INTF_ASRL: u16 = 4;
+    pub const VI_INTF_PXI: u16 = 5;
+    pub const VI_INTF_TCPIP: u16 = 6;
+    pub const VI_INTF_USB: u16 = 7;
+    pub const VI_INTF_RIO: u16 = 8;
+    pub const VI_INTF_FIREWIRE: u16 = 9;
 }
 
-// ---------------------------------------------------------------------------
-// Opaque handles
-// ---------------------------------------------------------------------------
+/// ViStatus viOpenDefaultRM(ViPSession vi);
+pub type ViOpenDefaultRM = unsafe extern "system" fn(vi: *mut ViSession) -> ViStatus;
 
-/// Opaque handle to a VISA session (resource manager or instrument)
-#[repr(C)]
-pub struct ViSession {
-    _private: [u8; 0],
-}
+/// ViStatus viClose(ViObject vi);
+pub type ViClose = unsafe extern "system" fn(vi: ViObject) -> ViStatus;
 
-/// Opaque handle to a VISA object (used for find lists)
-#[repr(C)]
-pub struct ViObject {
-    _private: [u8; 0],
-}
-
-// ---------------------------------------------------------------------------
-// Function pointer types
-// ---------------------------------------------------------------------------
-
-/// Function signature for viOpenDefaultRM
-///
-/// Opens a session to the default resource manager.
-pub type ViOpenDefaultRM = unsafe extern "C" fn(sesn: *mut *mut ViSession) -> c_long;
-
-/// Function signature for viClose
-///
-/// Closes the specified session, object, or find list.
-pub type ViClose = unsafe extern "C" fn(vi: *mut ViSession) -> c_long;
-
-/// Function signature for viFindRsrc
-///
-/// Queries the system for VISA resources matching the expression.
-pub type ViFindRsrc = unsafe extern "C" fn(
-    sesn: *mut ViSession,
+/// ViStatus viFindRsrc(ViSession sesn, ViConstString expr, ViPFindList vi,
+///                     ViPUInt32 retCnt, ViChar desc[]);
+pub type ViFindRsrc = unsafe extern "system" fn(
+    sesn: ViSession,
     expr: *const c_char,
-    find_list: *mut *mut ViObject,
-    retcnt: *mut c_ulong,
+    find_list: *mut ViFindList,
+    ret_cnt: *mut ViUInt32,
     desc: *mut c_char,
-) -> c_long;
+) -> ViStatus;
 
-/// Function signature for viFindNext
-///
-/// Returns the next resource in the find list.
-pub type ViFindNext = unsafe extern "C" fn(find_list: *mut ViObject, desc: *mut c_char) -> c_long;
+/// ViStatus viFindNext(ViFindList vi, ViChar desc[]);
+pub type ViFindNext =
+    unsafe extern "system" fn(find_list: ViFindList, desc: *mut c_char) -> ViStatus;
 
-/// Function signature for viOpen
+/// ViStatus viOpen(ViSession sesn, ViConstRsrc name, ViAccessMode mode,
+///                 ViUInt32 timeout, ViPSession vi);
 ///
-/// Opens a session to the specified resource.
-pub type ViOpen = unsafe extern "C" fn(
-    sesn: *mut ViSession,
-    rsrc_name: *const c_char,
-    access_mode: c_ulong,
-    timeout: c_ulong,
-    vi: *mut *mut ViSession,
-) -> c_long;
-
-/// Function signature for viWrite
-///
-/// Writes data to the specified resource synchronously.
-pub type ViWrite = unsafe extern "C" fn(
+/// `timeout` is the *lock* wait time (only meaningful when a lock is
+/// requested), not the I/O timeout.
+pub type ViOpen = unsafe extern "system" fn(
+    sesn: ViSession,
+    name: *const c_char,
+    mode: ViAccessMode,
+    timeout: ViUInt32,
     vi: *mut ViSession,
+) -> ViStatus;
+
+/// ViStatus viWrite(ViSession vi, ViConstBuf buf, ViUInt32 cnt, ViPUInt32 retCnt);
+pub type ViWrite = unsafe extern "system" fn(
+    vi: ViSession,
     buf: *const u8,
-    count: c_ulong,
-    ret_count: *mut c_ulong,
-) -> c_long;
+    cnt: ViUInt32,
+    ret_cnt: *mut ViUInt32,
+) -> ViStatus;
 
-/// Function signature for viRead
-///
-/// Reads data from the specified resource synchronously.
-pub type ViRead = unsafe extern "C" fn(
-    vi: *mut ViSession,
+/// ViStatus viRead(ViSession vi, ViPBuf buf, ViUInt32 cnt, ViPUInt32 retCnt);
+pub type ViRead = unsafe extern "system" fn(
+    vi: ViSession,
     buf: *mut u8,
-    count: c_ulong,
-    ret_count: *mut c_ulong,
-) -> c_long;
+    cnt: ViUInt32,
+    ret_cnt: *mut ViUInt32,
+) -> ViStatus;
 
-/// Function signature for viGetAttribute
-///
-/// Retrieves the value of an attribute for the specified session or object.
+/// ViStatus viGetAttribute(ViObject vi, ViAttr attrName, void *attrValue);
 pub type ViGetAttribute =
-    unsafe extern "C" fn(vi: *mut ViSession, attr: c_int, attr_state: *mut c_void) -> c_long;
+    unsafe extern "system" fn(vi: ViObject, attr: ViAttr, value: *mut c_void) -> ViStatus;
+
+/// ViStatus viSetAttribute(ViObject vi, ViAttr attrName, ViAttrState attrValue);
+pub type ViSetAttribute =
+    unsafe extern "system" fn(vi: ViObject, attr: ViAttr, value: ViAttrState) -> ViStatus;

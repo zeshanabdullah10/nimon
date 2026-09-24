@@ -10,7 +10,61 @@ use lettre::transport::smtp::client::TlsParameters;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use actix::fut::wrap_future;
-use nimon_core::alert::{Alert, ChannelType, NotificationChannel, Severity};
+use nimon_core::alert::{Alert, AlertStatus, ChannelType, NotificationChannel, Severity};
+
+/// SMTP transport security.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmtpTlsMode {
+    /// TLS from the first byte (SMTPS, port 465)
+    Implicit,
+    /// STARTTLS, required (port 587)
+    StartTls,
+    /// STARTTLS when offered, plaintext otherwise (port 25)
+    Opportunistic,
+    /// No TLS
+    None,
+}
+
+/// TLS mode from the configured value, or by port when unset
+/// (465 implicit, 25 opportunistic, anything else STARTTLS).
+pub fn smtp_tls_mode(port: u16, configured: Option<&str>) -> Result<SmtpTlsMode, String> {
+    match configured.map(|s| s.trim().to_ascii_lowercase()) {
+        None => Ok(match port {
+            465 => SmtpTlsMode::Implicit,
+            25 => SmtpTlsMode::Opportunistic,
+            _ => SmtpTlsMode::StartTls,
+        }),
+        Some(s) => match s.as_str() {
+            "" => smtp_tls_mode(port, None),
+            "implicit" | "wrapper" | "smtps" | "tls" => Ok(SmtpTlsMode::Implicit),
+            "starttls" | "required" => Ok(SmtpTlsMode::StartTls),
+            "opportunistic" => Ok(SmtpTlsMode::Opportunistic),
+            "none" | "plain" | "plaintext" => Ok(SmtpTlsMode::None),
+            other => Err(format!("unknown smtp_tls mode '{}'", other)),
+        },
+    }
+}
+
+/// Mode actually used: with credentials and without
+/// `allow_plaintext_auth`, opportunistic TLS is upgraded to required
+/// STARTTLS and `None` is refused, so credentials never travel in clear.
+pub fn effective_tls_mode(
+    mode: SmtpTlsMode,
+    has_credentials: bool,
+    allow_plaintext_auth: bool,
+) -> Result<SmtpTlsMode, String> {
+    if !has_credentials || allow_plaintext_auth {
+        return Ok(mode);
+    }
+    match mode {
+        SmtpTlsMode::Opportunistic => Ok(SmtpTlsMode::StartTls),
+        SmtpTlsMode::None => Err(
+            "refusing to send SMTP credentials without TLS (set smtp_allow_plaintext_auth: true to override)"
+                .to_string(),
+        ),
+        other => Ok(other),
+    }
+}
 
 /// Alert notifier actor
 pub struct AlertNotifier {
@@ -22,7 +76,10 @@ impl AlertNotifier {
     pub fn new(channels: Vec<NotificationChannel>) -> Self {
         Self {
             channels,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -51,10 +108,6 @@ impl AlertNotifier {
         }
 
         for channel in channels {
-            if !channel.enabled {
-                continue;
-            }
-
             match &channel.channel_type {
                 ChannelType::Console => log_console(alert),
                 ChannelType::Email {
@@ -64,36 +117,32 @@ impl AlertNotifier {
                     from_addr,
                     to_addrs,
                 } => {
-                    let skip_tls_verify = channel
-                        .config
+                    let cfg = &channel.config;
+                    let skip_tls_verify = cfg
                         .get("smtp_skip_tls_verify")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    let password = channel
-                        .config
+                    let allow_plaintext = cfg
+                        .get("smtp_allow_plaintext_auth")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let tls = cfg.get("smtp_tls").and_then(|v| v.as_str());
+                    let password = cfg
                         .get("smtp_password")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
-                    let username = username.clone().or_else(|| {
-                        channel
-                            .config
-                            .get("smtp_username_env")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    });
-                    if let Err(e) = self
-                        .send_email(
-                            smtp_server,
-                            *smtp_port,
-                            username.as_deref(),
-                            password.as_deref(),
-                            from_addr,
-                            to_addrs,
-                            skip_tls_verify,
-                            alert,
-                        )
-                        .await
-                    {
+                    let email = EmailTarget {
+                        server: smtp_server,
+                        port: *smtp_port,
+                        username: username.as_deref(),
+                        password: password.as_deref(),
+                        from_addr,
+                        to_addrs,
+                        tls,
+                        skip_tls_verify,
+                        allow_plaintext,
+                    };
+                    if let Err(e) = self.send_email(&email, alert).await {
                         error!("Email notification failed for {}: {}", channel.id, e);
                     }
                 }
@@ -128,9 +177,11 @@ impl AlertNotifier {
             "edge_id": alert.edge_id,
             "device_id": alert.device_id,
             "severity": alert.severity.to_string(),
-            "title": alert.title,
+            "status": alert.status.to_string(),
+            "title": display_title(alert),
             "message": alert.message,
             "triggered_at": alert.triggered_at.to_rfc3339(),
+            "resolved_at": alert.resolved_at.map(|t| t.to_rfc3339()),
         });
 
         let mut request = self.http.post(url).json(&payload);
@@ -152,20 +203,25 @@ impl AlertNotifier {
         webhook_url: &str,
         alert: &Alert,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let color = match alert.severity {
-            Severity::Info => "#36a64f",
-            Severity::Warning => "warning",
-            Severity::Critical => "danger",
+        let color = if alert.status == AlertStatus::Resolved {
+            "good"
+        } else {
+            match alert.severity {
+                Severity::Info => "#36a64f",
+                Severity::Warning => "warning",
+                Severity::Critical => "danger",
+            }
         };
 
         let payload = serde_json::json!({
             "attachments": [{
                 "color": color,
-                "title": alert.title,
+                "title": display_title(alert),
                 "text": alert.message,
                 "fields": [
                     {"title": "Device", "value": alert.device_id, "short": true},
                     {"title": "Severity", "value": alert.severity.to_string(), "short": true},
+                    {"title": "Status", "value": alert.status.to_string(), "short": true},
                     {"title": "Time", "value": alert.triggered_at.to_rfc3339(), "short": true},
                 ]
             }]
@@ -184,22 +240,28 @@ impl AlertNotifier {
         webhook_url: &str,
         alert: &Alert,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let color = match alert.severity {
-            Severity::Info => "008000",
-            Severity::Warning => "ff8c00",
-            Severity::Critical => "ff0000",
+        let color = if alert.status == AlertStatus::Resolved {
+            "2eb886"
+        } else {
+            match alert.severity {
+                Severity::Info => "008000",
+                Severity::Warning => "ff8c00",
+                Severity::Critical => "ff0000",
+            }
         };
 
         let payload = serde_json::json!({
             "@type": "MessageCard",
             "@context": "https://schema.org/extensions",
-            "summary": alert.title,
+            "summary": display_title(alert),
             "themeColor": color,
             "sections": [{
-                "activityTitle": alert.message,
+                "activityTitle": display_title(alert),
+                "text": alert.message,
                 "facts": [
                     {"name": "Device", "value": alert.device_id},
                     {"name": "Severity", "value": alert.severity.to_string()},
+                    {"name": "Status", "value": alert.status.to_string()},
                     {"name": "Time", "value": alert.triggered_at.to_rfc3339()},
                 ]
             }]
@@ -213,44 +275,59 @@ impl AlertNotifier {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn send_email(
         &self,
-        smtp_server: &str,
-        smtp_port: u16,
-        username: Option<&str>,
-        password: Option<&str>,
-        from_addr: &str,
-        to_addrs: &[String],
-        skip_tls_verify: bool,
+        target: &EmailTarget<'_>,
         alert: &Alert,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let to_list = to_addrs
+        let to_list = target
+            .to_addrs
             .iter()
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+        let subject = if alert.status == AlertStatus::Resolved {
+            format!("[RESOLVED][{}] {}", alert.severity, alert.title)
+        } else {
+            format!("[{}] {}", alert.severity, alert.title)
+        };
         let email = Message::builder()
-            .from(from_addr.parse()?)
+            .from(target.from_addr.parse()?)
             .to(to_list.parse()?)
-            .subject(format!("[{}] {}", alert.severity, alert.title))
+            .subject(subject)
             .header(ContentType::TEXT_PLAIN)
             .body(alert.message.clone())?;
 
-        let mut builder =
-            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(smtp_server).port(smtp_port);
+        let credentials = match (target.username, target.password) {
+            (Some(user), Some(pass)) => Some(Credentials::new(user.to_string(), pass.to_string())),
+            _ => None,
+        };
+        let mode = effective_tls_mode(
+            smtp_tls_mode(target.port, target.tls)?,
+            credentials.is_some(),
+            target.allow_plaintext,
+        )?;
 
-        // TLS when the port suggests it; verification can be skipped via config
-        if smtp_port != 25 && smtp_port != 465 {
-            let mut tls = TlsParameters::builder(smtp_server.to_string());
-            if skip_tls_verify {
+        let tls_params = || {
+            let mut tls = TlsParameters::builder(target.server.to_string());
+            if target.skip_tls_verify {
                 tls = tls.dangerous_accept_invalid_certs(true);
             }
-            builder = builder.tls(Tls::Required(tls.build()?));
-        }
+            tls.build()
+        };
+        let tls = match mode {
+            SmtpTlsMode::Implicit => Tls::Wrapper(tls_params()?),
+            SmtpTlsMode::StartTls => Tls::Required(tls_params()?),
+            SmtpTlsMode::Opportunistic => Tls::Opportunistic(tls_params()?),
+            SmtpTlsMode::None => Tls::None,
+        };
 
-        if let (Some(user), Some(pass)) = (username, password) {
-            builder = builder.credentials(Credentials::new(user.to_string(), pass.to_string()));
+        let mut builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(target.server)
+            .port(target.port)
+            .tls(tls)
+            .timeout(Some(std::time::Duration::from_secs(30)));
+        if let Some(credentials) = credentials {
+            builder = builder.credentials(credentials);
         }
 
         builder.build().send(email).await?;
@@ -258,7 +335,36 @@ impl AlertNotifier {
     }
 }
 
+/// Everything needed to deliver one email.
+struct EmailTarget<'a> {
+    server: &'a str,
+    port: u16,
+    username: Option<&'a str>,
+    password: Option<&'a str>,
+    from_addr: &'a str,
+    to_addrs: &'a [String],
+    tls: Option<&'a str>,
+    skip_tls_verify: bool,
+    allow_plaintext: bool,
+}
+
+/// Title with a `[RESOLVED]` prefix for resolution notifications.
+fn display_title(alert: &Alert) -> String {
+    if alert.status == AlertStatus::Resolved {
+        format!("[RESOLVED] {}", alert.title)
+    } else {
+        alert.title.clone()
+    }
+}
+
 fn log_console(alert: &Alert) {
+    if alert.status == AlertStatus::Resolved {
+        info!(
+            "[ALERT resolved] {} - {}: {}",
+            alert.device_id, alert.title, alert.message
+        );
+        return;
+    }
     match alert.severity {
         Severity::Critical => error!(
             "[ALERT critical] {} - {}: {}",
@@ -286,7 +392,8 @@ impl Actor for AlertNotifier {
     }
 }
 
-/// Message to send a notification
+/// Message to send a notification. An alert with status `Resolved` is
+/// sent as a resolution notice.
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct SendNotification {
@@ -296,16 +403,15 @@ pub struct SendNotification {
 }
 
 impl Handler<SendNotification> for AlertNotifier {
-    type Result = ResponseActFuture<Self, ()>;
+    type Result = ();
 
-    fn handle(&mut self, msg: SendNotification, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: SendNotification, ctx: &mut Self::Context) -> Self::Result {
+        // Deliveries run concurrently so one slow channel does not delay
+        // later notifications.
         let notifier = self.clone();
-        let alert = msg.alert;
-        let channels = msg.channels;
-
-        Box::pin(wrap_future(async move {
-            notifier.send_alert(&alert, &channels).await;
-        }))
+        ctx.spawn(wrap_future(async move {
+            notifier.send_alert(&msg.alert, &msg.channels).await;
+        }));
     }
 }
 
@@ -321,7 +427,6 @@ impl Clone for AlertNotifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn console_channel(id: &str, enabled: bool) -> NotificationChannel {
         NotificationChannel {
@@ -338,8 +443,9 @@ mod tests {
         let notifier = AlertNotifier::new(vec![
             console_channel("a", true),
             console_channel("b", false),
+            console_channel("c", true),
         ]);
-        assert_eq!(notifier.resolve_channels(&[]).len(), 1);
+        assert_eq!(notifier.resolve_channels(&[]).len(), 2);
     }
 
     #[test]
@@ -362,26 +468,64 @@ mod tests {
     }
 
     #[test]
-    fn test_email_channel_config_serialization() {
-        let channel = NotificationChannel {
-            id: "email".to_string(),
-            name: "email".to_string(),
-            channel_type: ChannelType::Email {
-                smtp_server: "smtp.example.com".to_string(),
-                smtp_port: 587,
-                username: Some("user".to_string()),
-                from_addr: "nimon@example.com".to_string(),
-                to_addrs: vec!["ops@example.com".to_string()],
-            },
-            enabled: true,
-            config: serde_json::json!({
-                "smtp_password": "secret",
-                "smtp_skip_tls_verify": false
-            }),
+    fn test_smtp_tls_mode_by_port() {
+        assert_eq!(smtp_tls_mode(465, None).unwrap(), SmtpTlsMode::Implicit);
+        assert_eq!(smtp_tls_mode(587, None).unwrap(), SmtpTlsMode::StartTls);
+        assert_eq!(smtp_tls_mode(25, None).unwrap(), SmtpTlsMode::Opportunistic);
+        assert_eq!(smtp_tls_mode(2525, None).unwrap(), SmtpTlsMode::StartTls);
+        assert_eq!(
+            smtp_tls_mode(587, Some("wrapper")).unwrap(),
+            SmtpTlsMode::Implicit
+        );
+        assert_eq!(smtp_tls_mode(25, Some("none")).unwrap(), SmtpTlsMode::None);
+        assert!(smtp_tls_mode(25, Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn test_credentials_never_plaintext_by_default() {
+        // No credentials: mode unchanged
+        assert_eq!(
+            effective_tls_mode(SmtpTlsMode::Opportunistic, false, false).unwrap(),
+            SmtpTlsMode::Opportunistic
+        );
+        // Credentials: opportunistic upgraded, none refused
+        assert_eq!(
+            effective_tls_mode(SmtpTlsMode::Opportunistic, true, false).unwrap(),
+            SmtpTlsMode::StartTls
+        );
+        assert!(effective_tls_mode(SmtpTlsMode::None, true, false).is_err());
+        // Explicitly allowed
+        assert_eq!(
+            effective_tls_mode(SmtpTlsMode::None, true, true).unwrap(),
+            SmtpTlsMode::None
+        );
+        assert_eq!(
+            effective_tls_mode(SmtpTlsMode::Implicit, true, false).unwrap(),
+            SmtpTlsMode::Implicit
+        );
+    }
+
+    #[test]
+    fn test_resolved_title_prefix() {
+        let mut alert = Alert {
+            id: "a".into(),
+            rule_id: "r".into(),
+            edge_id: "e".into(),
+            device_id: "d".into(),
+            severity: Severity::Warning,
+            status: AlertStatus::Firing,
+            title: "Hot".into(),
+            message: "m".into(),
+            metric_name: None,
+            metric_value: None,
+            threshold: None,
+            triggered_at: chrono::Utc::now(),
+            resolved_at: None,
+            fired_count: 1,
+            notification_sent: false,
         };
-        let json = serde_json::to_string(&channel).unwrap();
-        assert!(json.contains("\"smtp_port\":587"));
-        let headers: Option<HashMap<String, String>> = None;
-        assert!(headers.is_none());
+        assert_eq!(display_title(&alert), "Hot");
+        alert.status = AlertStatus::Resolved;
+        assert_eq!(display_title(&alert), "[RESOLVED] Hot");
     }
 }

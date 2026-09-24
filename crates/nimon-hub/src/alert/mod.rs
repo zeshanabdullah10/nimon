@@ -3,4 +3,7 @@
 pub mod manager;
 pub mod notifier;
 
-pub use manager::{AlertManager, EvaluateRules};
+pub use manager::{
+    AcknowledgeAlert, AlertManager, AlertManagerConfig, EvaluateRules, GetActiveAlertViews,
+    GetActiveAlerts, ResolveAlert,
+};
